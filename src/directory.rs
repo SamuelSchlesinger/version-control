@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{object_id::ObjectId, object_store::ObjectStore};
 
+/// A directory tree, with [`ObjectId`]s at the leaves.
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct Directory {
     pub root: BTreeMap<OsString, DirectoryEntry>,
@@ -23,6 +24,9 @@ pub enum Error<Store: ObjectStore> {
 }
 
 impl Directory {
+    /// Write out the directory structure at the given directory path.
+    ///
+    /// The target directory must already exist.
     pub fn write<Store: ObjectStore>(
         &self,
         store: &Store,
@@ -55,6 +59,7 @@ impl Directory {
     }
 }
 
+/// The set of file names which we will ignore at any level.
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct Ignores {
     set: BTreeSet<OsString>,
