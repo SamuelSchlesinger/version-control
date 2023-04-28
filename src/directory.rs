@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsString,
     fs::{read_dir, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -13,7 +12,7 @@ use crate::{object_id::ObjectId, object_store::ObjectStore};
 /// A directory tree, with [`ObjectId`]s at the leaves.
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct Directory {
-    pub root: BTreeMap<OsString, DirectoryEntry>,
+    pub root: BTreeMap<String, DirectoryEntry>,
 }
 
 #[derive(Debug)]
@@ -62,7 +61,7 @@ impl Directory {
 /// The set of file names which we will ignore at any level.
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct Ignores {
-    pub set: BTreeSet<OsString>,
+    pub set: BTreeSet<String>,
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
@@ -81,19 +80,25 @@ impl Directory {
         for f in std::fs::read_dir(dir).map_err(Error::IO)? {
             let dir_entry = f.map_err(Error::IO)?;
             eprintln!("{}", dir_entry.file_name().to_str().unwrap());
-            if ignores.set.contains(&dir_entry.file_name()) {
+            if ignores
+                .set
+                .contains(&dir_entry.file_name().into_string().unwrap())
+            {
                 continue;
             }
             let file_type = dir_entry.file_type().map_err(Error::IO)?;
             if file_type.is_dir() {
                 let directory = Directory::new(dir_entry.path().as_path(), ignores, store)?;
                 root.insert(
-                    dir_entry.file_name().into(),
+                    dir_entry.file_name().into_string().unwrap(),
                     DirectoryEntry::Directory(Box::new(directory)),
                 );
             } else if file_type.is_file() {
                 let id = ObjectId::try_from(dir_entry.path().as_path()).map_err(Error::IO)?;
-                root.insert(dir_entry.file_name(), DirectoryEntry::File(id));
+                root.insert(
+                    dir_entry.file_name().into_string().unwrap(),
+                    DirectoryEntry::File(id),
+                );
                 let mut v = Vec::new();
                 let mut obj_file = File::options()
                     .read(true)
@@ -118,13 +123,20 @@ fn test_directory() {
     let codebase = Directory::new(
         dir.as_path(),
         &Ignores {
-            set: vec![OsString::from(".git"), OsString::from("target")]
+            set: vec![String::from(".git"), String::from("target")]
                 .into_iter()
                 .collect(),
         },
         &mut store,
     )
     .unwrap();
-    let readme_path = OsString::from("README.md");
+    let readme_path = String::from("README.md");
+    let mut f = File::options()
+        .create(true)
+        .write(true)
+        .open(&dir.join("directory"))
+        .unwrap();
+    f.write(&serde_json::to_vec_pretty(&codebase).expect("1"))
+        .expect("1");
     assert!(codebase.root.get(&readme_path).is_some());
 }

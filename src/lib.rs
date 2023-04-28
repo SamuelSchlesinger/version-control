@@ -13,3 +13,5 @@ pub mod directory;
 pub mod object_id;
 /// Content addressible store API using `ObjectId` as the address.
 pub mod object_store;
+/// A snapshot of a particular revision.
+pub mod snapshot;
