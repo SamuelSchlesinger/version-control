@@ -7,9 +7,9 @@
 mod hex;
 
 /// A data structure representing a directory structure with
-/// names of files pointing to an [`ObjectId`].
+/// names of files and their `ObjectId`.
 pub mod directory;
-/// Hash-based binary object identifier.
+/// Hash-based binary object identifier type called `ObjectId`.
 pub mod object_id;
-/// Content addressible store API using the [`ObjectId`].
+/// Content addressible store API using `ObjectId` as the address.
 pub mod object_store;
