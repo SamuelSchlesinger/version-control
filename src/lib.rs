@@ -6,6 +6,8 @@
 
 mod hex;
 
+/// A data structure representing the currently known of branches
+pub mod branches;
 /// A data structure representing a directory structure with
 /// names of files pointing to an [`ObjectId`].
 pub mod directory;
