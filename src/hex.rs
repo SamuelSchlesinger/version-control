@@ -1,8 +1,30 @@
 use std::fmt::Display;
 
+use serde::{Deserialize, Serialize};
+
 /// A valid hexadecimal encoding of binary data.
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct Hex(pub Vec<u8>);
+
+impl Serialize for Hex {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        format!("{}", self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Hex {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s: String = String::deserialize(deserializer)?;
+        let b: &[u8] = &s.into_bytes();
+        Ok(Hex::from(b))
+    }
+}
 
 impl Display for Hex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

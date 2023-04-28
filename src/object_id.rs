@@ -1,5 +1,6 @@
 use crate::hex;
 use blake3::Hash;
+use serde::{Deserialize, Serialize};
 
 use std::{fmt::Display, fs::File, io::Read, path::Path};
 
@@ -9,6 +10,31 @@ use std::{fmt::Display, fs::File, io::Read, path::Path};
 /// It is displayed in hexadecimal format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectId(Hash);
+
+impl Serialize for ObjectId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let b: &[u8] = self.0.as_bytes();
+        hex::Hex::from(b).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let b: hex::Hex = Deserialize::deserialize(deserializer)?;
+        let v: Vec<u8> = b.into();
+        let mut bytes: [u8; 32] = [0; 32];
+        for i in 0..32 {
+            bytes[i] = v[i];
+        }
+        Ok(ObjectId(Hash::from(bytes)))
+    }
+}
 
 impl Ord for ObjectId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
