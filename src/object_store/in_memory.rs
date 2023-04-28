@@ -1,14 +1,20 @@
-use std::{collections::BTreeMap, convert::Infallible};
+use std::{
+    collections::{btree_map::Entry, BTreeMap},
+    convert::Infallible,
+};
 
 use crate::object_id::ObjectId;
 
 use super::ObjectStore;
 
+/// An ephemeral [`ObjectStore`] stored in memory using a
+/// [`BTreeMap`].
 pub struct InMemoryObjectStore {
     objects: BTreeMap<ObjectId, Vec<u8>>,
 }
 
 impl InMemoryObjectStore {
+    /// Create a new, ephemeral [`InMemoryObjectStore`].
     pub fn new() -> Self {
         Self {
             objects: BTreeMap::new(),
@@ -32,8 +38,13 @@ impl ObjectStore for InMemoryObjectStore {
 
     fn insert(&mut self, object: &[u8]) -> Result<ObjectId, Self::Error> {
         let id: ObjectId = object.into();
-        self.objects.insert(id, Vec::from(object));
-        Ok(id)
+        match self.objects.entry(id) {
+            Entry::Vacant(v) => {
+                v.insert(object.into());
+                Ok(id)
+            }
+            Entry::Occupied(_o) => Ok(id),
+        }
     }
 }
 

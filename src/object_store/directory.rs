@@ -8,6 +8,11 @@ use crate::object_id::ObjectId;
 
 use super::ObjectStore;
 
+/// A persistent [`ObjectStore`] stored in a directory,
+/// using the first two hexadecimal characters of the [`ObjectId`]
+/// to determine which directory to place the binary object in
+/// and creating a file with the rest of the hexadecimal characters
+/// as the file name.
 pub struct DirectoryObjectStore {
     root: PathBuf,
 }
@@ -60,11 +65,14 @@ impl ObjectStore for DirectoryObjectStore {
         let filename: &str = &s[2..];
         let subdir_path = self.root.join(format!("{}", subdir));
         eprintln!("subdir_path: {:?}", subdir_path);
+        let path = subdir_path.join(format!("{}", filename));
+        if std::fs::try_exists(&path)? {
+            return Ok(id);
+        }
         if !std::fs::try_exists(&subdir_path)? {
             eprintln!("subdir doesn't exist");
             std::fs::create_dir(&subdir_path)?;
         }
-        let path = subdir_path.join(format!("{}", filename));
         let mut f = File::options().create(true).write(true).open(path)?;
         f.write(object)?;
         Ok(id)

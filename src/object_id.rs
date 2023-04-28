@@ -3,6 +3,10 @@ use blake3::Hash;
 
 use std::{fmt::Display, fs::File, io::Read, path::Path};
 
+/// An identifier for a particular piece of binary content.
+/// Under the hood, this is a [`blake3`] hash.
+///
+/// It is displayed in hexadecimal format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectId(Hash);
 
