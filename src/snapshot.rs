@@ -9,6 +9,6 @@ pub struct SnapShot {
     pub message: ObjectId,
     /// The [`ObjectId`] of the directory structure.
     pub directory: ObjectId,
-    /// The [`ObjectId`] of the previous snapshot, if there was one.
+    /// The previous [`SnapShot`].
     pub previous: Option<ObjectId>,
 }
