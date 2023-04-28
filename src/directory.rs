@@ -62,7 +62,7 @@ impl Directory {
 /// The set of file names which we will ignore at any level.
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct Ignores {
-    set: BTreeSet<OsString>,
+    pub set: BTreeSet<OsString>,
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
