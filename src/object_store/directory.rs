@@ -13,6 +13,7 @@ use super::ObjectStore;
 /// to determine which directory to place the binary object in
 /// and creating a file with the rest of the hexadecimal characters
 /// as the file name.
+#[derive(Debug, Clone)]
 pub struct DirectoryObjectStore {
     root: PathBuf,
 }

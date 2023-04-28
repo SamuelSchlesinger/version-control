@@ -9,6 +9,7 @@ use super::ObjectStore;
 
 /// An ephemeral [`ObjectStore`] stored in memory using a
 /// [`BTreeMap`].
+#[derive(Debug, Clone)]
 pub struct InMemoryObjectStore {
     objects: BTreeMap<ObjectId, Vec<u8>>,
 }
