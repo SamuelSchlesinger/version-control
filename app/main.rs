@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeSet,
     env::current_dir,
+    fmt::Debug,
     fs::{create_dir, read_dir, File},
+    io::stdout,
     path::Path,
 };
 
@@ -24,6 +26,8 @@ struct Arguments {
 enum Command {
     #[clap(about = "initialize a brand new revision")]
     Init,
+    #[clap(about = "shows the changed files or directories")]
+    Changes,
     #[clap(about = "take a new snapshot")]
     Snap {
         #[arg(short, long, help = "message to leave with this snapshot")]
@@ -47,6 +51,22 @@ fn main() {
     let args = Arguments::parse();
     use Command::*;
     match args.cmd {
+        Changes => {
+            let dir = current_dir().unwrap();
+            let rev_dir = dir.join(".rev");
+            if !read_dir(&rev_dir).is_ok() {
+                eprintln!("no .rev in working directory");
+            }
+            let mut store = DirectoryObjectStore::new(rev_dir.join("store")).unwrap();
+            let old_tip: ObjectId = read_json(&rev_dir.join("tip"));
+            let ignores: Ignores = read_json(&rev_dir.join("ignores"));
+            let directory = Directory::new(dir.as_path(), &ignores, &mut store).unwrap();
+            let snapshot: SnapShot =
+                serde_json::from_slice(&store.read(old_tip).expect("1").expect("2")).expect("3");
+            let old_directory: Directory =
+                serde_json::from_slice(&store.read(snapshot.directory).unwrap().unwrap()).unwrap();
+            serde_json::to_writer_pretty(stdout(), &old_directory.diff(&directory)).unwrap();
+        }
         Snap { message } => {
             let dir = current_dir().unwrap();
             let rev_dir = dir.join(".rev");
@@ -87,15 +107,7 @@ fn main() {
                 .into_iter()
                 .collect(),
             };
-            serde_json::to_writer_pretty(
-                File::options()
-                    .create(true)
-                    .write(true)
-                    .open(rev_dir.join("ignores"))
-                    .unwrap(),
-                &ignores,
-            )
-            .unwrap();
+            write_json(&ignores, &rev_dir.join("ignores"));
             let directory = Directory::new(dir.as_path(), &ignores, &mut store).unwrap();
             let directory_bytes = serde_json::to_vec_pretty(&directory).unwrap();
             let directory_id = store.insert(&directory_bytes).unwrap();
