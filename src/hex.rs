@@ -21,8 +21,8 @@ impl<'de> Deserialize<'de> for Hex {
         D: serde::Deserializer<'de>,
     {
         let s: String = String::deserialize(deserializer)?;
-        let b: &[u8] = &s.into_bytes();
-        Ok(Hex::from(b))
+        let b: Vec<u8> = s.into_bytes().iter().copied().collect();
+        Ok(Hex(b))
     }
 }
 
@@ -92,4 +92,13 @@ fn test_hex_round_trip() {
     let bytes: Vec<u8> = hex.into();
     let bytes_ref: &[u8] = &bytes;
     assert_eq!(example, bytes_ref);
+}
+
+#[test]
+fn test_hex_deserialize() {
+    let example: &[u8] = b"hello, world";
+    let hex: Hex = Hex::from(example);
+    let json = serde_json::to_vec(&hex).unwrap();
+    let hex_: Hex = serde_json::from_slice(&json).unwrap();
+    assert_eq!(hex, hex_);
 }

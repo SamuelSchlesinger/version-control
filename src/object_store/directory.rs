@@ -21,6 +21,7 @@ pub struct DirectoryObjectStore {
 impl DirectoryObjectStore {
     pub fn new(root: PathBuf) -> Result<Self, std::io::Error> {
         if !try_exists(&root)? {
+            log::info!("creating directory store root: {:?}", root);
             create_dir(&root)?;
         }
         Ok(Self { root })
@@ -31,6 +32,7 @@ impl ObjectStore for DirectoryObjectStore {
     type Error = std::io::Error;
 
     fn has(&self, id: ObjectId) -> Result<bool, Self::Error> {
+        log::info!("checking whether {} is contained in {:?}", id, self.root);
         let s: String = format!("{}", id);
         let subdir: &str = &s[0..2];
         let filename: &str = &s[2..];
@@ -39,6 +41,7 @@ impl ObjectStore for DirectoryObjectStore {
     }
 
     fn read(&self, id: ObjectId) -> Result<Option<Vec<u8>>, Self::Error> {
+        log::info!("reading {} from {:?}", id, self.root);
         let s: String = format!("{}", id);
         let subdir: &str = &s[0..2];
         let filename: &str = &s[2..];
@@ -61,15 +64,18 @@ impl ObjectStore for DirectoryObjectStore {
 
     fn insert(&mut self, object: &[u8]) -> Result<ObjectId, Self::Error> {
         let id: ObjectId = object.into();
+        log::info!("inserting {} into {:?}", id, self.root);
         let s: String = format!("{}", id);
         let subdir: &str = &s[0..2];
         let filename: &str = &s[2..];
         let subdir_path = self.root.join(format!("{}", subdir));
         let path = subdir_path.join(format!("{}", filename));
         if std::fs::try_exists(&path)? {
+            log::info!("{:?} already exists", path);
             return Ok(id);
         }
         if !std::fs::try_exists(&subdir_path)? {
+            log::info!("creating subdir path {:?} in {:?}", subdir_path, self.root);
             std::fs::create_dir(&subdir_path)?;
         }
         let mut f = File::options().create(true).write(true).open(path)?;

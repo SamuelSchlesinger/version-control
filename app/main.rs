@@ -48,6 +48,7 @@ pub fn write_json<A: Serialize>(thing: &A, path: &Path) {
 }
 
 fn main() {
+    env_logger::init();
     let args = Arguments::parse();
     use Command::*;
     match args.cmd {
