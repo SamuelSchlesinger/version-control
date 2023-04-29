@@ -99,22 +99,14 @@ fn main() {
             }
             create_dir(&rev_dir).unwrap();
             let mut store = DirectoryObjectStore::new(rev_dir.join("store")).unwrap();
-            let ignores = Ignores {
-                set: vec![
-                    String::from(".git"),
-                    String::from("target"),
-                    String::from(".rev"),
-                ]
-                .into_iter()
-                .collect(),
-            };
+            let ignores = Ignores::default();
             write_json(&ignores, &rev_dir.join("ignores"));
-            let directory = Directory::new(dir.as_path(), &ignores, &mut store).unwrap();
+            let directory = Directory::default();
             let directory_bytes = serde_json::to_vec_pretty(&directory).unwrap();
             let directory_id = store.insert(&directory_bytes).unwrap();
             let snapshot = SnapShot {
                 directory: directory_id,
-                message: String::from("init"),
+                message: String::from("empty!"),
                 previous: BTreeSet::new(),
             };
             let snapshot_bytes = serde_json::to_vec_pretty(&snapshot).unwrap();

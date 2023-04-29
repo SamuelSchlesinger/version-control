@@ -3,7 +3,7 @@
 A version control system implemented in Rust.
 
 ```
-Usage: revcontrol <COMMAND>
+Usage: revtool <COMMAND>
 
 Commands:
   init     initialize a brand new revision

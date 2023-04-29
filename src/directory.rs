@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{object_id::ObjectId, object_store::ObjectStore};
 
 /// A directory tree, with [`ObjectId`]s at the leaves.
-#[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Directory {
     #[serde(flatten)]
     pub root: BTreeMap<String, DirectoryEntry>,
@@ -139,6 +139,14 @@ pub struct Ignores {
     pub set: BTreeSet<String>,
 }
 
+impl Default for Ignores {
+    fn default() -> Self {
+        Ignores {
+            set: vec![String::from(".rev")].into_iter().collect(),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub enum DirectoryEntry {
     Directory(Box<Directory>),
@@ -200,9 +208,13 @@ fn test_directory() {
     let codebase = Directory::new(
         dir.as_path(),
         &Ignores {
-            set: vec![String::from(".git"), String::from("target")]
-                .into_iter()
-                .collect(),
+            set: vec![
+                String::from(".git"),
+                String::from(".rev"),
+                String::from("target"),
+            ]
+            .into_iter()
+            .collect(),
         },
         &mut store,
     )
