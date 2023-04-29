@@ -17,5 +17,5 @@ name = "lib"
 path = "src/lib.rs"
 
 [[bin]]
-name = "app"
+name = "revcontrol"
 path = "app/main.rs"

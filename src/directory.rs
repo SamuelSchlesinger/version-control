@@ -22,7 +22,75 @@ pub enum Error<Store: ObjectStore> {
     IO(std::io::Error),
 }
 
+#[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
+pub struct Diff {
+    pub deleted: BTreeSet<String>,
+    pub added: BTreeMap<String, DirectoryEntry>,
+    pub modified: BTreeMap<String, DiffEntry>,
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
+pub enum DiffEntry {
+    File(ObjectId),
+    Directory(Box<Diff>),
+}
+
+impl DirectoryEntry {
+    pub fn diff(&self, other: &DirectoryEntry) -> Option<DiffEntry> {
+        use DirectoryEntry::*;
+        match (self, other) {
+            (File(id), File(id_)) => {
+                if id == id_ {
+                    Some(DiffEntry::File(*id_))
+                } else {
+                    None
+                }
+            }
+            (Directory(_), File(id)) => Some(DiffEntry::File(*id)),
+            (File(_), Directory(d)) => Some(DiffEntry::Directory(Box::new(Diff {
+                deleted: BTreeSet::new(),
+                added: d.root.clone(),
+                modified: BTreeMap::new(),
+            }))),
+            (Directory(d), Directory(d_)) => Some(DiffEntry::Directory(Box::new(d.diff(d_)))),
+        }
+    }
+}
+
 impl Directory {
+    /// Compute the diff between this directory structure and the one
+    /// which is currently located at the path.
+    pub fn diff(&self, other: &Directory) -> Diff {
+        let added: BTreeMap<String, DirectoryEntry> = other
+            .root
+            .iter()
+            .filter(|(file_name, _dir_entry)| !self.root.contains_key(*file_name))
+            .map(|(fname, dir_entry)| (fname.clone(), dir_entry.clone()))
+            .collect();
+        let deleted: BTreeSet<String> = self
+            .root
+            .iter()
+            .filter(|(file_name, _dir_entry)| !other.root.contains_key(*file_name))
+            .map(|(fname, _dir_entry)| fname.clone())
+            .collect();
+        let modified: BTreeMap<String, DiffEntry> = self
+            .root
+            .iter()
+            .filter_map(|(file_name, dir_entry)| {
+                other.root.get(file_name).and_then(|other_dir_entry| {
+                    dir_entry
+                        .diff(other_dir_entry)
+                        .map(|diff| (file_name.clone(), diff))
+                })
+            })
+            .collect();
+        Diff {
+            added,
+            deleted,
+            modified,
+        }
+    }
+
     /// Write out the directory structure at the given directory path.
     ///
     /// The target directory must already exist.
@@ -106,7 +174,10 @@ impl Directory {
                 obj_file.read_to_end(&mut v).map_err(Error::IO)?;
                 store.insert(&v).map_err(Error::Store)?;
             } else {
-                panic!("TODO support things which aren't files or directories");
+                eprintln!(
+                    "TODO support things which aren't files or directories: {:?}",
+                    dir_entry.file_name()
+                );
             }
         }
         Ok(Directory { root })
