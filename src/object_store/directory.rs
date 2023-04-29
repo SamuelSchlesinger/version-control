@@ -65,13 +65,11 @@ impl ObjectStore for DirectoryObjectStore {
         let subdir: &str = &s[0..2];
         let filename: &str = &s[2..];
         let subdir_path = self.root.join(format!("{}", subdir));
-        eprintln!("subdir_path: {:?}", subdir_path);
         let path = subdir_path.join(format!("{}", filename));
         if std::fs::try_exists(&path)? {
             return Ok(id);
         }
         if !std::fs::try_exists(&subdir_path)? {
-            eprintln!("subdir doesn't exist");
             std::fs::create_dir(&subdir_path)?;
         }
         let mut f = File::options().create(true).write(true).open(path)?;

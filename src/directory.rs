@@ -79,7 +79,6 @@ impl Directory {
         let mut root = BTreeMap::new();
         for f in std::fs::read_dir(dir).map_err(Error::IO)? {
             let dir_entry = f.map_err(Error::IO)?;
-            eprintln!("{}", dir_entry.file_name().to_str().unwrap());
             if ignores
                 .set
                 .contains(&dir_entry.file_name().into_string().unwrap())
@@ -131,12 +130,5 @@ fn test_directory() {
     )
     .unwrap();
     let readme_path = String::from("README.md");
-    let mut f = File::options()
-        .create(true)
-        .write(true)
-        .open(&dir.join("directory"))
-        .unwrap();
-    f.write(&serde_json::to_vec_pretty(&codebase).expect("1"))
-        .expect("1");
     assert!(codebase.root.get(&readme_path).is_some());
 }
