@@ -11,6 +11,6 @@ pub struct SnapShot {
     pub message: String,
     /// The [`ObjectId`] of the directory structure.
     pub directory: ObjectId,
-    /// The previous [`SnapShot`]s' [`ObjectId`]s, if there was one.
+    /// The previous [`SnapShot`]s' [`ObjectId`]s, if there were some.
     pub previous: BTreeSet<ObjectId>,
 }

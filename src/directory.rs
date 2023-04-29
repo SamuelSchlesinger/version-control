@@ -12,6 +12,7 @@ use crate::{object_id::ObjectId, object_store::ObjectStore};
 /// A directory tree, with [`ObjectId`]s at the leaves.
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct Directory {
+    #[serde(flatten)]
     pub root: BTreeMap<String, DirectoryEntry>,
 }
 
