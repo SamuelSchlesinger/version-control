@@ -41,7 +41,7 @@ impl DirectoryEntry {
         use DirectoryEntry::*;
         match (self, other) {
             (File(id), File(id_)) => {
-                if id == id_ {
+                if id != id_ {
                     Some(DiffEntry::File(*id_))
                 } else {
                     None
@@ -53,7 +53,13 @@ impl DirectoryEntry {
                 added: d.root.clone(),
                 modified: BTreeMap::new(),
             }))),
-            (Directory(d), Directory(d_)) => Some(DiffEntry::Directory(Box::new(d.diff(d_)))),
+            (Directory(d), Directory(d_)) => {
+                if d == d_ {
+                    None
+                } else {
+                    Some(DiffEntry::Directory(Box::new(d.diff(d_))))
+                }
+            }
         }
     }
 }
