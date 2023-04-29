@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env::current_dir,
     fs::{create_dir, read_dir, File},
     path::Path,
@@ -21,8 +22,13 @@ struct Arguments {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    #[clap(about = "initialize a brand new revision")]
     Init,
-    Snap { message: String },
+    #[clap(about = "take a new snapshot")]
+    Snap {
+        #[arg(short, long, help = "message to leave with this snapshot")]
+        message: String,
+    },
 }
 
 pub fn read_json<A: for<'de> Deserialize<'de>>(path: &Path) -> A {
@@ -56,7 +62,7 @@ fn main() {
                 .unwrap();
             let snap = SnapShot {
                 directory: directory_id,
-                previous: Some(old_tip),
+                previous: vec![old_tip].into_iter().collect(),
                 message,
             };
             let snap_id = store
@@ -96,7 +102,7 @@ fn main() {
             let snapshot = SnapShot {
                 directory: directory_id,
                 message: String::from("init"),
-                previous: None,
+                previous: BTreeSet::new(),
             };
             let snapshot_bytes = serde_json::to_vec_pretty(&snapshot).unwrap();
             let snapshot_id = store.insert(&snapshot_bytes).unwrap();
