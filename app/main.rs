@@ -1,10 +1,13 @@
+#![feature(fs_try_exists)]
+
 use std::{
     collections::BTreeSet,
     env::current_dir,
     fmt::Debug,
-    fs::{create_dir, read_dir, File},
+    fs::{create_dir, read_dir, try_exists, File},
     io::stdout,
-    path::Path,
+    path::{Path, PathBuf},
+    process::exit,
 };
 
 use clap::{Parser, Subcommand};
@@ -33,6 +36,10 @@ enum Command {
         #[arg(short, long, help = "message to leave with this snapshot")]
         message: String,
     },
+    #[clap(about = "switch to branch")]
+    SetBranch { name: PathBuf },
+    #[clap(about = "print out current branch")]
+    Branch,
 }
 
 pub fn read_json<A: for<'de> Deserialize<'de>>(path: &Path) -> A {
@@ -52,14 +59,42 @@ fn main() {
     let args = Arguments::parse();
     use Command::*;
     match args.cmd {
+        Branch => {
+            let dir = current_dir().unwrap();
+            let rev_dir = dir.join(".rev");
+            if !read_dir(&rev_dir).is_ok() {
+                eprintln!("no .rev in working directory");
+                exit(1);
+            }
+            let branch: String = read_json(&rev_dir.join("branch"));
+            println!("{}", branch);
+        }
+        SetBranch { name } => {
+            let dir = current_dir().unwrap();
+            let rev_dir = dir.join(".rev");
+            if !read_dir(&rev_dir).is_ok() {
+                eprintln!("no .rev in working directory");
+                exit(1);
+            }
+            let branch_dir = rev_dir.join("branches");
+            if !try_exists(&branch_dir.join(&name)).unwrap() {
+                let branch: String = read_json(&rev_dir.join("branch"));
+                let old_tip: ObjectId = read_json(&branch_dir.join(&branch));
+                write_json(&old_tip, &branch_dir.join(&name));
+            }
+            write_json(&name, &rev_dir.join("branch"));
+        }
         Changes => {
             let dir = current_dir().unwrap();
             let rev_dir = dir.join(".rev");
             if !read_dir(&rev_dir).is_ok() {
                 eprintln!("no .rev in working directory");
+                exit(1);
             }
             let mut store = DirectoryObjectStore::new(rev_dir.join("store")).unwrap();
-            let old_tip: ObjectId = read_json(&rev_dir.join("tip"));
+            let branch: String = read_json(&rev_dir.join("branch"));
+            let branch_dir = rev_dir.join("branches");
+            let old_tip: ObjectId = read_json(&branch_dir.join(&branch));
             let ignores: Ignores = read_json(&rev_dir.join("ignores"));
             let directory = Directory::new(dir.as_path(), &ignores, &mut store).unwrap();
             let snapshot: SnapShot =
@@ -75,7 +110,9 @@ fn main() {
                 eprintln!("no .rev in working directory");
             }
             let mut store = DirectoryObjectStore::new(rev_dir.join("store")).unwrap();
-            let old_tip: ObjectId = read_json(&rev_dir.join("tip"));
+            let branch: String = read_json(&rev_dir.join("branch"));
+            let branch_dir = rev_dir.join("branches");
+            let old_tip: ObjectId = read_json(&branch_dir.join(&branch));
             let ignores: Ignores = read_json(&rev_dir.join("ignores"));
             let directory = Directory::new(dir.as_path(), &ignores, &mut store).unwrap();
             let directory_id = store
@@ -89,7 +126,7 @@ fn main() {
             let snap_id = store
                 .insert(&serde_json::to_vec_pretty(&snap).unwrap())
                 .unwrap();
-            write_json(&snap_id, &rev_dir.join("tip"));
+            write_json(&snap_id, &branch_dir.join(&branch));
         }
         Init => {
             let dir = current_dir().unwrap();
@@ -111,7 +148,10 @@ fn main() {
             };
             let snapshot_bytes = serde_json::to_vec_pretty(&snapshot).unwrap();
             let snapshot_id = store.insert(&snapshot_bytes).unwrap();
-            write_json(&snapshot_id, &rev_dir.join("tip"));
+            let branch_dir = rev_dir.as_path().join("branches");
+            create_dir(&branch_dir).unwrap();
+            write_json(&snapshot_id, &branch_dir.as_path().join("dev"));
+            write_json(&String::from("dev"), &rev_dir.join("branch"));
         }
     }
 }

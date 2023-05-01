@@ -2,13 +2,18 @@ use crate::hex;
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
 
-use std::{fmt::Display, fs::File, io::Read, path::Path};
+use std::{
+    fmt::{Debug, Display},
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
 /// An identifier for a particular piece of binary content.
 /// Under the hood, this is a [`blake3`] hash.
 ///
 /// It is displayed in hexadecimal format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ObjectId(Hash);
 
 impl Serialize for ObjectId {
@@ -52,6 +57,12 @@ impl Display for ObjectId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let b: &[u8] = self.0.as_bytes();
         write!(f, "{}", hex::Hex::from(b))
+    }
+}
+
+impl Debug for ObjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, f)
     }
 }
 
