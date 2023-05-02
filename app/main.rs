@@ -81,8 +81,12 @@ fn main() {
             let this_tip: ObjectId = read_json(&branch_dir.join(&this_branch));
             // let ignores: Ignores = read_json(&rev_dir.join("ignores"));
             let that_tip: ObjectId = read_json(&branch_dir.join(&that_branch));
-            let that_branch_directory =
+            let that_snapshot: SnapShot =
                 serde_json::from_slice(&store.read(that_tip).expect("a").expect("b")).expect("c");
+            let that_branch_directory = serde_json::from_slice(
+                &store.read(that_snapshot.directory).expect("x").expect("y"),
+            )
+            .expect("z");
             let this_snapshot: SnapShot =
                 serde_json::from_slice(&store.read(this_tip).expect("1").expect("2")).expect("3");
             let this_branch_directory: Directory =
