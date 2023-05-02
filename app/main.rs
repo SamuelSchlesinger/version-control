@@ -29,7 +29,11 @@ struct Arguments {
 enum Command {
     #[clap(about = "initialize a brand new revision")]
     Init,
-    #[clap(about = "shows the changed files or directories")]
+    #[clap(about = "check the difference between this branch and another")]
+    Diff { branch: String },
+    #[clap(
+        about = "shows the files and directories which have been changed since the latest snap"
+    )]
     Changes,
     #[clap(about = "take a new snapshot")]
     Snap {
@@ -37,7 +41,7 @@ enum Command {
         message: String,
     },
     #[clap(about = "switch to branch")]
-    SetBranch { name: PathBuf },
+    SetBranch { name: String },
     #[clap(about = "print out current branch")]
     Branch,
 }
@@ -59,6 +63,37 @@ fn main() {
     let args = Arguments::parse();
     use Command::*;
     match args.cmd {
+        Diff { branch } => {
+            let dir = current_dir().unwrap();
+            let rev_dir = dir.join(".rev");
+            if !read_dir(&rev_dir).is_ok() {
+                eprintln!("no .rev in working directory");
+                exit(1);
+            }
+            let store = DirectoryObjectStore::new(rev_dir.join("store")).unwrap();
+            let that_branch = branch;
+            let this_branch: String = read_json(&rev_dir.join("branch"));
+            let branch_dir = rev_dir.join("branches");
+            if !try_exists(branch_dir.as_path().join(&that_branch)).unwrap() {
+                eprintln!("no branch named {} exists", that_branch);
+                exit(1);
+            }
+            let this_tip: ObjectId = read_json(&branch_dir.join(&this_branch));
+            // let ignores: Ignores = read_json(&rev_dir.join("ignores"));
+            let that_tip: ObjectId = read_json(&branch_dir.join(&that_branch));
+            let that_branch_directory =
+                serde_json::from_slice(&store.read(that_tip).expect("a").expect("b")).expect("c");
+            let this_snapshot: SnapShot =
+                serde_json::from_slice(&store.read(this_tip).expect("1").expect("2")).expect("3");
+            let this_branch_directory: Directory =
+                serde_json::from_slice(&store.read(this_snapshot.directory).unwrap().unwrap())
+                    .unwrap();
+            serde_json::to_writer_pretty(
+                stdout(),
+                &this_branch_directory.diff(&that_branch_directory),
+            )
+            .unwrap();
+        }
         Branch => {
             let dir = current_dir().unwrap();
             let rev_dir = dir.join(".rev");
