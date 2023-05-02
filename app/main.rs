@@ -6,7 +6,7 @@ use std::{
     fmt::Debug,
     fs::{create_dir, read_dir, try_exists, File},
     io::stdout,
-    path::{Path, PathBuf},
+    path::Path,
     process::exit,
 };
 
@@ -41,7 +41,10 @@ enum Command {
         message: String,
     },
     #[clap(about = "switch to branch")]
-    SetBranch { name: String },
+    Checkout {
+        #[arg(short, long, help = "branch to checkout")]
+        branch: String,
+    },
     #[clap(about = "print out current branch")]
     Branch,
 }
@@ -108,7 +111,7 @@ fn main() {
             let branch: String = read_json(&rev_dir.join("branch"));
             println!("{}", branch);
         }
-        SetBranch { name } => {
+        Checkout { branch } => {
             let dir = current_dir().unwrap();
             let rev_dir = dir.join(".rev");
             if !read_dir(&rev_dir).is_ok() {
@@ -116,12 +119,12 @@ fn main() {
                 exit(1);
             }
             let branch_dir = rev_dir.join("branches");
-            if !try_exists(&branch_dir.join(&name)).unwrap() {
+            if !try_exists(&branch_dir.join(&branch)).unwrap() {
                 let branch: String = read_json(&rev_dir.join("branch"));
                 let old_tip: ObjectId = read_json(&branch_dir.join(&branch));
-                write_json(&old_tip, &branch_dir.join(&name));
+                write_json(&old_tip, &branch_dir.join(&branch));
             }
-            write_json(&name, &rev_dir.join("branch"));
+            write_json(&branch, &rev_dir.join("branch"));
         }
         Changes => {
             let dir = current_dir().unwrap();
