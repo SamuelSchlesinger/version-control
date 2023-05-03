@@ -9,6 +9,8 @@ mod hex;
 /// A data structure representing a directory structure with
 /// names of files and their `ObjectId`.
 pub mod directory;
+/// A .rev directory as well as associated convenience functions.
+pub mod dot_rev;
 /// Hash-based binary object identifier type called `ObjectId`.
 pub mod object_id;
 /// Content addressible store API using `ObjectId` as the address.
