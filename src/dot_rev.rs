@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
-    fs::{create_dir, create_dir_all, read_dir, try_exists, File},
-    io::{BufReader, Read, Write},
+    fs::{create_dir, create_dir_all, read_dir, read_to_string, try_exists, File},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -25,6 +25,7 @@ pub enum Error {
     IO(std::io::Error),
     #[from]
     Serde(serde_json::Error),
+    MissingObject(ObjectId),
 }
 impl DotRev {
     pub fn root(&self) -> &PathBuf {
@@ -70,10 +71,7 @@ impl DotRev {
     }
 
     pub fn branch(&self) -> Result<String, Error> {
-        let mut file = BufReader::new(File::options().read(true).open(&self.root.join("branch"))?);
-        let mut branch = String::new();
-        file.read_to_string(&mut branch)?;
-        Ok(branch)
+        Ok(read_to_string(&self.root.join("branch"))?)
     }
 
     pub fn set_branch(&self, new_branch: &str) -> Result<(), Error> {
@@ -87,6 +85,10 @@ impl DotRev {
 
     pub fn branch_snapshot_id(&self, branch: &str) -> Result<ObjectId, Error> {
         read_json(&self.root.join("branches").join(&branch))
+    }
+
+    pub fn set_branch_snapshot_id(&self, branch: &str, object_id: ObjectId) -> Result<(), Error> {
+        write_json(&object_id, &self.root.join("branches").join(&branch))
     }
 
     pub fn current_snapshot_id(&self) -> Result<ObjectId, Error> {
@@ -105,15 +107,32 @@ impl DotRev {
     pub fn branch_exists(&self, branch: &str) -> Result<bool, Error> {
         Ok(try_exists(self.root.join("branches").join(&branch))?)
     }
+
+    pub fn store(&self) -> Result<DirectoryObjectStore, Error> {
+        Ok(DirectoryObjectStore::new(self.root.clone())?)
+    }
+
+    pub fn ignores(&self) -> Result<Ignores, Error> {
+        Ok(read_json(&self.root.join("ignores"))?)
+    }
 }
 
-trait InsertJson {
+pub trait InsertJson {
     fn insert_json<A: Serialize>(&mut self, thing: &A) -> Result<ObjectId, Error>;
+
+    fn read_json<A: for<'de> Deserialize<'de>>(&mut self, object_id: ObjectId) -> Result<A, Error>;
 }
 
 impl InsertJson for DirectoryObjectStore {
     fn insert_json<A: Serialize>(&mut self, thing: &A) -> Result<ObjectId, Error> {
         Ok(self.insert(&serde_json::to_vec_pretty(thing)?)?)
+    }
+
+    fn read_json<A: for<'de> Deserialize<'de>>(&mut self, object_id: ObjectId) -> Result<A, Error> {
+        match self.read(object_id)? {
+            None => Err(Error::MissingObject(object_id)),
+            Some(obj) => Ok(serde_json::from_slice(&obj)?),
+        }
     }
 }
 
