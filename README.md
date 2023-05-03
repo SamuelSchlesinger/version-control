@@ -2,8 +2,9 @@
 
 [![Rust](https://github.com/SamuelSchlesinger/version-control/actions/workflows/rust.yml/badge.svg)](https://github.com/SamuelSchlesinger/version-control/actions/workflows/rust.yml)
 
-An experiment to write a version control system from scratch in Rust. So far,
-we've implemented the following commands:
+An experiment to write a version control system from scratch in Rust.
+
+## CLI Usage
 
 ```
 Usage: revtool <COMMAND>
@@ -20,6 +21,8 @@ Commands:
 Options:
   -h, --help  Print help
 ```
+
+## How Does It Work?
 
 Under the hood, it is using a content addressed binary object store in
 `.rev/store` using the [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) hash
@@ -47,3 +50,8 @@ branch with the `ObjectId` of a particular encoded `SnapShot`. In
 Finally, when we construct a `Directory` from the current directory, often we
 don't care about many files, so we have an ignore list in `.rev/ignores` which
 configures which paths we ignore.
+
+## Contributing
+
+There are a number of issues on the GitHub repository, please feel free to take
+any and do them.
