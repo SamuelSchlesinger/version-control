@@ -15,6 +15,7 @@ use crate::{
     snapshot::SnapShot,
 };
 
+/// A wrapper for the path of the .rev directory which has a number of utilities defined on it.
 pub struct DotRev {
     root: PathBuf,
 }
@@ -117,9 +118,12 @@ impl DotRev {
     }
 }
 
+/// A convenience trait for writing and reading JSON from the [`DirectoryObjectStore`].
 pub trait InsertJson {
+    /// Inserts a pretty JSON encoded version of the thing into the store.
     fn insert_json<A: Serialize>(&mut self, thing: &A) -> Result<ObjectId, Error>;
 
+    /// Reads a JSON encoded thing of the given type from the store at that given [`ObjectId`].
     fn read_json<A: for<'de> Deserialize<'de>>(&mut self, object_id: ObjectId) -> Result<A, Error>;
 }
 
