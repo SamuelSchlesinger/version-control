@@ -1,5 +1,7 @@
 # Version Control
 
+[![Rust](https://github.com/SamuelSchlesinger/version-control/actions/workflows/rust.yml/badge.svg)](https://github.com/SamuelSchlesinger/version-control/actions/workflows/rust.yml)
+
 An experiment to write a version control system from scratch in Rust. So far,
 we've implemented the following commands:
 
