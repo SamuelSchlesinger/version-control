@@ -133,7 +133,7 @@ fn main() {
                     .open(&rev_dir.join("branch"))
                     .unwrap(),
             )
-            .unwrap(); // read_json(&rev_dir.join("branch"));
+            .unwrap();
             let branch_dir = rev_dir.join("branches");
             let old_tip: ObjectId = read_json(&branch_dir.join(&branch));
             let ignores: Ignores = read_json(&rev_dir.join("ignores"));
@@ -151,7 +151,13 @@ fn main() {
                 eprintln!("no .rev in working directory");
             }
             let mut store = DirectoryObjectStore::new(rev_dir.join("store")).unwrap();
-            let branch: String = read_json(&rev_dir.join("branch"));
+            let branch: String = read_to_string(
+                File::options()
+                    .read(true)
+                    .open(&rev_dir.join("branch"))
+                    .unwrap(),
+            )
+            .unwrap();
             let branch_dir = rev_dir.join("branches");
             let old_tip: ObjectId = read_json(&branch_dir.join(&branch));
             let ignores: Ignores = read_json(&rev_dir.join("ignores"));
