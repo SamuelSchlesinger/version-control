@@ -199,6 +199,55 @@ impl Directory {
     }
 }
 
+impl Diff {
+    pub fn print(&self) {
+        fn go_added(path: &Path, entry: &DirectoryEntry) {
+            match entry {
+                DirectoryEntry::File(_) => {
+                    println!("A {}", path.to_str().unwrap());
+                }
+                DirectoryEntry::Directory(dir) => {
+                    for (dir_name, dir_entry) in dir.root.clone() {
+                        go_added(PathBuf::from(path).join(dir_name).as_path(), &dir_entry)
+                    }
+                }
+            }
+        }
+        fn go_modified(path: &Path, entry: &DiffEntry) {
+            match entry {
+                DiffEntry::File(_) => {
+                    println!("M {}", path.to_str().unwrap());
+                }
+                DiffEntry::Directory(diff) => {
+                    for (sub_path, dir_entry) in diff.added.clone() {
+                        // go_added(&format!("{}/{}", path, p), &dir_entry)
+                        go_added(path.join(sub_path).as_path(), &dir_entry)
+                    }
+                    for (sub_path, diff_entry) in diff.modified.clone() {
+                        go_modified(path.join(sub_path).as_path(), &diff_entry)
+                    }
+                    for sub_path in diff.deleted.clone() {
+                        go_deleted(path.join(sub_path).as_path())
+                    }
+                }
+            }
+        }
+        fn go_deleted(path: &Path) {
+            println!("D {}", path.to_str().unwrap());
+        }
+
+        for (path, dir_entry) in self.added.clone() {
+            go_added(&PathBuf::from(path), &dir_entry);
+        }
+        for (path, diff_entry) in self.modified.clone() {
+            go_modified(&PathBuf::from(path), &diff_entry);
+        }
+        for path in self.deleted.clone() {
+            go_deleted(&PathBuf::from(path));
+        }
+    }
+}
+
 #[test]
 fn test_directory() {
     use crate::object_store::in_memory::InMemoryObjectStore;

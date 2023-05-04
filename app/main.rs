@@ -4,7 +4,7 @@ use std::{env::current_dir, fmt::Debug, io::stdout, process::exit};
 
 use clap::{Parser, Subcommand};
 use lib::{
-    directory::{DiffEntry, Directory, DirectoryEntry, Ignores},
+    directory::{Directory, Ignores},
     dot_rev::{DotRev, InsertJson},
     object_id::ObjectId,
     snapshot::SnapShot,
@@ -67,51 +67,7 @@ fn main() {
                 .read_json(this_snapshot.directory)
                 .expect("read this branch directory");
             let diff = &this_branch_directory.diff(&that_branch_directory);
-
-            fn go_added(path: &str, entry: &DirectoryEntry) {
-                match entry {
-                    DirectoryEntry::File(_file) => {
-                        println!("A {}", path);
-                    }
-                    DirectoryEntry::Directory(dir) => {
-                        for (dir_name, dir_entry) in dir.root.clone() {
-                            go_added(&format!("{}/{}", path, dir_name), &dir_entry)
-                        }
-                    }
-                }
-            }
-            for (path, dir_entry) in diff.added.clone() {
-                go_added(&path, &dir_entry);
-            }
-
-            fn go_modified(path: &str, entry: &DiffEntry) {
-                match entry {
-                    DiffEntry::File(_file) => {
-                        println!("M {}", path);
-                    }
-                    DiffEntry::Directory(diff) => {
-                        for (p, dir_entry) in diff.added.clone() {
-                            go_added(&format!("{}/{}", path, p), &dir_entry)
-                        }
-                        for (p, diff_entry) in diff.modified.clone() {
-                            go_modified(&format!("{}/{}", path, p), &diff_entry)
-                        }
-                        for p in diff.deleted.clone() {
-                            go_deleted(&format!("{}/{}", path, p))
-                        }
-                    }
-                }
-            }
-            for (path, diff_entry) in diff.modified.clone() {
-                go_modified(&path, &diff_entry);
-            }
-
-            fn go_deleted(path: &str) {
-                println!("D {}", path);
-            }
-            for path in diff.deleted.clone() {
-                go_deleted(&path);
-            }
+            diff.print();
         }
         Branch => {
             let dot_rev = DotRev::existing(current_dir().unwrap().join(".rev")).unwrap();
