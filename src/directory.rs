@@ -294,7 +294,7 @@ fn test_diff_display() {
         added: added_bar.clone(),
         modified: BTreeMap::new(),
     };
-    assert_eq!(diff_3.to_string(), "A bar\nD foo\n");
+    assert_eq!(diff_3.to_string(), ["A bar", "D foo", ""].join("\n"));
 
     let diff_4: Diff = Diff {
         deleted: deleted_foo.clone(),
@@ -306,7 +306,34 @@ fn test_diff_display() {
         .into_iter()
         .collect(),
     };
-    assert_eq!(diff_4.to_string(), "A bar\nM baz\nD foo\n");
+    assert_eq!(
+        diff_4.to_string(),
+        ["A bar", "M baz", "D foo", ""].join("\n")
+    );
+
+    let diff_5: Diff = Diff {
+        deleted: deleted_foo.clone(),
+        added: added_bar.clone(),
+        modified: vec![
+            (String::from("a"), DiffEntry::Directory(Box::new(diff_2))),
+            (String::from("baz"), DiffEntry::Directory(Box::new(diff_4))),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    assert_eq!(
+        diff_5.to_string(),
+        [
+            "A bar",
+            "D a/foo",
+            "A baz/bar",
+            "M baz/baz",
+            "D baz/foo",
+            "D foo",
+            ""
+        ]
+        .join("\n")
+    );
 }
 
 #[test]
