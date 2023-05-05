@@ -209,14 +209,14 @@ impl fmt::Display for Diff {
         ) -> fmt::Result {
             match entry {
                 DirectoryEntry::File(_) => {
-                    return write!(f, "A {}", path.to_str().unwrap());
+                    writeln!(f, "A {}", path.to_str().unwrap())
                 }
                 DirectoryEntry::Directory(dir) => {
                     if dir.root.is_empty() {
-                        return write!(f, "A {}", path.to_str().unwrap());
+                        writeln!(f, "A {}", path.to_str().unwrap()).unwrap();
                     }
                     for (dir_name, dir_entry) in dir.root.clone() {
-                        return go_added(path.join(dir_name).as_path(), &dir_entry, f);
+                        go_added(path.join(dir_name).as_path(), &dir_entry, f).unwrap();
                     }
                     Ok(())
                 }
@@ -225,37 +225,88 @@ impl fmt::Display for Diff {
         fn go_modified(path: &Path, entry: &DiffEntry, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match entry {
                 DiffEntry::File(_) => {
-                    write!(f, "M {}", path.to_str().unwrap())
+                    writeln!(f, "M {}", path.to_str().unwrap())
                 }
                 DiffEntry::Directory(diff) => {
                     for (sub_path, dir_entry) in diff.added.clone() {
-                        return go_added(path.join(sub_path).as_path(), &dir_entry, f);
+                        go_added(path.join(sub_path).as_path(), &dir_entry, f).unwrap();
                     }
                     for (sub_path, diff_entry) in diff.modified.clone() {
-                        return go_modified(path.join(sub_path).as_path(), &diff_entry, f);
+                        go_modified(path.join(sub_path).as_path(), &diff_entry, f).unwrap();
                     }
                     for sub_path in diff.deleted.clone() {
-                        return go_deleted(path.join(sub_path).as_path(), f);
+                        go_deleted(path.join(sub_path).as_path(), f).unwrap();
                     }
                     Ok(())
                 }
             }
         }
         fn go_deleted(path: &Path, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "D {}", path.to_str().unwrap())
+            writeln!(f, "D {}", path.to_str().unwrap())
         }
 
         for (path, dir_entry) in self.added.clone() {
-            return go_added(&PathBuf::from(path), &dir_entry, f);
+            go_added(&PathBuf::from(path), &dir_entry, f).unwrap();
         }
         for (path, diff_entry) in self.modified.clone() {
-            return go_modified(&PathBuf::from(path), &diff_entry, f);
+            go_modified(&PathBuf::from(path), &diff_entry, f).unwrap();
         }
         for path in self.deleted.clone() {
-            return go_deleted(&PathBuf::from(path), f);
+            go_deleted(&PathBuf::from(path), f).unwrap();
         }
         Ok(())
     }
+}
+
+#[test]
+fn test_diff_display() {
+    let diff_empty: Diff = Diff {
+        deleted: BTreeSet::new(),
+        added: BTreeMap::new(),
+        modified: BTreeMap::new(),
+    };
+    assert_eq!(diff_empty.to_string(), "");
+
+    let deleted_foo = BTreeSet::from([String::from("foo")]);
+    let added_bar: BTreeMap<String, DirectoryEntry> = vec![(
+        String::from("bar"),
+        DirectoryEntry::File(ObjectId::from(&vec![])),
+    )]
+    .into_iter()
+    .collect();
+
+    let diff_1: Diff = Diff {
+        deleted: BTreeSet::new(),
+        added: added_bar.clone(),
+        modified: BTreeMap::new(),
+    };
+    assert_eq!(diff_1.to_string(), "A bar\n");
+
+    let diff_2: Diff = Diff {
+        deleted: deleted_foo.clone(),
+        added: BTreeMap::new(),
+        modified: BTreeMap::new(),
+    };
+    assert_eq!(diff_2.to_string(), "D foo\n");
+
+    let diff_3: Diff = Diff {
+        deleted: deleted_foo.clone(),
+        added: added_bar.clone(),
+        modified: BTreeMap::new(),
+    };
+    assert_eq!(diff_3.to_string(), "A bar\nD foo\n");
+
+    let diff_4: Diff = Diff {
+        deleted: deleted_foo.clone(),
+        added: added_bar.clone(),
+        modified: vec![(
+            String::from("baz"),
+            DiffEntry::File(ObjectId::from(&vec![])),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    assert_eq!(diff_4.to_string(), "A bar\nM baz\nD foo\n");
 }
 
 #[test]
