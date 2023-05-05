@@ -67,7 +67,7 @@ fn main() {
                 .read_json(this_snapshot.directory)
                 .expect("read this branch directory");
             let diff = &this_branch_directory.diff(&that_branch_directory);
-            diff.print();
+            println!("{diff}")
         }
         Branch => {
             let dot_rev = DotRev::existing(current_dir().unwrap().join(".rev")).unwrap();
