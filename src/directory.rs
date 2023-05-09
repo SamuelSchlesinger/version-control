@@ -207,39 +207,45 @@ impl fmt::Display for Diff {
             entry: &DirectoryEntry,
             f: &mut fmt::Formatter<'_>,
         ) -> fmt::Result {
-            match entry {
-                DirectoryEntry::File(_) => {
-                    writeln!(f, "A {}", path.to_str().unwrap())
-                }
-                DirectoryEntry::Directory(dir) => {
-                    if dir.root.is_empty() {
+            let mut stack = vec![(entry.clone(), PathBuf::from(path))];
+            while let Some((entry, path)) = stack.pop() {
+                match entry {
+                    DirectoryEntry::File(_) => {
                         writeln!(f, "A {}", path.to_str().unwrap()).unwrap();
                     }
-                    for (dir_name, dir_entry) in dir.root.clone() {
-                        go_added(path.join(dir_name).as_path(), &dir_entry, f).unwrap();
+                    DirectoryEntry::Directory(dir) => {
+                        if dir.root.is_empty() {
+                            writeln!(f, "A {}", path.to_str().unwrap()).unwrap();
+                        }
+                        for (dir_name, dir_entry) in dir.root.clone() {
+                            stack.push((dir_entry, path.join(dir_name)))
+                        }
                     }
-                    Ok(())
                 }
             }
+            Ok(())
         }
         fn go_modified(path: &Path, entry: &DiffEntry, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match entry {
-                DiffEntry::File(_) => {
-                    writeln!(f, "M {}", path.to_str().unwrap())
-                }
-                DiffEntry::Directory(diff) => {
-                    for (sub_path, dir_entry) in diff.added.clone() {
-                        go_added(path.join(sub_path).as_path(), &dir_entry, f).unwrap();
+            let mut stack = vec![(entry.clone(), PathBuf::from(path))];
+            while let Some((entry, path)) = stack.pop() {
+                match entry {
+                    DiffEntry::File(_) => {
+                        writeln!(f, "M {}", path.to_str().unwrap()).unwrap();
                     }
-                    for (sub_path, diff_entry) in diff.modified.clone() {
-                        go_modified(path.join(sub_path).as_path(), &diff_entry, f).unwrap();
+                    DiffEntry::Directory(diff) => {
+                        for (dir_name, dir_entry) in diff.added.clone() {
+                            go_added(path.join(dir_name).as_path(), &dir_entry, f).unwrap();
+                        }
+                        for (dir_name, diff_entry) in diff.modified.clone() {
+                            stack.push((diff_entry, path.join(dir_name)))
+                        }
+                        for dir_name in diff.deleted.clone() {
+                            go_deleted(path.join(dir_name).as_path(), f).unwrap();
+                        }
                     }
-                    for sub_path in diff.deleted.clone() {
-                        go_deleted(path.join(sub_path).as_path(), f).unwrap();
-                    }
-                    Ok(())
                 }
             }
+            Ok(())
         }
         fn go_deleted(path: &Path, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             writeln!(f, "D {}", path.to_str().unwrap())
@@ -327,8 +333,8 @@ fn test_diff_display() {
             "A bar",
             "D a/foo",
             "A baz/bar",
-            "M baz/baz",
             "D baz/foo",
+            "M baz/baz",
             "D foo",
             ""
         ]
