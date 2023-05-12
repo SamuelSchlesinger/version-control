@@ -202,63 +202,74 @@ impl Directory {
 
 impl fmt::Display for Diff {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn go_added(
-            path: &Path,
-            entry: &DirectoryEntry,
-            f: &mut fmt::Formatter<'_>,
-        ) -> fmt::Result {
-            let mut stack = vec![(entry.clone(), PathBuf::from(path))];
-            while let Some((entry, path)) = stack.pop() {
-                match entry {
+        enum DiffStackItem {
+            Deleted(PathBuf),
+            Added(PathBuf, DirectoryEntry),
+            Modified(PathBuf, DiffEntry),
+        }
+        let mut stack: Vec<DiffStackItem> = vec![];
+
+        for (path, dir_entry) in self.added.clone() {
+            stack.push(DiffStackItem::Added(PathBuf::from(path), dir_entry));
+        }
+        for (path, diff_entry) in self.modified.clone() {
+            stack.push(DiffStackItem::Modified(PathBuf::from(path), diff_entry));
+        }
+        for path in self.deleted.clone() {
+            stack.push(DiffStackItem::Deleted(PathBuf::from(path)));
+        }
+
+        enum DiffItem {
+            Deleted,
+            Added,
+            Modified,
+        }
+        let mut diff_paths: BTreeMap<PathBuf, DiffItem> = BTreeMap::new();
+
+        while let Some(diff_stack_item) = stack.pop() {
+            match diff_stack_item {
+                DiffStackItem::Deleted(path) => {
+                    diff_paths.insert(path, DiffItem::Deleted);
+                }
+                DiffStackItem::Added(path, dir_entry) => match dir_entry {
                     DirectoryEntry::File(_) => {
-                        writeln!(f, "A {}", path.to_str().unwrap()).unwrap();
+                        diff_paths.insert(path, DiffItem::Added);
                     }
                     DirectoryEntry::Directory(dir) => {
                         if dir.root.is_empty() {
-                            writeln!(f, "A {}", path.to_str().unwrap()).unwrap();
-                        }
-                        for (dir_name, dir_entry) in dir.root.clone() {
-                            stack.push((dir_entry, path.join(dir_name)))
+                            diff_paths.insert(path, DiffItem::Added);
+                        } else {
+                            for (dir_name, dir_entry) in dir.root.clone() {
+                                stack.push(DiffStackItem::Added(path.join(dir_name), dir_entry));
+                            }
                         }
                     }
-                }
-            }
-            Ok(())
-        }
-        fn go_modified(path: &Path, entry: &DiffEntry, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            let mut stack = vec![(entry.clone(), PathBuf::from(path))];
-            while let Some((entry, path)) = stack.pop() {
-                match entry {
+                },
+                DiffStackItem::Modified(path, diff_entry) => match diff_entry {
                     DiffEntry::File(_) => {
-                        writeln!(f, "M {}", path.to_str().unwrap()).unwrap();
+                        diff_paths.insert(path, DiffItem::Modified);
                     }
                     DiffEntry::Directory(diff) => {
                         for (dir_name, dir_entry) in diff.added.clone() {
-                            go_added(path.join(dir_name).as_path(), &dir_entry, f).unwrap();
+                            stack.push(DiffStackItem::Added(path.join(dir_name), dir_entry))
                         }
                         for (dir_name, diff_entry) in diff.modified.clone() {
-                            stack.push((diff_entry, path.join(dir_name)))
+                            stack.push(DiffStackItem::Modified(path.join(dir_name), diff_entry))
                         }
                         for dir_name in diff.deleted.clone() {
-                            go_deleted(path.join(dir_name).as_path(), f).unwrap();
+                            stack.push(DiffStackItem::Deleted(path.join(dir_name)))
                         }
                     }
-                }
+                },
             }
-            Ok(())
-        }
-        fn go_deleted(path: &Path, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            writeln!(f, "D {}", path.to_str().unwrap())
         }
 
-        for (path, dir_entry) in self.added.clone() {
-            go_added(&PathBuf::from(path), &dir_entry, f).unwrap();
-        }
-        for (path, diff_entry) in self.modified.clone() {
-            go_modified(&PathBuf::from(path), &diff_entry, f).unwrap();
-        }
-        for path in self.deleted.clone() {
-            go_deleted(&PathBuf::from(path), f).unwrap();
+        for (path, diff_item) in diff_paths {
+            match diff_item {
+                DiffItem::Deleted => writeln!(f, "D {}", path.to_str().unwrap())?,
+                DiffItem::Added => writeln!(f, "A {}", path.to_str().unwrap())?,
+                DiffItem::Modified => writeln!(f, "M {}", path.to_str().unwrap())?,
+            }
         }
         Ok(())
     }
@@ -330,11 +341,11 @@ fn test_diff_display() {
     assert_eq!(
         diff_5.to_string(),
         [
-            "A bar",
             "D a/foo",
+            "A bar",
             "A baz/bar",
-            "D baz/foo",
             "M baz/baz",
+            "D baz/foo",
             "D foo",
             ""
         ]
