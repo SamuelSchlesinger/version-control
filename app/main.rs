@@ -66,12 +66,8 @@ fn main() {
             let this_branch_directory: Directory = store
                 .read_json(this_snapshot.directory)
                 .expect("read this branch directory");
-            // TODO Format this more nicely, this is cringe
-            serde_json::to_writer_pretty(
-                stdout(),
-                &this_branch_directory.diff(&that_branch_directory),
-            )
-            .unwrap();
+            let diff = &this_branch_directory.diff(&that_branch_directory);
+            println!("{diff}")
         }
         Branch => {
             let dot_rev = DotRev::existing(current_dir().unwrap().join(".rev")).unwrap();

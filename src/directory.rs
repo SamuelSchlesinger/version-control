@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     fs::{read_dir, File},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -197,6 +198,159 @@ impl Directory {
         }
         Ok(Directory { root })
     }
+}
+
+impl fmt::Display for Diff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        enum DiffStackItem {
+            Deleted(PathBuf),
+            Added(PathBuf, DirectoryEntry),
+            Modified(PathBuf, DiffEntry),
+        }
+        let mut stack: Vec<DiffStackItem> = vec![];
+
+        for (path, dir_entry) in self.added.clone() {
+            stack.push(DiffStackItem::Added(PathBuf::from(path), dir_entry));
+        }
+        for (path, diff_entry) in self.modified.clone() {
+            stack.push(DiffStackItem::Modified(PathBuf::from(path), diff_entry));
+        }
+        for path in self.deleted.clone() {
+            stack.push(DiffStackItem::Deleted(PathBuf::from(path)));
+        }
+
+        enum DiffItem {
+            Deleted,
+            Added,
+            Modified,
+        }
+        let mut diff_paths: BTreeMap<PathBuf, DiffItem> = BTreeMap::new();
+
+        while let Some(diff_stack_item) = stack.pop() {
+            match diff_stack_item {
+                DiffStackItem::Deleted(path) => {
+                    diff_paths.insert(path, DiffItem::Deleted);
+                }
+                DiffStackItem::Added(path, dir_entry) => match dir_entry {
+                    DirectoryEntry::File(_) => {
+                        diff_paths.insert(path, DiffItem::Added);
+                    }
+                    DirectoryEntry::Directory(dir) => {
+                        if dir.root.is_empty() {
+                            diff_paths.insert(path, DiffItem::Added);
+                        } else {
+                            for (dir_name, dir_entry) in dir.root.clone() {
+                                stack.push(DiffStackItem::Added(path.join(dir_name), dir_entry));
+                            }
+                        }
+                    }
+                },
+                DiffStackItem::Modified(path, diff_entry) => match diff_entry {
+                    DiffEntry::File(_) => {
+                        diff_paths.insert(path, DiffItem::Modified);
+                    }
+                    DiffEntry::Directory(diff) => {
+                        for (dir_name, dir_entry) in diff.added.clone() {
+                            stack.push(DiffStackItem::Added(path.join(dir_name), dir_entry))
+                        }
+                        for (dir_name, diff_entry) in diff.modified.clone() {
+                            stack.push(DiffStackItem::Modified(path.join(dir_name), diff_entry))
+                        }
+                        for dir_name in diff.deleted.clone() {
+                            stack.push(DiffStackItem::Deleted(path.join(dir_name)))
+                        }
+                    }
+                },
+            }
+        }
+
+        for (path, diff_item) in diff_paths {
+            match diff_item {
+                DiffItem::Deleted => writeln!(f, "D {}", path.to_str().unwrap())?,
+                DiffItem::Added => writeln!(f, "A {}", path.to_str().unwrap())?,
+                DiffItem::Modified => writeln!(f, "M {}", path.to_str().unwrap())?,
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn test_diff_display() {
+    let diff_empty: Diff = Diff {
+        deleted: BTreeSet::new(),
+        added: BTreeMap::new(),
+        modified: BTreeMap::new(),
+    };
+    assert_eq!(diff_empty.to_string(), "");
+
+    let deleted_foo = BTreeSet::from([String::from("foo")]);
+    let added_bar: BTreeMap<String, DirectoryEntry> = vec![(
+        String::from("bar"),
+        DirectoryEntry::File(ObjectId::from(&vec![])),
+    )]
+    .into_iter()
+    .collect();
+
+    let diff_1: Diff = Diff {
+        deleted: BTreeSet::new(),
+        added: added_bar.clone(),
+        modified: BTreeMap::new(),
+    };
+    assert_eq!(diff_1.to_string(), "A bar\n");
+
+    let diff_2: Diff = Diff {
+        deleted: deleted_foo.clone(),
+        added: BTreeMap::new(),
+        modified: BTreeMap::new(),
+    };
+    assert_eq!(diff_2.to_string(), "D foo\n");
+
+    let diff_3: Diff = Diff {
+        deleted: deleted_foo.clone(),
+        added: added_bar.clone(),
+        modified: BTreeMap::new(),
+    };
+    assert_eq!(diff_3.to_string(), ["A bar", "D foo", ""].join("\n"));
+
+    let diff_4: Diff = Diff {
+        deleted: deleted_foo.clone(),
+        added: added_bar.clone(),
+        modified: vec![(
+            String::from("baz"),
+            DiffEntry::File(ObjectId::from(&vec![])),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    assert_eq!(
+        diff_4.to_string(),
+        ["A bar", "M baz", "D foo", ""].join("\n")
+    );
+
+    let diff_5: Diff = Diff {
+        deleted: deleted_foo.clone(),
+        added: added_bar.clone(),
+        modified: vec![
+            (String::from("a"), DiffEntry::Directory(Box::new(diff_2))),
+            (String::from("baz"), DiffEntry::Directory(Box::new(diff_4))),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    assert_eq!(
+        diff_5.to_string(),
+        [
+            "D a/foo",
+            "A bar",
+            "A baz/bar",
+            "M baz/baz",
+            "D baz/foo",
+            "D foo",
+            ""
+        ]
+        .join("\n")
+    );
 }
 
 #[test]
