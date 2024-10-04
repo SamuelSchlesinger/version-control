@@ -38,6 +38,16 @@ enum Command {
     },
     #[clap(about = "print out current branch")]
     Branch,
+    #[clap(about = "reset all files to the last snapshot on this branch")]
+    Reset {
+        #[arg(
+            short,
+            long,
+            default_value = "false",
+            help = "whether to delete files absent from the snapshot"
+        )]
+        delete_absent: bool,
+    },
 }
 
 fn main() {
@@ -45,10 +55,11 @@ fn main() {
     let args = Arguments::parse();
     use Command::*;
     match args.cmd {
+        Reset { delete_absent } => {
+            unimplemented!()
+        }
         Diff { branch } => {
-            let dir = current_dir().unwrap();
-            let rev_dir = dir.join(".rev");
-            let dot_rev = DotRev::existing(rev_dir).unwrap();
+            let dot_rev = DotRev::here().unwrap();
             let mut store = dot_rev.store().unwrap();
             let that_branch = branch;
             let this_branch: String = dot_rev.branch().unwrap();
@@ -70,39 +81,37 @@ fn main() {
             println!("{diff}")
         }
         Branch => {
-            let dot_rev = DotRev::existing(current_dir().unwrap().join(".rev")).unwrap();
+            let dot_rev = DotRev::here().unwrap();
             let branch = dot_rev.branch().unwrap();
             println!("{}", branch);
         }
         Checkout { branch } => {
-            let dot_rev = DotRev::existing(current_dir().unwrap().join(".rev")).unwrap();
+            let dot_rev = DotRev::here().unwrap();
             if !dot_rev.branch_exists(&branch).unwrap() {
                 dot_rev.create_branch(&branch).unwrap();
             }
             dot_rev.set_branch(&branch).unwrap();
         }
         Changes => {
-            let dir = current_dir().unwrap();
-            let rev_dir = dir.join(".rev");
-            let dot_rev = DotRev::existing(rev_dir).unwrap();
+            let dot_rev = DotRev::here().unwrap();
             let mut store = dot_rev.store().unwrap();
             let branch: String = dot_rev.branch().unwrap();
             let old_tip: ObjectId = dot_rev.branch_snapshot_id(&branch).unwrap();
             let ignores: Ignores = dot_rev.ignores().unwrap();
-            let directory = Directory::new(dir.as_path(), &ignores, &mut store).unwrap();
+            let directory =
+                Directory::new(current_dir().unwrap().as_path(), &ignores, &mut store).unwrap();
             let snapshot: SnapShot = store.read_json(old_tip).unwrap();
             let old_directory: Directory = store.read_json(snapshot.directory).unwrap();
             serde_json::to_writer_pretty(stdout(), &old_directory.diff(&directory)).unwrap();
         }
         Snap { message } => {
-            let dir = current_dir().unwrap();
-            let rev_dir = dir.join(".rev");
-            let dot_rev = DotRev::existing(rev_dir).unwrap();
+            let dot_rev = DotRev::here().unwrap();
             let mut store = dot_rev.store().unwrap();
             let branch: String = dot_rev.branch().unwrap();
             let old_tip: ObjectId = dot_rev.branch_snapshot_id(&branch).unwrap();
             let ignores: Ignores = dot_rev.ignores().unwrap();
-            let directory = Directory::new(dir.as_path(), &ignores, &mut store).unwrap();
+            let directory =
+                Directory::new(current_dir().unwrap().as_path(), &ignores, &mut store).unwrap();
             let directory_id = store.insert_json(&directory).unwrap();
             let snap = SnapShot {
                 directory: directory_id,

@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    env::current_dir,
     fs::{create_dir, create_dir_all, read_dir, read_to_string, try_exists, File},
     io::Write,
     path::{Path, PathBuf},
@@ -66,6 +67,10 @@ impl DotRev {
         Ok(DotRev { root })
     }
 
+    pub fn here() -> Result<Self, Error> {
+        DotRev::existing(current_dir().unwrap().join(".rev"))
+    }
+
     pub fn existing(root: PathBuf) -> Result<Self, Error> {
         read_dir(&root)?;
         Ok(DotRev { root })
@@ -110,7 +115,7 @@ impl DotRev {
     }
 
     pub fn store(&self) -> Result<DirectoryObjectStore, Error> {
-        Ok(DirectoryObjectStore::new(self.root.clone())?)
+        Ok(DirectoryObjectStore::new(self.root.join("store").clone())?)
     }
 
     pub fn ignores(&self) -> Result<Ignores, Error> {

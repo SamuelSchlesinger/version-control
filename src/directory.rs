@@ -143,7 +143,13 @@ pub struct Ignores {
 impl Default for Ignores {
     fn default() -> Self {
         Ignores {
-            set: vec![String::from(".rev")].into_iter().collect(),
+            set: vec![
+                String::from(".rev"),
+                String::from("target"),
+                String::from(".git"),
+            ]
+            .into_iter()
+            .collect(),
         }
     }
 }
