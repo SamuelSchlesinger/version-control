@@ -36,11 +36,15 @@ Commands:
   changes   Show files and directories changed since the latest snapshot
   snap      Take a new snapshot (commit changes)
   checkout  Switch to a different branch
-  branch    Print out current branch name
+  branch    Create or list branches
+  status    Show working tree status
+  reset     Reset files to last snapshot
+  log       Show commit logs
   help      Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
+  -i, --interactive  Use interactive mode with prompts
 ```
 
 ### Examples

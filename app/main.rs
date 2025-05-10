@@ -25,13 +25,6 @@ enum AppError {
     FailedToResetFiles(String),
     FailedToRestoreFiles(String),
     FailedToOutputChanges(String),
-    RemoteNotFound(String),
-    #[allow(dead_code)]
-    RemoteAlreadyExists(String),
-    #[allow(dead_code)]
-    RemoteError(String),
-    PushError(String),
-    PullError(String),
     Other(String),
 }
 
@@ -63,10 +56,6 @@ impl std::fmt::Display for AppError {
                 DotRevError::BranchNotFound(branch) => write!(f, "Branch '{}' not found. Use 'revtool branch' to list available branches.", branch),
                 DotRevError::RepositoryNotInitialized => write!(f, "Repository not initialized. Use 'revtool init' first to create a repository."),
                 DotRevError::CorruptRepository(msg) => write!(f, "Corrupt repository: {}. Consider reinitializing or restoring from backup.", msg),
-                DotRevError::RemoteNotFound(name) => write!(f, "Remote '{}' not found. Use 'revtool remote list' to see available remotes.", name),
-                DotRevError::RemoteAlreadyExists(name) => write!(f, "Remote '{}' already exists. Use 'revtool remote remove {}' first if you want to recreate it.", name, name),
-                DotRevError::PushError(msg) => write!(f, "Push failed: {}. Check network connection and remote repository status.", msg),
-                DotRevError::PullError(msg) => write!(f, "Pull failed: {}. Check network connection and remote repository status.", msg),
             },
             AppError::IoError(err) => {
                 match err.kind() {
@@ -84,11 +73,6 @@ impl std::fmt::Display for AppError {
             AppError::FailedToResetFiles(reason) => write!(f, "Failed to reset files: {}. Ensure you have write permissions in the directory.", reason),
             AppError::FailedToRestoreFiles(reason) => write!(f, "Failed to restore files: {}. Check directory permissions and available space.", reason),
             AppError::FailedToOutputChanges(reason) => write!(f, "Failed to output changes: {}. Check terminal and stdout status.", reason),
-            AppError::RemoteNotFound(name) => write!(f, "Remote '{}' not found. Use 'revtool remote list' to see available remotes or 'revtool remote add' to create one.", name),
-            AppError::RemoteAlreadyExists(name) => write!(f, "Remote '{}' already exists. Use a different name or remove the existing remote first.", name),
-            AppError::RemoteError(msg) => write!(f, "Remote operation failed: {}. Check network connection and remote status.", msg),
-            AppError::PushError(msg) => write!(f, "Push failed: {}. Ensure the remote repository is accessible and you have proper permissions.", msg),
-            AppError::PullError(msg) => write!(f, "Pull failed: {}. Check network connection and ensure the remote repository is available.", msg),
             AppError::Other(msg) => write!(f, "{}. Please check your command and try again.", msg),
         }
     }
@@ -96,26 +80,6 @@ impl std::fmt::Display for AppError {
 
 type AppResult<T> = Result<T, AppError>;
 
-#[derive(Subcommand, Debug)]
-enum RemoteCommand {
-    #[clap(about = "Add a new remote")]
-    Add {
-        #[arg(help = "Name of the remote")]
-        name: String,
-
-        #[arg(help = "URL or path to the remote repository")]
-        url: String,
-    },
-
-    #[clap(about = "Remove a remote")]
-    Remove {
-        #[arg(help = "Name of the remote to remove")]
-        name: String,
-    },
-
-    #[clap(about = "List all remotes")]
-    List,
-}
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -134,41 +98,6 @@ struct Arguments {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    #[clap(
-        about = "Add a remote repository reference",
-        long_about = "Adds a reference to a remote repository that can be used for push/pull operations",
-        after_help = "Example:\n  revtool remote add origin /path/to/remote/repo"
-    )]
-    Remote {
-        #[clap(subcommand)]
-        cmd: RemoteCommand,
-    },
-
-    #[clap(
-        about = "Push changes to a remote repository",
-        long_about = "Pushes local branch changes to a remote repository",
-        after_help = "Example:\n  revtool push origin dev"
-    )]
-    Push {
-        #[arg(help = "Name of the remote to push to")]
-        remote: Option<String>,
-
-        #[arg(help = "Branch to push")]
-        branch: Option<String>,
-    },
-
-    #[clap(
-        about = "Pull changes from a remote repository",
-        long_about = "Pulls remote branch changes to the local repository",
-        after_help = "Example:\n  revtool pull origin dev"
-    )]
-    Pull {
-        #[arg(help = "Name of the remote to pull from")]
-        remote: Option<String>,
-
-        #[arg(help = "Branch to pull")]
-        branch: Option<String>,
-    },
     #[clap(
         about = "Display help information and usage examples",
         long_about = "Shows detailed help information and common usage examples for revtool commands",
@@ -285,29 +214,6 @@ fn get_repository() -> AppResult<(DotRev, String)> {
     Ok((dot_rev, branch))
 }
 
-/// Interactive mode helper for remote selection
-fn interactive_remote_selection(dot_rev: &DotRev) -> AppResult<Option<String>> {
-    let remotes = dot_rev.remotes()
-        .map_err(|e| AppError::DotRevError(e))?;
-
-    if remotes.remotes.is_empty() {
-        return Err(AppError::RemoteNotFound("No remotes configured. Use 'revtool remote add' first.".to_string()));
-    }
-
-    let remote_names: Vec<String> = remotes.remotes.keys().cloned().collect();
-
-    println!("\n{}", "Available remotes:".cyan().bold());
-
-    let theme = ColorfulTheme::default();
-    let selection = Select::with_theme(&theme)
-        .with_prompt("Select remote")
-        .default(0)
-        .items(&remote_names)
-        .interact()
-        .map_err(|_| AppError::Other("Failed to get user input".to_string()))?;
-
-    Ok(Some(remote_names[selection].clone()))
-}
 
 /// Interactive mode helper for branch selection
 fn interactive_branch_selection(dot_rev: &DotRev, current_branch: &str) -> AppResult<Option<String>> {
@@ -379,37 +285,6 @@ fn interactive_snapshot_message(diff: &lib::directory::Diff) -> AppResult<Option
 // Define help texts for command examples
 pub fn get_command_help(command: &str) -> Option<String> {
     match command.to_lowercase().as_str() {
-        "remote" => Some(r#"
-Manage remote repositories:
-  revtool remote add <name> <url>      # Add a new remote
-  revtool remote remove <name>         # Remove a remote
-  revtool remote list                  # List all remotes
-
-Examples:
-  revtool remote add origin /path/to/remote/repo
-  revtool remote list"#.to_string()),
-
-        "push" => Some(r#"
-Push local changes to a remote repository:
-  revtool push [<remote>] [<branch>]
-
-Examples:
-  revtool push                  # Push current branch to "origin" (interactive mode only)
-  revtool push origin           # Push current branch to "origin"
-  revtool push origin dev       # Push "dev" branch to "origin"
-
-When using interactive mode (-i), you can select the remote and branch interactively."#.to_string()),
-
-        "pull" => Some(r#"
-Pull remote changes into local repository:
-  revtool pull [<remote>] [<branch>]
-
-Examples:
-  revtool pull                  # Pull current branch from "origin" (interactive mode only)
-  revtool pull origin           # Pull current branch from "origin"
-  revtool pull origin dev       # Pull "dev" branch from "origin"
-
-When using interactive mode (-i), you can select the remote and branch interactively."#.to_string()),
         "ignore" => Some(r#"
 Manage files and directories to ignore:
   revtool ignore                # List all current ignore patterns
@@ -531,153 +406,7 @@ Use 'revtool usage <command>' for detailed help on a specific command.
 
 fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
     use Command::*;
-    use RemoteCommand::*;
     match cmd {
-        Remote { cmd } => {
-            let dot_rev = DotRev::here()?;
-
-            match cmd {
-                Add { name, url } => {
-                    dot_rev.add_remote(&name, &url)
-                        .map_err(|e| AppError::DotRevError(e))?;
-                    println!("Added remote '{}' with URL '{}'", name.green().bold(), url);
-                    Ok(())
-                },
-                Remove { name } => {
-                    dot_rev.remove_remote(&name)
-                        .map_err(|e| match e {
-                            DotRevError::RemoteNotFound(name) => AppError::RemoteNotFound(name),
-                            _ => AppError::DotRevError(e),
-                        })?;
-                    println!("Removed remote '{}'", name.red().bold());
-                    Ok(())
-                },
-                List => {
-                    let remotes = dot_rev.remotes()
-                        .map_err(|e| AppError::DotRevError(e))?;
-
-                    if remotes.remotes.is_empty() {
-                        println!("No remotes configured.");
-                    } else {
-                        println!("{}", "Configured remotes:".cyan().bold());
-                        for (name, remote) in remotes.remotes {
-                            println!("  {} -> {}", name.green().bold(), remote.url);
-                        }
-                    }
-                    Ok(())
-                }
-            }
-        },
-
-        Push { remote, branch } => {
-            let (dot_rev, current_branch) = get_repository()?;
-
-            // Get the remote name - either from command line or interactively
-            let remote_name = if let Some(r) = remote {
-                r
-            } else if interactive {
-                match interactive_remote_selection(&dot_rev)? {
-                    Some(r) => r,
-                    None => return Ok(()) // User aborted
-                }
-            } else {
-                return Err(AppError::Other("No remote specified. Please provide a remote name or use interactive mode with -i".to_string()));
-            };
-
-            // Get the branch to push - either from command line or use current branch
-            let branch_to_push = if let Some(b) = branch {
-                b
-            } else if interactive {
-                match interactive_branch_selection(&dot_rev, &current_branch)? {
-                    Some(b) => b,
-                    None => return Ok(()) // User aborted
-                }
-            } else {
-                current_branch
-            };
-
-            // Confirm the push if in interactive mode
-            if interactive {
-                let theme = ColorfulTheme::default();
-                if !Confirm::with_theme(&theme)
-                    .with_prompt(format!("Push branch '{}' to remote '{}'?", branch_to_push, remote_name))
-                    .default(true)
-                    .interact()
-                    .unwrap_or(false) {
-                    println!("Push aborted.");
-                    return Ok(());
-                }
-            }
-
-            // Perform the push
-            println!("Pushing branch '{}' to remote '{}'...", branch_to_push.green().bold(), remote_name.green().bold());
-
-            dot_rev.push(&remote_name, &branch_to_push)
-                .map_err(|e| match e {
-                    DotRevError::RemoteNotFound(name) => AppError::RemoteNotFound(name),
-                    DotRevError::BranchNotFound(name) => AppError::BranchNotFound(name),
-                    DotRevError::PushError(msg) => AppError::PushError(msg),
-                    _ => AppError::DotRevError(e),
-                })?;
-
-            println!("Branch '{}' successfully pushed to remote '{}'", branch_to_push.green().bold(), remote_name.green().bold());
-            Ok(())
-        },
-
-        Pull { remote, branch } => {
-            let (dot_rev, current_branch) = get_repository()?;
-
-            // Get the remote name - either from command line or interactively
-            let remote_name = if let Some(r) = remote {
-                r
-            } else if interactive {
-                match interactive_remote_selection(&dot_rev)? {
-                    Some(r) => r,
-                    None => return Ok(()) // User aborted
-                }
-            } else {
-                return Err(AppError::Other("No remote specified. Please provide a remote name or use interactive mode with -i".to_string()));
-            };
-
-            // Get the branch to pull - either from command line or use current branch
-            let branch_to_pull = if let Some(b) = branch {
-                b
-            } else if interactive {
-                match interactive_branch_selection(&dot_rev, &current_branch)? {
-                    Some(b) => b,
-                    None => return Ok(()) // User aborted
-                }
-            } else {
-                current_branch
-            };
-
-            // Confirm the pull if in interactive mode
-            if interactive {
-                let theme = ColorfulTheme::default();
-                if !Confirm::with_theme(&theme)
-                    .with_prompt(format!("Pull branch '{}' from remote '{}'?", branch_to_pull, remote_name))
-                    .default(true)
-                    .interact()
-                    .unwrap_or(false) {
-                    println!("Pull aborted.");
-                    return Ok(());
-                }
-            }
-
-            // Perform the pull
-            println!("Pulling branch '{}' from remote '{}'...", branch_to_pull.green().bold(), remote_name.green().bold());
-
-            dot_rev.pull(&remote_name, &branch_to_pull)
-                .map_err(|e| match e {
-                    DotRevError::RemoteNotFound(name) => AppError::RemoteNotFound(name),
-                    DotRevError::BranchNotFound(name) => AppError::BranchNotFound(name),
-                    DotRevError::PullError(msg) => AppError::PullError(msg),
-                    _ => AppError::DotRevError(e),
-                })?;
-
-            println!("Branch '{}' successfully pulled from remote '{}'", branch_to_pull.green().bold(), remote_name.green().bold());
-            Ok(())
-        },
         Usage { command } => {
             match command {
                 Some(cmd) => {
@@ -1042,20 +771,6 @@ fn main() {
                 eprintln!("{} {}", "Error:".red().bold(), err);
                 println!("\nTo initialize a repository in the current directory, run:");
                 println!("  revtool init");
-                exit(1);
-            },
-            AppError::RemoteNotFound(ref name) => {
-                eprintln!("{} {}", "Error:".red().bold(), err);
-                println!("\nTo add a remote named '{}', use:", name);
-                println!("  revtool remote add {} <url>", name);
-                exit(1);
-            },
-            AppError::Other(ref msg) if msg.contains("No remote specified") => {
-                eprintln!("{} {}", "Error:".red().bold(), err);
-                println!("\nTo use with a specific remote, provide the remote name:");
-                println!("  revtool push <remote-name> [branch]");
-                println!("  revtool pull <remote-name> [branch]");
-                println!("\nOr use interactive mode with the -i flag");
                 exit(1);
             },
             _ => {
