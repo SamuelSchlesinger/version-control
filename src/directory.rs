@@ -9,7 +9,10 @@ use std::{
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
-use crate::{object_id::ObjectId, object_store::ObjectStore};
+use crate::{
+    object_id::ObjectId,
+    object_store::ObjectStore
+};
 
 /// A directory tree, with [`ObjectId`]s at the leaves.
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize, Default)]
@@ -38,9 +41,51 @@ pub struct Diff {
     pub modified: BTreeMap<String, DiffEntry>,
 }
 
+impl Diff {
+    /// Returns whether this diff contains any content-level diffs
+    pub fn has_content_diffs(&self) -> bool {
+        for (_, entry) in &self.modified {
+            match entry {
+                DiffEntry::FileWithContentDiff { content_diff, .. } => {
+                    if content_diff.is_some() {
+                        return true;
+                    }
+                }
+                DiffEntry::Directory(diff) => {
+                    if diff.has_content_diffs() {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// This approach doesn't work well for production because we can't mutate the nested Directory
+    /// objects without cloning them. Instead, generate content diffs at creation time in
+    /// the Directory::diff_with_content method
+    #[deprecated]
+    pub fn with_content_diffs<Store: ObjectStore>(&mut self, _store: &Store) -> &mut Self {
+        // This approach won't work properly - directory diffs need to be created with content
+        // at generation time
+        self
+    }
+}
+
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub enum DiffEntry {
+    /// A file was modified, contains new ObjectId
     File(ObjectId),
+    /// A file was modified with content diff available
+    FileWithContentDiff {
+        /// New object ID
+        new_id: ObjectId,
+        /// Optional content diff
+        #[serde(skip)]
+        content_diff: Option<crate::content_diff::ContentDiff>,
+    },
+    /// A directory was modified
     Directory(Box<Diff>),
 }
 
@@ -50,7 +95,11 @@ impl DirectoryEntry {
         match (self, other) {
             (File(id), File(id_)) => {
                 if id != id_ {
-                    Some(DiffEntry::File(*id_))
+                    // Files are different, create a basic file diff entry
+                    Some(DiffEntry::FileWithContentDiff {
+                        new_id: *id_,
+                        content_diff: None, // Content diff will be populated later when requested
+                    })
                 } else {
                     None
                 }
@@ -70,35 +119,106 @@ impl DirectoryEntry {
             }
         }
     }
+
+    // Generate content diff for a file entry
+    pub fn generate_content_diff<Store: ObjectStore>(
+        &self,
+        other: &DirectoryEntry,
+        store: &Store
+    ) -> Option<DiffEntry> {
+        use DirectoryEntry::*;
+        match (self, other) {
+            (File(old_id), File(new_id)) => {
+                if old_id != new_id {
+                    match crate::content_diff::ContentDiff::generate(store, *old_id, *new_id) {
+                        Ok(content_diff) => Some(DiffEntry::FileWithContentDiff {
+                            new_id: *new_id,
+                            content_diff,
+                        }),
+                        Err(_) => Some(DiffEntry::File(*new_id)),
+                    }
+                } else {
+                    None
+                }
+            }
+            // For other cases, fall back to the regular diff
+            _ => self.diff(other),
+        }
+    }
 }
 
 impl Directory {
     /// Compute the diff between this directory structure and the one
     /// which is currently located at the path.
     pub fn diff(&self, other: &Directory) -> Diff {
+        // Use InMemoryObjectStore as a type parameter but pass None as the store
+        // since we're not using content diffs
+        self.diff_internal::<crate::object_store::in_memory::InMemoryObjectStore>(other, false, None)
+    }
+
+    /// Compute a diff with optional content diffing between file contents.
+    ///
+    /// When `with_content_diff` is true and an object store is provided,
+    /// the diff will include line-by-line differences between modified files.
+    pub fn diff_with_content<Store: ObjectStore>(
+        &self,
+        other: &Directory,
+        with_content_diff: bool,
+        store: &Store
+    ) -> Diff {
+        self.diff_internal(other, with_content_diff, Some(store))
+    }
+
+    // Internal implementation that handles both regular and content diffing
+    fn diff_internal<Store: ObjectStore>(
+        &self,
+        other: &Directory,
+        with_content_diff: bool,
+        store: Option<&Store>
+    ) -> Diff {
         let added: BTreeMap<String, DirectoryEntry> = other
             .root
             .iter()
             .filter(|(file_name, _dir_entry)| !self.root.contains_key(*file_name))
             .map(|(fname, dir_entry)| (fname.clone(), dir_entry.clone()))
             .collect();
+
         let deleted: BTreeSet<String> = self
             .root
             .iter()
             .filter(|(file_name, _dir_entry)| !other.root.contains_key(*file_name))
             .map(|(fname, _dir_entry)| fname.clone())
             .collect();
+
         let modified: BTreeMap<String, DiffEntry> = self
             .root
             .iter()
             .filter_map(|(file_name, dir_entry)| {
                 other.root.get(file_name).and_then(|other_dir_entry| {
-                    dir_entry
-                        .diff(other_dir_entry)
-                        .map(|diff| (file_name.clone(), diff))
+                    // If content diffing is enabled and we have an object store
+                    if with_content_diff && store.is_some() {
+                        match (dir_entry, other_dir_entry) {
+                            // For files, use the content diff method
+                            (DirectoryEntry::File(_), DirectoryEntry::File(_)) => {
+                                dir_entry
+                                    .generate_content_diff(other_dir_entry, store.unwrap())
+                                    .map(|diff| (file_name.clone(), diff))
+                            }
+                            // For directories or mixed types, use regular diff
+                            _ => dir_entry
+                                .diff(other_dir_entry)
+                                .map(|diff| (file_name.clone(), diff))
+                        }
+                    } else {
+                        // If content diffing is disabled, use the regular diff
+                        dir_entry
+                            .diff(other_dir_entry)
+                            .map(|diff| (file_name.clone(), diff))
+                    }
                 })
             })
             .collect();
+
         Diff {
             added,
             deleted,
@@ -339,6 +459,7 @@ impl Directory {
 
 impl fmt::Display for Diff {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // This enum now carries a content_diff option for file changes
         enum DiffStackItem {
             Deleted(PathBuf),
             Added(PathBuf, DirectoryEntry),
@@ -356,10 +477,13 @@ impl fmt::Display for Diff {
             stack.push(DiffStackItem::Deleted(PathBuf::from(path)));
         }
 
+        // This enum now includes a variant for files with content diffs
         enum DiffItem {
             Deleted,
             Added,
             Modified,
+            // Special variant for modified files with content diffs
+            ModifiedWithContent(crate::content_diff::ContentDiff),
         }
         let mut diff_paths: BTreeMap<PathBuf, DiffItem> = BTreeMap::new();
 
@@ -386,6 +510,13 @@ impl fmt::Display for Diff {
                     DiffEntry::File(_) => {
                         diff_paths.insert(path, DiffItem::Modified);
                     }
+                    DiffEntry::FileWithContentDiff { content_diff, .. } => {
+                        if let Some(content_diff) = content_diff {
+                            diff_paths.insert(path, DiffItem::ModifiedWithContent(content_diff));
+                        } else {
+                            diff_paths.insert(path, DiffItem::Modified);
+                        }
+                    }
                     DiffEntry::Directory(diff) => {
                         for (dir_name, dir_entry) in diff.added.clone() {
                             stack.push(DiffStackItem::Added(path.join(dir_name), dir_entry))
@@ -406,6 +537,13 @@ impl fmt::Display for Diff {
                 DiffItem::Deleted => writeln!(f, "D {}", path.to_str().unwrap())?,
                 DiffItem::Added => writeln!(f, "A {}", path.to_str().unwrap())?,
                 DiffItem::Modified => writeln!(f, "M {}", path.to_str().unwrap())?,
+                DiffItem::ModifiedWithContent(content_diff) => {
+                    writeln!(f, "M {}", path.to_str().unwrap())?;
+                    // Format a delimited content diff section
+                    writeln!(f, "<<<<<<< CONTENT DIFF: {} >>>>>>>", path.to_str().unwrap())?;
+                    writeln!(f, "{}", content_diff)?;
+                    writeln!(f, "<<<<<<< END CONTENT DIFF >>>>>>>>")?;
+                }
             }
         }
         Ok(())

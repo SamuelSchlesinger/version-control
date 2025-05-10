@@ -15,6 +15,8 @@
 //!    file paths mapping to their content hashes
 //! 3. **Snapshot history** - A directed acyclic graph (DAG) of snapshots that forms the version history
 //! 4. **Branch management** - Separate development lines maintained as references to snapshots
+//! 5. **Diffing** - Both structure-level (files added/removed/modified) and content-level
+//!    (line-by-line changes) diffing capabilities between files and snapshots
 //!
 //! ## Usage
 //!
@@ -43,6 +45,18 @@ pub mod object_store;
 /// Implements the `SnapShot` type which represents a point-in-time version
 /// of a directory structure, forming nodes in the version history graph.
 pub mod snapshot;
+
+/// Provides functionality for diffing file contents at the line level,
+/// showing what changed within files between different versions.
+pub mod content_diff;
+
+/// Implements functionality for comparing snapshots and generating detailed
+/// diffs between repository states at different points in the version history.
+pub mod snapshot_diff;
+
+/// Provides utilities for formatting diffs in human-readable ways,
+/// including colorized terminal output and context-sensitive displays.
+pub mod diff_format;
 
 // Test modules
 #[cfg(test)]

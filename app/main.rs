@@ -130,26 +130,56 @@ enum Command {
     #[clap(
         about = "Check the difference between this branch and another",
         long_about = "Compares the files in the current branch with the specified branch and displays the differences",
-        after_help = "Example:\n  revtool diff dev\n  revtool diff main"
+        after_help = "Example:\n  revtool diff dev\n  revtool diff main\n  revtool diff --content main"
     )]
     Diff {
         #[arg(help = "Branch to compare with current branch")]
-        branch: String
+        branch: String,
+
+        #[arg(long, help = "Show content-level diffs for modified files")]
+        content: bool,
+
+        #[arg(long, help = "Number of context lines to show around changes", default_value_t = 3)]
+        context: usize,
+
+        #[arg(long, help = "Disable colorized output")]
+        no_color: bool
     },
 
     #[clap(
         about = "Shows files and directories changed since the latest snapshot",
         long_about = "Outputs detailed information about which files have been added, modified, or deleted since the last snapshot",
-        after_help = "Example:\n  revtool changes"
+        after_help = "Example:\n  revtool changes\n  revtool changes --content\n  revtool changes --json"
     )]
-    Changes,
+    Changes {
+        #[arg(long, help = "Show content-level diffs for modified files")]
+        content: bool,
+
+        #[arg(long, help = "Output as JSON instead of formatted text")]
+        json: bool,
+
+        #[arg(long, help = "Number of context lines to show around changes", default_value_t = 3)]
+        context: usize,
+
+        #[arg(long, help = "Disable colorized output")]
+        no_color: bool
+    },
 
     #[clap(
         about = "Show working tree status",
         long_about = "Shows which files have been modified, added, or deleted since the last snapshot. Similar to 'git status'",
-        after_help = "Example:\n  revtool status"
+        after_help = "Example:\n  revtool status\n  revtool status --content"
     )]
-    Status,
+    Status {
+        #[arg(long, help = "Show content-level diffs for modified files")]
+        content: bool,
+
+        #[arg(long, help = "Number of context lines to show around changes", default_value_t = 3)]
+        context: usize,
+
+        #[arg(long, help = "Disable colorized output")]
+        no_color: bool
+    },
 
     #[clap(
         about = "Take a new snapshot (similar to git commit)",
@@ -310,11 +340,17 @@ Creates a .rev directory in the current location and initializes a repository st
         "diff" => Some(r#"
 Compare changes between branches:
   revtool diff <branch>
+  revtool diff --content <branch>  # Show content-level diffs
+  revtool diff --context <n> <branch>  # Show n lines of context
 
 Examples:
-  revtool diff main        # Compare current branch with main
+  revtool diff main                # Compare current branch with main
+  revtool diff --content main      # Show content-level diffs
+  revtool diff --content --context 5 main  # Show content diffs with 5 lines of context
+  revtool diff --no-color main     # Show without colors
 
-The diff command shows what changes would be merged if you merged the specified branch."#.to_string()),
+The diff command shows what changes would be merged if you merged the specified branch.
+With --content, shows line-by-line differences within modified files."#.to_string()),
         "status" => Some(r#"
 Show the current status of the working directory:
   revtool status
@@ -406,6 +442,21 @@ Use 'revtool usage <command>' for detailed help on a specific command.
 
 fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
     use Command::*;
+
+    // Special cases that don't require an initialized repository
+    match &cmd {
+        // These commands should work without a repository
+        Usage { .. } => {},
+        Init => {},
+        // All other commands require a repository
+        _ => {
+            // Only check for repository if we're not initializing or showing usage
+            if let Err(e) = DotRev::here() {
+                return Err(AppError::DotRevError(e));
+            }
+        }
+    }
+
     match cmd {
         Usage { command } => {
             match command {
@@ -481,9 +532,9 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 snapshot_id.to_string().cyan());
             Ok(())
         }
-        Diff { branch } => {
+        Diff { branch, content, context, no_color } => {
             let (dot_rev, this_branch) = get_repository()?;
-            let mut store = dot_rev.store()?;
+            let store = dot_rev.store()?;
             let that_branch = branch;
 
             if !dot_rev.branch_exists(&that_branch)? {
@@ -494,31 +545,29 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let this_tip = dot_rev.branch_snapshot_id(&this_branch)?;
             let that_tip = dot_rev.branch_snapshot_id(&that_branch)?;
 
-            // Load directory structures
-            let this_snapshot: SnapShot = store.read_json(this_tip)?;
-            let that_snapshot: SnapShot = store.read_json(that_tip)?;
+            // Generate snapshot diff
+            let snapshot_diff = lib::snapshot_diff::SnapShotDiff::generate(
+                &store,
+                this_tip,
+                that_tip,
+                content
+            ).map_err(|e| AppError::Other(format!("Failed to generate diff: {:?}", e)))?;
 
-            let this_branch_directory: Directory = store.read_json(this_snapshot.directory)?;
-            let that_branch_directory: Directory = store.read_json(that_snapshot.directory)?;
+            // Import the required types first
+            use lib::diff_format;
 
-            // Calculate and display diff
-            let diff = &this_branch_directory.diff(&that_branch_directory);
-            println!("Diff between branch '{}' and '{}':",
-                this_branch.green().bold(),
-                that_branch.green().bold());
+            // Create format options based on user preferences
+            let format_options = diff_format::FormatOptions {
+                use_color: !no_color,
+                show_content: content,
+                context_lines: context,
+                show_stats: true,
+            };
 
-            // Custom output for diff to add colors
-            for line in diff.to_string().lines() {
-                if line.starts_with("A ") {
-                    println!("{} {}", "A".green().bold(), line[2..].green());
-                } else if line.starts_with("D ") {
-                    println!("{} {}", "D".red().bold(), line[2..].red());
-                } else if line.starts_with("M ") {
-                    println!("{} {}", "M".yellow().bold(), line[2..].yellow());
-                } else {
-                    println!("{}", line);
-                }
-            }
+            // Format the diff with colors
+            let formatter = diff_format::SnapShotDiffFormatter::new(&snapshot_diff, format_options);
+
+            println!("{}", formatter);
 
             Ok(())
         }
@@ -548,17 +597,24 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             }
         },
 
-        Status => {
+        Status { content, context, no_color } => {
             let (dot_rev, branch) = get_repository()?;
             let mut store = dot_rev.store()?;
             let old_tip: ObjectId = dot_rev.branch_snapshot_id(&branch)?;
             let ignores: Ignores = dot_rev.ignores()?;
             let cwd = current_dir()?;
+
+            // Calculate directory diff with or without content depending on options
             let directory = Directory::new(cwd.as_path(), &ignores, &mut store)
                 .map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
             let snapshot: SnapShot = store.read_json(old_tip)?;
             let old_directory: Directory = store.read_json(snapshot.directory)?;
-            let diff = old_directory.diff(&directory);
+
+            let diff = if content {
+                old_directory.diff_with_content(&directory, true, &store)
+            } else {
+                old_directory.diff(&directory)
+            };
 
             println!("On branch {}", branch.green().bold());
             if diff.added.is_empty() && diff.deleted.is_empty() && diff.modified.is_empty() {
@@ -567,22 +623,25 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 println!("\n{}", "Changes not yet snapped:".yellow().bold());
                 println!("  (use \"{}\" to create a new snapshot)\n", "revtool snap -m <message>".cyan());
 
-                for file in diff.added.keys() {
-                    println!("        {}: {}", "new file".green().bold(), file);
-                }
+                // Import the required types locally
+                use lib::diff_format;
 
-                for file in &diff.deleted {
-                    println!("        {}: {}", "deleted".red().bold(), file);
-                }
+                // Use our formatter for consistent display
+                let format_options = diff_format::FormatOptions {
+                    use_color: !no_color,
+                    show_content: content,
+                    context_lines: context,
+                    show_stats: true,
+                };
 
-                for file in diff.modified.keys() {
-                    println!("        {}: {}", "modified".yellow().bold(), file);
-                }
+                let formatter = diff_format::DiffFormatter::new(&diff, format_options);
+                println!("{}", formatter);
             }
             Ok(())
         },
 
         Log { limit } => {
+            // Repository existence check is now done at the beginning of the function
             let (dot_rev, branch) = get_repository()?;
             let mut store = dot_rev.store()?;
             let mut snapshot_id = dot_rev.branch_snapshot_id(&branch)?;
@@ -673,7 +732,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 snapshot_id.to_string().cyan());
             Ok(())
         }
-        Changes => {
+        Changes { content, json, context, no_color } => {
             let (dot_rev, branch) = get_repository()?;
             let mut store = dot_rev.store()?;
             let old_tip = dot_rev.branch_snapshot_id(&branch)?;
@@ -688,8 +747,33 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let snapshot: SnapShot = store.read_json(old_tip)?;
             let old_directory: Directory = store.read_json(snapshot.directory)?;
 
-            serde_json::to_writer_pretty(stdout(), &old_directory.diff(&directory))
-                .map_err(|e| AppError::FailedToOutputChanges(format!("{}", e)))?;
+            // Generate diff with or without content
+            let diff = if content {
+                old_directory.diff_with_content(&directory, true, &store)
+            } else {
+                old_directory.diff(&directory)
+            };
+
+            if json {
+                // Output as JSON
+                serde_json::to_writer_pretty(stdout(), &diff)
+                    .map_err(|e| AppError::FailedToOutputChanges(format!("{}", e)))?;
+            } else {
+                // Import the required types locally
+                use lib::diff_format;
+
+                // Format with our new formatter
+                let format_options = diff_format::FormatOptions {
+                    use_color: !no_color,
+                    show_content: content,
+                    context_lines: context,
+                    show_stats: true,
+                };
+
+                let formatter = diff_format::DiffFormatter::new(&diff, format_options);
+                println!("{}", formatter);
+            }
+
             Ok(())
         }
         Snap { message } => {
