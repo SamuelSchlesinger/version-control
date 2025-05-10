@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     env::current_dir,
-    fs::{create_dir, create_dir_all, read_dir, read_to_string, try_exists, File},
+    fs::{create_dir, create_dir_all, read_dir, read_to_string, File},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -111,7 +111,24 @@ impl DotRev {
     }
 
     pub fn branch_exists(&self, branch: &str) -> Result<bool, Error> {
-        Ok(try_exists(self.root.join("branches").join(&branch))?)
+        Ok(Path::try_exists(&self.root.join("branches").join(&branch))?)
+    }
+
+    pub fn list_branches(&self) -> Result<Vec<String>, Error> {
+        let branches_dir = self.root.join("branches");
+        let mut branches = Vec::new();
+
+        for entry in read_dir(&branches_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                if let Some(branch_name) = entry.file_name().to_str() {
+                    branches.push(branch_name.to_string());
+                }
+            }
+        }
+
+        branches.sort();
+        Ok(branches)
     }
 
     pub fn store(&self) -> Result<DirectoryObjectStore, Error> {

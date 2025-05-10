@@ -1,7 +1,7 @@
 use std::{
-    fs::{create_dir, try_exists, File},
+    fs::{create_dir, File},
     io::{ErrorKind, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use crate::object_id::ObjectId;
@@ -20,7 +20,7 @@ pub struct DirectoryObjectStore {
 
 impl DirectoryObjectStore {
     pub fn new(root: PathBuf) -> Result<Self, std::io::Error> {
-        if !try_exists(&root)? {
+        if !Path::try_exists(&root)? {
             log::info!("creating directory store root: {:?}", root);
             create_dir(&root)?;
         }
@@ -37,7 +37,7 @@ impl ObjectStore for DirectoryObjectStore {
         let subdir: &str = &s[0..2];
         let filename: &str = &s[2..];
         let path = self.root.join(format!("{}/{}", subdir, filename));
-        std::fs::try_exists(path)
+        Path::try_exists(&path)
     }
 
     fn read(&self, id: ObjectId) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -70,11 +70,11 @@ impl ObjectStore for DirectoryObjectStore {
         let filename: &str = &s[2..];
         let subdir_path = self.root.join(format!("{}", subdir));
         let path = subdir_path.join(format!("{}", filename));
-        if std::fs::try_exists(&path)? {
+        if Path::try_exists(&path)? {
             log::info!("{:?} already exists", path);
             return Ok(id);
         }
-        if !std::fs::try_exists(&subdir_path)? {
+        if !Path::try_exists(&subdir_path)? {
             log::info!("creating subdir path {:?} in {:?}", subdir_path, self.root);
             std::fs::create_dir(&subdir_path)?;
         }

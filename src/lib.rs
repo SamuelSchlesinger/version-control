@@ -1,5 +1,3 @@
-#![feature(fs_try_exists)]
-
 //! # Revision Control
 //!
 //! This is an implementation of a basic revision control system.

@@ -24,6 +24,12 @@ pub enum Error<Store: ObjectStore> {
     IO(std::io::Error),
 }
 
+impl<Store: ObjectStore> From<std::io::Error> for Error<Store> {
+    fn from(error: std::io::Error) -> Self {
+        Error::IO(error)
+    }
+}
+
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct Diff {
     pub deleted: BTreeSet<String>,
@@ -102,12 +108,16 @@ impl Directory {
     /// Write out the directory structure at the given directory path.
     ///
     /// The target directory must already exist.
+    /// If delete_absent is true, files in the target directory that are not in
+    /// this Directory will be deleted.
     pub fn write<Store: ObjectStore>(
         &self,
         store: &Store,
         path: &Path,
+        delete_absent: bool,
     ) -> Result<(), Error<Store>> {
         if read_dir(path).is_ok() {
+            // First, write/update all files and directories in the snapshot
             for (file_name, entry) in self.root.iter() {
                 match entry {
                     DirectoryEntry::File(id) => {
@@ -117,15 +127,44 @@ impl Directory {
                                 let mut f = File::options()
                                     .create(true)
                                     .write(true)
-                                    .open(path.join(file_name))
-                                    .map_err(Error::IO)?;
-                                f.write(&v).map_err(Error::IO)?;
+                                    .truncate(true)
+                                    .open(path.join(file_name))?;
+                                f.write(&v)?;
                             }
                             None => return Err(Error::ObjectMissing(*id)),
                         }
                     }
                     DirectoryEntry::Directory(dir) => {
-                        dir.write(store, PathBuf::from(path).join(file_name).as_path())?;
+                        let dir_path = PathBuf::from(path).join(file_name);
+
+                        // Create the directory if it doesn't exist
+                        if !Path::try_exists(&dir_path)? {
+                            std::fs::create_dir(&dir_path)?;
+                        }
+
+                        dir.write(store, dir_path.as_path(), delete_absent)?;
+                    }
+                }
+            }
+
+            // If delete_absent is true, remove files that aren't in the snapshot
+            if delete_absent {
+                for entry in read_dir(path)? {
+                    let entry = entry?;
+                    let file_name = entry.file_name().into_string().unwrap();
+
+                    // Skip special directories like .rev, .git, etc.
+                    if file_name == ".rev" || file_name == ".git" {
+                        continue;
+                    }
+
+                    if !self.root.contains_key(&file_name) {
+                        let entry_path = entry.path();
+                        if entry.file_type()?.is_dir() {
+                            std::fs::remove_dir_all(&entry_path)?;
+                        } else {
+                            std::fs::remove_file(&entry_path)?;
+                        }
                     }
                 }
             }
