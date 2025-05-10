@@ -19,6 +19,7 @@ globset = "0.4.10"
 ignore = "0.4.20"
 dialoguer = "0.10.4"
 console = "0.15.7"
+hex = "0.4.3"
 
 [lib]
 name = "lib"

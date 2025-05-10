@@ -1,10 +1,11 @@
 use std::{env::current_dir, fmt::Debug, io::stdout, process::exit};
 
+
 use clap::{Parser, Subcommand};
 use colored::*;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use lib::{
-    directory::{Directory, Ignores},
+    directory::{Directory, Ignores, DiffEntry},
     dot_rev::{DotRev, Error as DotRevError, InsertJson},
     object_id::ObjectId,
     snapshot::SnapShot,
@@ -15,6 +16,7 @@ use lib::{
 enum AppError {
     DotRevError(DotRevError),
     IoError(std::io::Error),
+    #[allow(dead_code)]
     BranchNotFound(String),
     NoChangesToSnapshot,
     #[allow(dead_code)]
@@ -111,7 +113,7 @@ enum Command {
     #[clap(
         about = "Manage the ignore patterns",
         long_about = "List, add, or remove ignore patterns for files that should be excluded from snapshots",
-        after_help = "Examples:\n  revtool ignore                # List all patterns\n  revtool ignore \"**/*.log\"      # Add a pattern\n  revtool ignore --remove target  # Remove a pattern"
+        after_help = "Examples:\n  revtool ignore                # List all patterns\n  revtool ignore \"**/*.log\"      # Add a pattern\n  revtool ignore --remove target  # Remove a pattern\n  revtool ignore -i             # Manage patterns interactively"
     )]
     Ignore {
         #[arg(help = "Pattern to add to ignore list")]
@@ -128,13 +130,16 @@ enum Command {
     Init,
 
     #[clap(
-        about = "Check the difference between this branch and another",
-        long_about = "Compares the files in the current branch with the specified branch and displays the differences",
-        after_help = "Example:\n  revtool diff dev\n  revtool diff main\n  revtool diff --content main"
+        about = "Check the difference between snapshots",
+        long_about = "Compares two snapshots and displays the differences between them",
+        after_help = "Examples:\n  revtool diff dev                  # Current branch vs dev branch\n  revtool diff main                 # Current branch vs main branch\n  revtool diff HEAD~1                # Current branch vs its parent\n  revtool diff abc123                # Current branch vs specific snapshot (by ID or prefix)\n  revtool diff main HEAD~2           # Compare main branch with grandparent of current branch\n  revtool diff abc123 def456         # Compare two specific snapshots\n  revtool diff --content main        # Show content-level diffs"
     )]
     Diff {
-        #[arg(help = "Branch to compare with current branch")]
-        branch: String,
+        #[arg(help = "First snapshot reference (defaults to current branch if omitted when second ref is provided)")]
+        first_ref: Option<String>,
+
+        #[arg(help = "Second snapshot reference (defaults to current branch)")]
+        second_ref: Option<String>,
 
         #[arg(long, help = "Show content-level diffs for modified files")]
         content: bool,
@@ -271,17 +276,20 @@ fn interactive_snapshot_message(diff: &lib::directory::Diff) -> AppResult<Option
     // Show the changes that will be included in this snapshot
     println!("\n{}", "Changes to be snapped:".yellow().bold());
 
-    for file in diff.added.keys() {
-        println!("        {}: {}", "new file".green().bold(), file);
-    }
+    // Use the DiffFormatter for consistent display
+    use lib::diff_format::{DiffFormatter, FormatOptions};
 
-    for file in &diff.deleted {
-        println!("        {}: {}", "deleted".red().bold(), file);
-    }
+    // Configure formatter options - preserve color but hide content diffs for the snapshot preview
+    // We'll keep color on for the snapshot preview by default, since it's part of the interactive UI
+    let format_options = FormatOptions {
+        use_color: true,
+        show_content: false,  // Don't show content diffs in the snapshot preview
+        context_lines: 3,     // Standard context lines
+        show_stats: true,     // Show stats summary
+    };
 
-    for file in diff.modified.keys() {
-        println!("        {}: {}", "modified".yellow().bold(), file);
-    }
+    let formatter = DiffFormatter::new(diff, format_options);
+    println!("{}", formatter);
 
     println!();
 
@@ -312,6 +320,84 @@ fn interactive_snapshot_message(diff: &lib::directory::Diff) -> AppResult<Option
     Ok(Some(msg))
 }
 
+/// Interactive mode helper for managing ignore patterns
+fn interactive_ignore_management(dot_rev: &DotRev, mut ignores: Ignores) -> AppResult<()> {
+    let theme = ColorfulTheme::default();
+
+    loop {
+        // Show current patterns
+        println!("\n{}", "Current ignore patterns:".green().bold());
+        for (i, pattern) in ignores.patterns.iter().enumerate() {
+            println!("  {}: {}", i + 1, pattern);
+        }
+
+        // Show options
+        println!("\n{}", "What would you like to do?".cyan().bold());
+        let options = vec!["Add a pattern", "Remove a pattern", "Done"];
+
+        let selection = Select::with_theme(&theme)
+            .with_prompt("Select action")
+            .default(0)
+            .items(&options)
+            .interact()
+            .map_err(|_| AppError::Other("Failed to get user input".to_string()))?;
+
+        match selection {
+            0 => {
+                // Add a pattern
+                let new_pattern: String = Input::with_theme(&theme)
+                    .with_prompt("Enter pattern to ignore")
+                    .validate_with(|input: &String| -> Result<(), &str> {
+                        if input.trim().is_empty() {
+                            Err("Pattern cannot be empty")
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .interact_text()
+                    .map_err(|_| AppError::Other("Failed to get user input".to_string()))?;
+
+                if ignores.patterns.contains(&new_pattern) {
+                    println!("Pattern '{}' is already in the ignore list", new_pattern.yellow());
+                } else {
+                    ignores.add_pattern(new_pattern.clone());
+                    dot_rev.set_ignores(&ignores)?;
+                    println!("Added '{}' to ignore patterns", new_pattern.green());
+                }
+            },
+            1 => {
+                // Remove a pattern
+                if ignores.patterns.is_empty() {
+                    println!("{}", "No patterns to remove".yellow());
+                    continue;
+                }
+
+                let options: Vec<&String> = ignores.patterns.iter().collect();
+                let selection = Select::with_theme(&theme)
+                    .with_prompt("Select pattern to remove")
+                    .default(0)
+                    .items(&options)
+                    .interact()
+                    .map_err(|_| AppError::Other("Failed to get user input".to_string()))?;
+
+                let pattern = ignores.patterns.remove(selection);
+                let new_ignores = Ignores::new(ignores.patterns.clone());
+                dot_rev.set_ignores(&new_ignores)?;
+                ignores = new_ignores;
+
+                println!("Removed '{}' from ignore patterns", pattern.red());
+            },
+            2 => {
+                // Exit the loop
+                break;
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(())
+}
+
 // Define help texts for command examples
 pub fn get_command_help(command: &str) -> Option<String> {
     match command.to_lowercase().as_str() {
@@ -320,11 +406,13 @@ Manage files and directories to ignore:
   revtool ignore                # List all current ignore patterns
   revtool ignore <pattern>      # Add a new pattern to ignore
   revtool ignore --remove <pattern>  # Remove a pattern from ignore list
+  revtool ignore -i             # Interactive pattern management
 
 Examples:
   revtool ignore "**/*.log"    # Ignore all .log files in any directory
   revtool ignore "build/"      # Ignore the build directory
   revtool ignore "**/*.tmp"    # Ignore all .tmp files
+  revtool ignore -i            # Manage patterns interactively
 
 Patterns support gitignore-style glob syntax:
   *      - Matches any sequence of non-separator characters
@@ -338,18 +426,29 @@ Initialize a new revision control repository:
 
 Creates a .rev directory in the current location and initializes a repository structure."#.to_string()),
         "diff" => Some(r#"
-Compare changes between branches:
-  revtool diff <branch>
-  revtool diff --content <branch>  # Show content-level diffs
-  revtool diff --context <n> <branch>  # Show n lines of context
+Compare snapshots with flexible referencing:
+  revtool diff <ref>                     # Compare current branch with <ref>
+  revtool diff <ref1> <ref2>             # Compare <ref1> with <ref2>
+  revtool diff --content <ref>           # Show content-level diffs
+
+Snapshot reference syntax:
+  branch_name       # Latest snapshot on a branch (e.g., "main", "dev")
+  HEAD              # Latest snapshot on current branch
+  HEAD~N            # N snapshots back from HEAD (e.g., "HEAD~1" for parent)
+  branch_name~N     # N snapshots back from branch tip (e.g., "main~2")
+  abc123            # Snapshot ID (prefix or full hash)
+  abc123~N          # N snapshots back from specific snapshot
 
 Examples:
   revtool diff main                # Compare current branch with main
-  revtool diff --content main      # Show content-level diffs
-  revtool diff --content --context 5 main  # Show content diffs with 5 lines of context
+  revtool diff HEAD~1              # Compare current branch with its parent
+  revtool diff a1f2305             # Compare current branch with specific snapshot (using ID prefix)
+  revtool diff main dev            # Compare main branch with dev branch
+  revtool diff main~1 dev~2        # Compare main's parent with dev's grandparent
+  revtool diff --content HEAD~1    # Show content-level diffs with parent
+  revtool diff --context 5 HEAD~1  # Show diffs with 5 lines of context
   revtool diff --no-color main     # Show without colors
 
-The diff command shows what changes would be merged if you merged the specified branch.
 With --content, shows line-by-line differences within modified files."#.to_string()),
         "status" => Some(r#"
 Show the current status of the working directory:
@@ -475,6 +574,11 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let (dot_rev, _branch) = get_repository()?;
             let mut ignores = dot_rev.ignores()?;
 
+            // Use interactive mode if flag is set and no explicit arguments are provided
+            if interactive && pattern.is_none() && !remove {
+                return interactive_ignore_management(&dot_rev, ignores);
+            }
+
             match (pattern, remove) {
                 // Just list the current ignore patterns
                 (None, false) => {
@@ -508,8 +612,30 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 },
                 // No pattern provided for remove
                 (None, true) => {
-                    println!("{}", "Error: Must specify a pattern to remove".red().bold());
-                    println!("Usage: revtool ignore --remove <pattern>");
+                    if interactive {
+                        // In interactive mode, show a list of patterns to remove
+                        if ignores.patterns.is_empty() {
+                            println!("{}", "No patterns to remove".yellow());
+                            return Ok(());
+                        }
+
+                        let theme = ColorfulTheme::default();
+                        let options: Vec<&String> = ignores.patterns.iter().collect();
+                        let selection = Select::with_theme(&theme)
+                            .with_prompt("Select pattern to remove")
+                            .default(0)
+                            .items(&options)
+                            .interact()
+                            .map_err(|_| AppError::Other("Failed to get user input".to_string()))?;
+
+                        let pattern = ignores.patterns.remove(selection);
+                        let new_ignores = Ignores::new(ignores.patterns);
+                        dot_rev.set_ignores(&new_ignores)?;
+                        println!("Removed '{}' from ignore patterns", pattern.red());
+                    } else {
+                        println!("{}", "Error: Must specify a pattern to remove".red().bold());
+                        println!("Usage: revtool ignore --remove <pattern>");
+                    }
                 }
             }
 
@@ -532,28 +658,67 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 snapshot_id.to_string().cyan());
             Ok(())
         }
-        Diff { branch, content, context, no_color } => {
-            let (dot_rev, this_branch) = get_repository()?;
+        Diff { first_ref, second_ref, content, context, no_color } => {
+            let (dot_rev, current_branch) = get_repository()?;
             let store = dot_rev.store()?;
-            let that_branch = branch;
 
-            if !dot_rev.branch_exists(&that_branch)? {
-                return Err(AppError::BranchNotFound(that_branch));
-            }
+            // Parse snapshot references
+            use std::str::FromStr;
+            use lib::snapshot_ref::SnapshotRef;
 
-            // Load snapshots for both branches
-            let this_tip = dot_rev.branch_snapshot_id(&this_branch)?;
-            let that_tip = dot_rev.branch_snapshot_id(&that_branch)?;
+            // Handle the various possible combinations of first_ref and second_ref
+            let (source_ref, target_ref) = match (first_ref, second_ref) {
+                (Some(first), Some(second)) => {
+                    // Both refs provided: first is source, second is target
+                    let source = SnapshotRef::from_str(&first)
+                        .map_err(|e| AppError::Other(format!("Invalid first snapshot reference: {}", e)))?;
+                    let target = SnapshotRef::from_str(&second)
+                        .map_err(|e| AppError::Other(format!("Invalid second snapshot reference: {}", e)))?;
+                    (source, target)
+                },
+                (Some(first), None) => {
+                    // Only first ref provided: current branch is source, first is target
+                    let source = SnapshotRef::Branch(current_branch);
+                    let target = SnapshotRef::from_str(&first)
+                        .map_err(|e| AppError::Other(format!("Invalid snapshot reference: {}", e)))?;
+                    (source, target)
+                },
+                (None, Some(second)) => {
+                    // Only second ref provided: second is source, current branch is target
+                    let source = SnapshotRef::from_str(&second)
+                        .map_err(|e| AppError::Other(format!("Invalid snapshot reference: {}", e)))?;
+                    let target = SnapshotRef::Branch(current_branch);
+                    (source, target)
+                },
+                (None, None) => {
+                    // No refs provided - show help info about the new syntax
+                    println!("Diff command requires at least one snapshot reference.");
+                    println!("Example usage:");
+                    println!("  revtool diff branch_name           # Compare current branch with branch_name");
+                    println!("  revtool diff HEAD~1                # Compare current branch with its parent");
+                    println!("  revtool diff abc123                # Compare current branch with snapshot abc123");
+                    println!("  revtool diff branch1 branch2       # Compare branch1 with branch2");
+                    println!("  revtool diff HEAD~1 feature        # Compare parent of HEAD with feature branch");
+                    println!("\nUse 'revtool usage diff' for more examples.");
+                    return Ok(());
+                }
+            };
+
+            // Resolve snapshot references to actual snapshot IDs
+            let source_id = source_ref.resolve(&dot_rev)
+                .map_err(|e| AppError::Other(format!("Failed to resolve source reference: {}", e)))?;
+            let target_id = target_ref.resolve(&dot_rev)
+                .map_err(|e| AppError::Other(format!("Failed to resolve target reference: {}", e)))?;
 
             // Generate snapshot diff
             let snapshot_diff = lib::snapshot_diff::SnapShotDiff::generate(
                 &store,
-                this_tip,
-                that_tip,
+                source_id,
+                target_id,
                 content
             ).map_err(|e| AppError::Other(format!("Failed to generate diff: {:?}", e)))?;
 
-            // Import the required types first
+            // Import the required types
             use lib::diff_format;
 
             // Create format options based on user preferences
@@ -762,7 +927,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 // Import the required types locally
                 use lib::diff_format;
 
-                // Format with our new formatter
+                // Use our formatter for consistent display
                 let format_options = diff_format::FormatOptions {
                     use_color: !no_color,
                     show_content: content,

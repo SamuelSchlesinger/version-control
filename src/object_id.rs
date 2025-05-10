@@ -2,6 +2,7 @@ use crate::hex;
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
 
+
 use std::{
     fmt::{Debug, Display},
     fs::File,
@@ -115,6 +116,14 @@ impl From<&Vec<u8>> for ObjectId {
 impl From<&[u8]> for ObjectId {
     fn from(bytes: &[u8]) -> Self {
         ObjectId(blake3::hash(&bytes))
+    }
+}
+
+impl ObjectId {
+    /// Create an ObjectId directly from a 32-byte hash value
+    /// This is used for reconstructing an ObjectId from a hash string
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        ObjectId(Hash::from(bytes))
     }
 }
 

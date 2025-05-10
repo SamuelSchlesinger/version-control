@@ -2,6 +2,9 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
+
+
+
 /// A valid hexadecimal encoding of binary data.
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct Hex(pub Vec<u8>);

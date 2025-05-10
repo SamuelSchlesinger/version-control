@@ -204,7 +204,13 @@ impl Directory {
                                     .generate_content_diff(other_dir_entry, store.unwrap())
                                     .map(|diff| (file_name.clone(), diff))
                             }
-                            // For directories or mixed types, use regular diff
+                            // For directories, recursively apply content diffing
+                            (DirectoryEntry::Directory(dir), DirectoryEntry::Directory(other_dir)) => {
+                                // Recursively diff the directories with content diffing enabled
+                                let nested_diff = dir.diff_with_content(other_dir, with_content_diff, store.unwrap());
+                                Some((file_name.clone(), DiffEntry::Directory(Box::new(nested_diff))))
+                            }
+                            // For other mixed types, use regular diff
                             _ => dir_entry
                                 .diff(other_dir_entry)
                                 .map(|diff| (file_name.clone(), diff))
@@ -500,6 +506,10 @@ impl fmt::Display for Diff {
                         if dir.root.is_empty() {
                             diff_paths.insert(path, DiffItem::Added);
                         } else {
+                            // Always add the directory itself as added
+                            diff_paths.insert(path.clone(), DiffItem::Added);
+
+                            // And also add all of its contents recursively
                             for (dir_name, dir_entry) in dir.root.clone() {
                                 stack.push(DiffStackItem::Added(path.join(dir_name), dir_entry));
                             }
@@ -518,6 +528,10 @@ impl fmt::Display for Diff {
                         }
                     }
                     DiffEntry::Directory(diff) => {
+                        // Always add the directory itself as modified
+                        diff_paths.insert(path.clone(), DiffItem::Modified);
+
+                        // And recursively process all changes inside it
                         for (dir_name, dir_entry) in diff.added.clone() {
                             stack.push(DiffStackItem::Added(path.join(dir_name), dir_entry))
                         }
@@ -613,11 +627,14 @@ fn test_diff_display() {
         .into_iter()
         .collect(),
     };
+    // Now we also show the directories themselves, not just their contents
     assert_eq!(
         diff_5.to_string(),
         [
+            "M a",
             "D a/foo",
             "A bar",
+            "M baz",
             "A baz/bar",
             "M baz/baz",
             "D baz/foo",

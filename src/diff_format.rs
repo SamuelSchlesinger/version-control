@@ -112,6 +112,72 @@ impl<'a> DiffFormatter<'a> {
                                 DiffEntry::FileWithContentDiff { content_diff: Some(content_diff), .. } => {
                                     result.push_str(&self.format_content_diff(path, content_diff));
                                 }
+                                DiffEntry::Directory(nested_diff) => {
+                                    // Recursively format nested directory diffs with the same options
+
+                                    // We need a custom nested path display for files in subdirectories
+                                    result.push_str("  │ Directory contents:\n");
+
+                                    // Process nested files to show their content diffs
+                                    // First, process all modified files with content diffs
+                                    for (file_name, entry) in &nested_diff.modified {
+                                        let nested_path = format!("{}/{}", path, file_name);
+
+                                        if self.options.use_color {
+                                            result.push_str(&format!("  │   {}{} {}{}\n",
+                                                Colors::YELLOW, "M", file_name, Colors::RESET));
+                                        } else {
+                                            result.push_str(&format!("  │   M {}\n", file_name));
+                                        }
+
+                                        // Show content diff for this file if it has one
+                                        match entry {
+                                            DiffEntry::FileWithContentDiff { content_diff: Some(content_diff), .. } => {
+                                                // Format the content diff with extra indentation
+                                                let diff_text = self.format_content_diff(&nested_path, content_diff);
+                                                for line in diff_text.lines() {
+                                                    result.push_str(&format!("  │   {}\n", line));
+                                                }
+                                            },
+                                            DiffEntry::Directory(sub_nested_diff) => {
+                                                // Handle deeper nesting by recursive call with indentation
+                                                let nested_formatter = DiffFormatter::new(sub_nested_diff, self.options);
+                                                let sub_result = nested_formatter.format();
+                                                if !sub_result.is_empty() {
+                                                    result.push_str("  │     Directory contents:\n");
+                                                    for line in sub_result.lines() {
+                                                        if !line.is_empty() {
+                                                            result.push_str(&format!("  │       {}\n", line));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+
+                                    // Process added files
+                                    for (file_name, _) in &nested_diff.added {
+                                        if self.options.use_color {
+                                            result.push_str(&format!("  │   {}{} {}{}\n",
+                                                Colors::GREEN, "A", file_name, Colors::RESET));
+                                        } else {
+                                            result.push_str(&format!("  │   A {}\n", file_name));
+                                        }
+                                    }
+
+                                    // Process deleted files
+                                    for file_name in &nested_diff.deleted {
+                                        if self.options.use_color {
+                                            result.push_str(&format!("  │   {}{} {}{}\n",
+                                                Colors::RED, "D", file_name, Colors::RESET));
+                                        } else {
+                                            result.push_str(&format!("  │   D {}\n", file_name));
+                                        }
+                                    }
+
+                                    result.push_str("  │\n");
+                                }
                                 _ => {}
                             }
                         }

@@ -58,6 +58,10 @@ pub mod snapshot_diff;
 /// including colorized terminal output and context-sensitive displays.
 pub mod diff_format;
 
+/// Provides functionality for referencing snapshots with various syntaxes,
+/// including direct IDs, HEAD, relative references (e.g., HEAD~1), and branch tips.
+pub mod snapshot_ref;
+
 // Test modules
 #[cfg(test)]
 mod tests;
