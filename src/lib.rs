@@ -15,3 +15,7 @@ pub mod object_id;
 pub mod object_store;
 /// A snapshot of a particular revision.
 pub mod snapshot;
+
+// Test modules
+#[cfg(test)]
+mod tests;

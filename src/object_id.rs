@@ -13,7 +13,7 @@ use std::{
 /// Under the hood, this is a [`blake3`] hash.
 ///
 /// It is displayed in hexadecimal format.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId(Hash);
 
 impl Serialize for ObjectId {

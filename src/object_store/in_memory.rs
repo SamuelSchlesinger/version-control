@@ -23,6 +23,12 @@ impl InMemoryObjectStore {
     }
 }
 
+impl Default for InMemoryObjectStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ObjectStore for InMemoryObjectStore {
     type Error = Infallible;
 

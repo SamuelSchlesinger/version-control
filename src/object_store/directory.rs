@@ -1,12 +1,26 @@
 use std::{
+    collections::HashMap,
     fs::{create_dir, File},
     io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 use crate::object_id::ObjectId;
 
 use super::ObjectStore;
+
+// Cache entry with object data and expiration time
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    data: Vec<u8>,
+    last_accessed: Instant,
+}
+
+// Cache configuration
+const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+const CACHE_MAX_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 
 /// A persistent [`ObjectStore`] stored in a directory,
 /// using the first two hexadecimal characters of the [`ObjectId`]
@@ -16,6 +30,10 @@ use super::ObjectStore;
 #[derive(Debug, Clone)]
 pub struct DirectoryObjectStore {
     root: PathBuf,
+    // Cache for objects to improve read performance
+    cache: Arc<RwLock<HashMap<ObjectId, CacheEntry>>>,
+    // Track current cache size in bytes
+    cache_size: Arc<Mutex<usize>>,
 }
 
 impl DirectoryObjectStore {
@@ -24,7 +42,94 @@ impl DirectoryObjectStore {
             log::info!("creating directory store root: {:?}", root);
             create_dir(&root)?;
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            cache_size: Arc::new(Mutex::new(0)),
+        })
+    }
+
+    // Clean up expired cache entries to free memory
+    fn cleanup_cache(&self) {
+        let now = Instant::now();
+        let mut cache = self.cache.write().unwrap();
+        let mut cache_size = self.cache_size.lock().unwrap();
+
+        let mut to_remove = Vec::new();
+
+        // Find expired entries
+        for (id, entry) in cache.iter() {
+            if now.duration_since(entry.last_accessed) > CACHE_TTL {
+                to_remove.push(*id);
+                *cache_size = cache_size.saturating_sub(entry.data.len());
+            }
+        }
+
+        // Remove expired entries
+        for id in to_remove {
+            cache.remove(&id);
+        }
+    }
+
+    // Add an object to the cache
+    fn cache_object(&self, id: ObjectId, data: Vec<u8>) {
+        // Clean up expired entries first
+        self.cleanup_cache();
+
+        let data_size = data.len();
+        let mut cache = self.cache.write().unwrap();
+        let mut cache_size = self.cache_size.lock().unwrap();
+
+        // If adding this object would exceed max cache size,
+        // evict entries until we have enough space
+        if *cache_size + data_size > CACHE_MAX_SIZE {
+            // Find and remove the oldest entries until we have enough space
+            // Create a vector of IDs to remove
+            let mut entries_to_remove = Vec::new();
+            let mut size_freed = 0;
+
+            {
+                // Sort by last accessed time (oldest first)
+                let mut entries: Vec<_> = cache.iter().collect();
+                entries.sort_by_key(|(_, entry)| entry.last_accessed);
+
+                // Find oldest entries to remove
+                for (id, entry) in entries {
+                    entries_to_remove.push(*id);
+                    size_freed += entry.data.len();
+
+                    if *cache_size - size_freed + data_size <= CACHE_MAX_SIZE {
+                        break;
+                    }
+                }
+            }
+
+            // Now remove the entries from the cache
+            for id in entries_to_remove {
+                if let Some(entry) = cache.remove(&id) {
+                    *cache_size = cache_size.saturating_sub(entry.data.len());
+                }
+            }
+        }
+
+        // Add the new entry
+        cache.insert(id, CacheEntry {
+            data,
+            last_accessed: Instant::now(),
+        });
+        *cache_size += data_size;
+    }
+
+    // Get an object from the cache
+    fn get_cached_object(&self, id: ObjectId) -> Option<Vec<u8>> {
+        let mut cache = self.cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&id) {
+            // Update the last accessed time
+            entry.last_accessed = Instant::now();
+            Some(entry.data.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -32,7 +137,14 @@ impl ObjectStore for DirectoryObjectStore {
     type Error = std::io::Error;
 
     fn has(&self, id: ObjectId) -> Result<bool, Self::Error> {
-        log::info!("checking whether {} is contained in {:?}", id, self.root);
+        log::info!("checking whether {id} is contained in {:?}", self.root);
+
+        // Check if the object is in the cache first
+        if self.get_cached_object(id).is_some() {
+            return Ok(true);
+        }
+
+        // Otherwise check on disk
         let s: String = format!("{}", id);
         let subdir: &str = &s[0..2];
         let filename: &str = &s[2..];
@@ -41,15 +153,28 @@ impl ObjectStore for DirectoryObjectStore {
     }
 
     fn read(&self, id: ObjectId) -> Result<Option<Vec<u8>>, Self::Error> {
-        log::info!("reading {} from {:?}", id, self.root);
-        let s: String = format!("{}", id);
+        log::info!("reading {id} from {:?}", self.root);
+
+        // Try to get from cache first
+        if let Some(data) = self.get_cached_object(id) {
+            log::info!("cache hit for {id}");
+            return Ok(Some(data));
+        }
+
+        // Otherwise read from disk
+        log::info!("cache miss for {id}, reading from disk");
+        let s: String = format!("{id}");
         let subdir: &str = &s[0..2];
         let filename: &str = &s[2..];
-        let path = self.root.join(format!("{}/{}", subdir, filename));
+        let path = self.root.join(format!("{subdir}/{filename}"));
         match std::fs::File::options().read(true).open(path) {
             Ok(mut f) => {
                 let mut v = Vec::new();
                 f.read_to_end(&mut v)?;
+
+                // Cache the object for future reads
+                self.cache_object(id, v.clone());
+
                 return Ok(Some(v));
             }
             Err(err) => {
@@ -64,22 +189,44 @@ impl ObjectStore for DirectoryObjectStore {
 
     fn insert(&mut self, object: &[u8]) -> Result<ObjectId, Self::Error> {
         let id: ObjectId = object.into();
-        log::info!("inserting {} into {:?}", id, self.root);
-        let s: String = format!("{}", id);
-        let subdir: &str = &s[0..2];
-        let filename: &str = &s[2..];
-        let subdir_path = self.root.join(format!("{}", subdir));
-        let path = subdir_path.join(format!("{}", filename));
-        if Path::try_exists(&path)? {
-            log::info!("{:?} already exists", path);
+        log::info!("inserting {id} into {:?}", self.root);
+
+        // Check if already in cache
+        if self.get_cached_object(id).is_some() {
+            log::info!("{id} already exists in cache");
             return Ok(id);
         }
+
+        // Check if already on disk
+        let s: String = format!("{id}");
+        let subdir: &str = &s[0..2];
+        let filename: &str = &s[2..];
+        let subdir_path = self.root.join(subdir);
+        let path = subdir_path.join(filename);
+        if Path::try_exists(&path)? {
+            log::info!("{path:?} already exists on disk");
+
+            // Read it into cache for future reads
+            let mut f = File::options().read(true).open(&path)?;
+            let mut data = Vec::new();
+            f.read_to_end(&mut data)?;
+            self.cache_object(id, data);
+
+            return Ok(id);
+        }
+
+        // Write new object
         if !Path::try_exists(&subdir_path)? {
             log::info!("creating subdir path {:?} in {:?}", subdir_path, self.root);
             std::fs::create_dir(&subdir_path)?;
         }
-        let mut f = File::options().create(true).write(true).open(path)?;
-        f.write(object)?;
+
+        let mut f = File::options().create(true).truncate(true).write(true).open(path)?;
+        f.write_all(object)?;
+
+        // Add to cache
+        self.cache_object(id, object.to_vec());
+
         Ok(id)
     }
 }
