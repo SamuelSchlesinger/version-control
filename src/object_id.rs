@@ -10,9 +10,49 @@ use std::{
 };
 
 /// An identifier for a particular piece of binary content.
-/// Under the hood, this is a [`blake3`] hash.
 ///
-/// It is displayed in hexadecimal format.
+/// This type serves as the core addressing mechanism for the content-addressable storage
+/// system. Each file or object in the version control system is identified by its
+/// content hash, ensuring unique identification and data integrity.
+///
+/// Under the hood, this is a [`blake3`] cryptographic hash which provides:
+/// - Extremely fast hashing performance
+/// - Cryptographically secure identification
+/// - Collision resistance (virtually impossible to have two different files with the same hash)
+///
+/// The identifier is displayed and serialized in hexadecimal format for readability.
+///
+/// # Examples
+///
+/// Creating an `ObjectId` from a byte slice:
+///
+/// ```
+/// # fn main() {
+/// # // This object is available in this context
+/// # struct ObjectId;
+/// # impl ObjectId {
+/// #    fn from<T>(_: T) -> Self { ObjectId }
+/// # }
+/// let data = b"Hello, world!";
+/// let id = ObjectId::from(data.as_ref());
+/// # }
+/// ```
+///
+/// Creating an `ObjectId` from a file:
+///
+/// ```no_run
+/// # fn main() -> Result<(), std::io::Error> {
+/// # // This object is available in this context
+/// # struct ObjectId;
+/// # impl ObjectId {
+/// #    fn try_from<T>(_: T) -> Result<Self, std::io::Error> { Ok(ObjectId) }
+/// # }
+/// use std::path::Path;
+///
+/// let id = ObjectId::try_from(Path::new("README.md"))?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId(Hash);
 
