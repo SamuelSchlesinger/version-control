@@ -1,20 +1,86 @@
-# Version Control
+# RevTool: A Modern Version Control System
 
 [![Rust](https://github.com/SamuelSchlesinger/version-control/actions/workflows/rust.yml/badge.svg)](https://github.com/SamuelSchlesinger/version-control/actions/workflows/rust.yml)
 
-A lightweight, flexible version control system implemented from scratch in Rust, focusing on simplicity, performance, and content-addressable storage principles. This project provides a Git-like workflow with a more approachable design.
+RevTool is a lightweight, approachable version control system implemented from scratch in Rust. It focuses on simplicity, performance, and modern content-addressable storage principles while providing a familiar workflow for developers used to Git. 
 
-## Features
+The project aims to deliver a more understandable and transparent approach to version control, making it both a practical tool and an educational resource for understanding how version control systems work.
 
-- **Content-addressable storage** with BLAKE3 cryptographic hashing
-- **Branch-based workflow** similar to Git but with simpler concepts
-- **Snapshot-based versioning** with commit history
-- **Flexible file ignoring** with gitignore-compatible pattern syntax
-- **Rich diffing capabilities** including both structural and content-level differences
-- **Interactive mode** for more guided operations
-- **Clean, modular architecture** implemented in safe Rust
+**Why RevTool?**
+- **Simplicity**: Clear conceptual model with straightforward commands
+- **Modern design**: Built using Rust and BLAKE3 cryptographic hashing
+- **Approachable code**: Well-organized architecture for learning and extending
+- **Interactive workflows**: Guided operations for complex tasks like merges
+- **Familiar feel**: Git-like concepts with more intuitive naming and behavior
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Key Differences from Git](#key-differences-from-git)
+- [Installation](#installation)
+- [Feature Highlights](#feature-highlights)
+- [Command Reference](#command-reference)
+- [Common Workflows](#common-workflows)
+- [Advanced Features](#advanced-features)
+- [Architecture](#architecture)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Quick Start
+
+Get up and running with RevTool in minutes:
+
+```bash
+# Install RevTool
+git clone https://github.com/SamuelSchlesinger/version-control.git
+cd version-control
+cargo build --release
+export PATH="$PATH:$(pwd)/target/release"  # Add to your path
+
+# Start your project
+mkdir my-project
+cd my-project
+revtool init
+echo "# My Project" > README.md
+revtool status
+revtool snap -m "Initial commit"
+
+# Create and use a feature branch
+revtool branch feature
+revtool checkout feature
+# Make changes...
+revtool status
+revtool snap -m "Add new functionality"
+
+# Merge changes back to main branch
+revtool checkout dev
+revtool merge feature -m "Merge feature branch"
+```
+
+## Key Differences from Git
+
+RevTool builds on Git's concepts while simplifying and modernizing several aspects:
+
+| Aspect | Git | RevTool | Benefit |
+|--------|-----|---------|---------|
+| **Terminology** | "commit" | "snapshot" | More intuitive naming |
+| **Hashing** | SHA-1 | BLAKE3 | Faster, more secure hashing |
+| **Default Branch** | main/master | dev | Modern naming convention |
+| **Merge Resolution** | Various tools | Built-in interactive | Guided conflict resolution |
+| **Repository** | .git | .rev | Fresh implementation |
+| **Object Model** | Complex | Simplified | Easier to understand |
+| **Implementation** | C | Rust | Memory safety, modern language |
+
+While Git offers more advanced features and widespread adoption, RevTool provides a cleaner, more approachable design that's ideal for:
+- Learning how version control works
+- Personal projects where simplicity is valued
+- Educational environments
+- Projects that benefit from interactive merge resolution
 
 ## Installation
+
+### From Source
 
 Clone the repository and build with Cargo:
 
@@ -25,6 +91,79 @@ cargo build --release
 ```
 
 The binary will be available at `target/release/revtool`.
+
+For convenience, you can add it to your PATH:
+
+```bash
+# Temporary (current session only)
+export PATH="$PATH:$(pwd)/target/release"
+
+# Permanent (add to your .bashrc, .zshrc, etc.)
+echo 'export PATH="$PATH:/path/to/version-control/target/release"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### Prerequisites
+
+- Rust (1.54 or later recommended)
+- Cargo
+
+### Verifying Installation
+
+To verify the installation:
+
+```bash
+revtool --version
+```
+
+## Feature Highlights
+
+RevTool offers a range of powerful features designed for modern version control workflows:
+
+### Core Features
+
+- **Content-addressable storage** with BLAKE3 cryptographic hashing
+  - Efficient storage with automatic deduplication
+  - Cryptographic verification of content integrity
+  - Fast object retrieval
+
+- **Branch-based workflow** with intuitive semantics
+  - Simple branch creation and switching
+  - Support for multiple development lines
+  - Familiar mental model for Git users
+
+- **Snapshot-based versioning** with complete history
+  - Directed acyclic graph (DAG) for history tracking
+  - Support for merge commits with multiple parents
+  - Efficient storage that only tracks changes
+
+- **Flexible file ignoring** with gitignore-compatible patterns
+  - Use familiar glob syntax
+  - Automatically ignore common build artifacts
+  - Interactive pattern management
+
+- **Comprehensive diffing capabilities**
+  - Structural diffs (files added/removed/modified)
+  - Content-level diffs (line-by-line changes)
+  - Rich formatting with context
+
+### Advanced Features
+
+- **Robust merge capabilities**
+  - Three-way merging with conflict detection
+  - Interactive conflict resolution
+  - Multiple automatic merge strategies
+  - Custom editor support for conflict resolution
+
+- **Flexible snapshot references**
+  - Support for branch names, direct IDs
+  - Relative references like `HEAD~N`
+  - Shortened hash prefixes
+
+- **Interactive mode** for guided operations
+  - Simplified workflows for complex tasks
+  - Clear conflict resolution interfaces
+  - Friendly confirmation prompts
 
 ## Command Reference
 
@@ -39,6 +178,7 @@ Commands:
   changes   Shows files and directories changed since the latest snapshot
   status    Show working tree status
   snap      Take a new snapshot (similar to git commit)
+  merge     Merge changes from another branch into the current branch
   checkout  Switch to a branch
   branch    Create or list branches
   reset     Reset all files to the last snapshot on this branch
@@ -69,6 +209,7 @@ Shows which files have been added, modified, or deleted.
 #### Taking Snapshots (Committing)
 ```bash
 revtool snap -m "Your commit message"
+revtool snap -i  # Interactive mode with guided prompts
 ```
 Records the current state of your files.
 
@@ -155,6 +296,58 @@ revtool diff main
 revtool checkout main
 ```
 
+### Merging Branches
+
+```bash
+# Work on feature branch
+revtool checkout feature-branch
+# ... make changes and create snapshots ...
+
+# Switch to target branch and merge
+revtool checkout main
+revtool merge feature-branch -m "Merge feature-branch into main"
+
+# If there are conflicts, you'll be prompted to resolve them
+# After resolving conflicts manually
+revtool merge --continue
+
+# If you want to abort a merge with conflicts
+revtool merge --abort
+```
+
+## Advanced Features
+
+### Merge Strategies
+
+RevTool provides several advanced merge capabilities to handle different scenarios:
+
+```bash
+# Automatically resolve all conflicts by taking our (current branch) version
+revtool merge feature-branch --strategy ours
+
+# Automatically resolve all conflicts by taking their (merging branch) version
+revtool merge feature-branch --strategy theirs
+
+# Default behavior, requires manual resolution
+revtool merge feature-branch --strategy normal
+```
+
+In interactive mode (`-i`), even with a strategy specified, you'll still be shown the conflicts that were automatically resolved.
+
+### Custom Editor for Conflict Resolution
+
+Specify your preferred editor for resolving merge conflicts:
+
+```bash
+# Use vim to edit conflict files
+revtool merge feature-branch --editor vim
+
+# Use VS Code to edit conflict files
+revtool merge feature-branch --editor "code -w"
+```
+
+The editor will be launched automatically when you choose to manually edit a conflict.
+
 ### Interactive Mode
 
 Most commands support an interactive mode with `-i` that guides you through the process:
@@ -167,7 +360,13 @@ revtool ignore -i     # Interactive ignore management
 
 ## Architecture
 
-RevTool is built around several key components that work together:
+RevTool follows a design philosophy centered on simplicity, understandability, and functional purity. Core principles include:
+
+- **Content-addressable storage** as the foundation
+- **Immutable objects** for reliability
+- **Clean separation of concerns** in modular components
+- **Type safety** through Rust's strong typing system
+- **Explicit over implicit** in operations and commands
 
 ### Core Components
 
@@ -221,29 +420,36 @@ The `.rev` directory contains:
 
 All objects (files, directories, snapshots) are stored in the content-addressable store and referenced by their hash, ensuring integrity and deduplication.
 
-## Implementation Details
+## Troubleshooting
 
-### Snapshot History as a DAG
+### Common Issues
 
-The version history is stored as a directed acyclic graph (DAG):
-- Each snapshot can have multiple parent snapshots
-- This supports merge operations (not yet fully implemented in CLI)
-- The `previous` field in `SnapShot` maintains these relationships
+**Issue**: "Repository not initialized" error
+**Solution**: Run `revtool init` in the root directory of your project.
 
-### Efficient Storage
+**Issue**: Changes not showing up in status
+**Solution**: Check if the files are in the ignore list with `revtool ignore`. Files matching ignore patterns won't appear in status.
 
-- Only stores changed files, not full copies
-- Content-addressable storage automatically deduplicates content
-- Directory structures are hierarchical and efficient
+**Issue**: Failed merge with conflicts
+**Solution**: 
+1. Resolve conflicts in the marked files
+2. Run `revtool merge --continue`
+3. If you want to start over, use `revtool merge --abort`
 
-### Flexible References
+**Issue**: "Branch not found" error
+**Solution**: List available branches with `revtool branch` and check spelling. If needed, create the branch first.
 
-You can reference snapshots in multiple ways:
-- `branch_name` - Latest snapshot on a branch
-- `HEAD` - Latest snapshot on current branch
-- `HEAD~N` - N snapshots back from HEAD
-- `branch_name~N` - N snapshots back from branch tip
-- `abc123` - Snapshot ID (prefix or full hash)
+### Debugging Tips
+
+- Use `revtool status --content` for detailed change information
+- Examine the `.rev` directory structure for troubleshooting repository issues
+- Try interactive mode (`-i`) for complex operations to see more information
+
+### Getting Help
+
+- Use `revtool usage <command>` for detailed help on a specific command
+- Review this README for workflow guidance
+- Submit issues via GitHub for bugs or feature requests
 
 ## Contributing
 
@@ -255,6 +461,16 @@ Contributions are welcome! To get started:
 4. Submit a pull request
 
 Please ensure your code follows the existing style patterns and includes appropriate tests.
+
+### Development Workflow
+
+1. Clone your fork: `git clone https://github.com/your-username/version-control.git`
+2. Add upstream: `git remote add upstream https://github.com/SamuelSchlesinger/version-control.git`
+3. Create branch: `git checkout -b my-feature`
+4. Make changes and test
+5. Commit: `git commit -am "Add new feature"`
+6. Push: `git push origin my-feature`
+7. Create PR through GitHub
 
 ## License
 

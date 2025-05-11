@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     env::current_dir,
-    fs::{create_dir, create_dir_all, read_dir, read_to_string, File},
+    fs::{create_dir, create_dir_all, read_dir, read_to_string, remove_file, File},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     directory::{Directory, Ignores},
+    merge::MergeResult,
     object_id::ObjectId,
     object_store::{directory::DirectoryObjectStore, ObjectStore},
     snapshot::SnapShot,
@@ -31,6 +32,23 @@ pub enum Error {
     BranchNotFound(String),
     RepositoryNotInitialized,
     CorruptRepository(String),
+    /// A merge is already in progress
+    MergeInProgress,
+    /// No merge is in progress
+    NoMergeInProgress,
+}
+
+/// Current state of an in-progress merge
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeState {
+    /// The current branch (ours)
+    pub current_branch: String,
+    /// The branch being merged (theirs)
+    pub merge_branch: String,
+    /// The original merge result with conflicts
+    pub merge_result: MergeResult,
+    /// Original state backup - the snapshot ID to reset to if aborting
+    pub backup_snapshot_id: ObjectId,
 }
 
 impl std::fmt::Display for Error {
@@ -42,6 +60,8 @@ impl std::fmt::Display for Error {
             Error::BranchNotFound(branch) => write!(f, "Branch not found: {}", branch),
             Error::RepositoryNotInitialized => write!(f, "Repository not initialized. Use 'revtool init' first"),
             Error::CorruptRepository(msg) => write!(f, "Corrupt repository: {}", msg),
+            Error::MergeInProgress => write!(f, "A merge is already in progress. Resolve conflicts and use 'revtool merge --continue' or use 'revtool merge --abort' to cancel"),
+            Error::NoMergeInProgress => write!(f, "No merge is in progress"),
         }
     }
 }
@@ -174,6 +194,36 @@ impl DotRev {
         write_json(ignores, &self.root.join("ignores"))
     }
 
+    /// Checks if a merge is in progress
+    pub fn is_merge_in_progress(&self) -> Result<bool, Error> {
+        let merge_state_path = self.root.join("merge_state");
+        Ok(Path::try_exists(&merge_state_path)?)
+    }
+
+    /// Saves the current merge state
+    pub fn save_merge_state(&self, state: &MergeState) -> Result<(), Error> {
+        if self.is_merge_in_progress()? {
+            return Err(Error::MergeInProgress);
+        }
+        write_json(state, &self.root.join("merge_state"))
+    }
+
+    /// Gets the current merge state
+    pub fn get_merge_state(&self) -> Result<MergeState, Error> {
+        if !self.is_merge_in_progress()? {
+            return Err(Error::NoMergeInProgress);
+        }
+        read_json(&self.root.join("merge_state"))
+    }
+
+    /// Removes the merge state file
+    pub fn clear_merge_state(&self) -> Result<(), Error> {
+        let merge_state_path = self.root.join("merge_state");
+        if Path::try_exists(&merge_state_path)? {
+            remove_file(&merge_state_path)?;
+        }
+        Ok(())
+    }
 }
 
 /// A convenience trait for writing and reading JSON from the [`DirectoryObjectStore`].

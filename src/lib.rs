@@ -62,6 +62,10 @@ pub mod diff_format;
 /// including direct IDs, HEAD, relative references (e.g., HEAD~1), and branch tips.
 pub mod snapshot_ref;
 
+/// Implements merging of branches and resolving conflicts between different
+/// versions of the same files.
+pub mod merge;
+
 // Test modules
 #[cfg(test)]
 mod tests;
