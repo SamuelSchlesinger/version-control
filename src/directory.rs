@@ -148,6 +148,27 @@ impl DirectoryEntry {
 }
 
 impl Directory {
+    /// Iterate over all files in the directory tree, returning (path, ObjectId) pairs
+    pub fn files(&self) -> Vec<(PathBuf, ObjectId)> {
+        let mut files = Vec::new();
+        self.collect_files(&mut files, PathBuf::new());
+        files
+    }
+    
+    fn collect_files(&self, files: &mut Vec<(PathBuf, ObjectId)>, current_path: PathBuf) {
+        for (name, entry) in &self.root {
+            let path = current_path.join(name);
+            match entry {
+                DirectoryEntry::File(id) => {
+                    files.push((path, *id));
+                },
+                DirectoryEntry::Directory(dir) => {
+                    dir.collect_files(files, path);
+                }
+            }
+        }
+    }
+    
     /// Compute the diff between this directory structure and the one
     /// which is currently located at the path.
     pub fn diff(&self, other: &Directory) -> Diff {

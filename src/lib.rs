@@ -66,6 +66,10 @@ pub mod snapshot_ref;
 /// versions of the same files.
 pub mod merge;
 
+/// Provides functionality for syncing with remote repositories over HTTP,
+/// including push/pull operations and object transfer.
+pub mod remote;
+
 // Test modules
 #[cfg(test)]
 mod tests;

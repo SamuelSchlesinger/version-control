@@ -15,6 +15,7 @@ use crate::{
     object_id::ObjectId,
     object_store::{directory::DirectoryObjectStore, ObjectStore},
     snapshot::SnapShot,
+    remote::RemoteConfig,
 };
 
 /// A wrapper for the path of the .rev directory which has a number of utilities defined on it.
@@ -62,6 +63,16 @@ impl std::fmt::Display for Error {
             Error::CorruptRepository(msg) => write!(f, "Corrupt repository: {}", msg),
             Error::MergeInProgress => write!(f, "A merge is already in progress. Resolve conflicts and use 'revtool merge --continue' or use 'revtool merge --abort' to cancel"),
             Error::NoMergeInProgress => write!(f, "No merge is in progress"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::IO(e) => Some(e),
+            Error::Serde(e) => Some(e),
+            _ => None,
         }
     }
 }
@@ -223,6 +234,41 @@ impl DotRev {
             remove_file(&merge_state_path)?;
         }
         Ok(())
+    }
+    
+    /// Get all configured remotes
+    pub fn remotes(&self) -> Result<Vec<RemoteConfig>, Error> {
+        let remotes_path = self.root.join("remotes");
+        if !Path::try_exists(&remotes_path)? {
+            return Ok(Vec::new());
+        }
+        read_json(&remotes_path)
+    }
+    
+    /// Add a remote
+    pub fn add_remote(&self, remote: RemoteConfig) -> Result<(), Error> {
+        let mut remotes = self.remotes()?;
+        
+        // Check if remote with same name already exists
+        if remotes.iter().any(|r| r.name == remote.name) {
+            return Err(Error::CorruptRepository(format!("Remote '{}' already exists", remote.name)));
+        }
+        
+        remotes.push(remote);
+        write_json(&remotes, &self.root.join("remotes"))
+    }
+    
+    /// Remove a remote by name
+    pub fn remove_remote(&self, name: &str) -> Result<(), Error> {
+        let mut remotes = self.remotes()?;
+        remotes.retain(|r| r.name != name);
+        write_json(&remotes, &self.root.join("remotes"))
+    }
+    
+    /// Get a remote by name
+    pub fn get_remote(&self, name: &str) -> Result<Option<RemoteConfig>, Error> {
+        let remotes = self.remotes()?;
+        Ok(remotes.into_iter().find(|r| r.name == name))
     }
 }
 

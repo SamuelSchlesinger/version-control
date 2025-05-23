@@ -16,6 +16,7 @@ use lib::{
     object_id::ObjectId,
     object_store::ObjectStore,
     snapshot::SnapShot,
+    remote::{RemoteConfig, http_client::HttpRemoteClient, http_server::HttpRemoteServer, sync},
 };
 
 // Application error type
@@ -304,6 +305,76 @@ enum Command {
     Log {
         #[arg(short, long, default_value = "10", help = "Number of commits to show")]
         limit: usize,
+    },
+
+    #[clap(
+        about = "Manage remote repositories",
+        long_about = "Add, remove, or list remote repositories for push/pull operations",
+        after_help = "Examples:\n  revtool remote                     # List all remotes\n  revtool remote add origin <url>    # Add a remote named 'origin'\n  revtool remote remove origin       # Remove the 'origin' remote"
+    )]
+    Remote {
+        #[clap(subcommand)]
+        cmd: Option<RemoteCommand>,
+    },
+
+    #[clap(
+        about = "Push changes to a remote repository",
+        long_about = "Upload local snapshots and update the remote branch reference",
+        after_help = "Examples:\n  revtool push origin                # Push current branch to origin\n  revtool push origin main           # Push main branch to origin\n  revtool push origin main --force   # Force push (overwrite remote)"
+    )]
+    Push {
+        #[arg(help = "Remote repository name")]
+        remote: String,
+
+        #[arg(help = "Branch to push (defaults to current branch)")]
+        branch: Option<String>,
+
+        #[arg(long, help = "Force push even if not fast-forward")]
+        force: bool,
+    },
+
+    #[clap(
+        about = "Pull changes from a remote repository",
+        long_about = "Download snapshots from a remote repository and update the local branch",
+        after_help = "Examples:\n  revtool pull origin                # Pull current branch from origin\n  revtool pull origin main           # Pull main branch from origin"
+    )]
+    Pull {
+        #[arg(help = "Remote repository name")]
+        remote: String,
+
+        #[arg(help = "Branch to pull (defaults to current branch)")]
+        branch: Option<String>,
+    },
+
+    #[clap(
+        about = "Start an HTTP server to host the repository",
+        long_about = "Run an HTTP server that allows other users to push/pull from this repository",
+        after_help = "Example:\n  revtool serve                      # Serve on default port 8080\n  revtool serve --port 3000          # Serve on port 3000"
+    )]
+    Serve {
+        #[arg(long, default_value = "8080", help = "Port to listen on")]
+        port: u16,
+
+        #[arg(long, default_value = "127.0.0.1", help = "Address to bind to")]
+        host: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RemoteCommand {
+    #[clap(about = "Add a new remote repository")]
+    Add {
+        #[arg(help = "Name for the remote")]
+        name: String,
+
+        #[arg(help = "URL of the remote repository")]
+        url: String,
+    },
+
+    #[clap(about = "Remove a remote repository")]
+    Remove {
+        #[arg(help = "Name of the remote to remove")]
+        name: String,
     },
 }
 
@@ -881,6 +952,52 @@ Show detailed information about changes since last snapshot:
   revtool changes
 
 Shows a JSON representation of all changes in the working directory."#.to_string()),
+        "remote" => Some(r#"
+Manage remote repositories:
+  revtool remote                    # List all configured remotes
+  revtool remote add <name> <url>   # Add a new remote
+  revtool remote remove <name>      # Remove a remote
+
+Examples:
+  revtool remote                    # Shows all remotes
+  revtool remote add origin http://example.com:8080  # Add 'origin' remote
+  revtool remote remove backup      # Remove 'backup' remote
+
+Remote repositories allow you to share your snapshots with others."#.to_string()),
+        "push" => Some(r#"
+Push changes to a remote repository:
+  revtool push <remote>             # Push current branch to remote
+  revtool push <remote> <branch>    # Push specific branch to remote
+  revtool push <remote> --force     # Force push (overwrites remote)
+
+Examples:
+  revtool push origin               # Push current branch to origin
+  revtool push origin main          # Push main branch to origin
+  revtool push origin dev --force   # Force push dev branch
+
+Push uploads your local snapshots to the remote repository."#.to_string()),
+        "pull" => Some(r#"
+Pull changes from a remote repository:
+  revtool pull <remote>             # Pull current branch from remote
+  revtool pull <remote> <branch>    # Pull specific branch from remote
+
+Examples:
+  revtool pull origin               # Pull current branch from origin
+  revtool pull origin main          # Pull main branch from origin
+
+Pull downloads snapshots from the remote and updates your local branch."#.to_string()),
+        "serve" => Some(r#"
+Start an HTTP server to host the repository:
+  revtool serve                     # Serve on default port 8080
+  revtool serve --port <port>       # Serve on specific port
+  revtool serve --host <host>       # Bind to specific address
+
+Examples:
+  revtool serve                     # Start server on 127.0.0.1:8080
+  revtool serve --port 3000         # Start server on port 3000
+  revtool serve --host 0.0.0.0     # Listen on all interfaces
+
+The server allows other users to push/pull from your repository."#.to_string()),
         _ => None,
     }
 }
@@ -911,6 +1028,11 @@ Common workflows:
    revtool checkout main
    revtool diff feature      # See changes in feature compared to main
 
+5. Working with remotes:
+   revtool remote add origin http://server:8080  # Add a remote
+   revtool push origin main      # Push changes
+   revtool pull origin main      # Pull changes
+
 Use 'revtool usage <command>' for detailed help on a specific command.
 "###.to_string()
 }
@@ -923,6 +1045,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
         // These commands should work without a repository
         Usage { .. } => {},
         Init => {},
+        Serve { .. } => {}, // Serve can work with just a path to a repository
         // All other commands require a repository
         _ => {
             // Only check for repository if we're not initializing or showing usage
@@ -1780,6 +1903,145 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
         Init => {
             DotRev::init(current_dir()?.join(".rev"))?;
             println!("{}", "Initialized empty revision control repository in .rev/".green().bold());
+            Ok(())
+        }
+        
+        Remote { cmd } => {
+            let (dot_rev, _) = get_repository()?;
+            
+            match cmd {
+                Some(RemoteCommand::Add { name, url }) => {
+                    let remote = RemoteConfig { name: name.clone(), url: url.clone() };
+                    dot_rev.add_remote(remote)?;
+                    println!("Added remote '{}' with URL: {}", name.green().bold(), url);
+                    Ok(())
+                },
+                Some(RemoteCommand::Remove { name }) => {
+                    dot_rev.remove_remote(&name)?;
+                    println!("Removed remote '{}'", name.red().bold());
+                    Ok(())
+                },
+                None => {
+                    // List remotes
+                    let remotes = dot_rev.remotes()?;
+                    if remotes.is_empty() {
+                        println!("No remotes configured");
+                    } else {
+                        println!("{}", "Configured remotes:".green().bold());
+                        for remote in remotes {
+                            println!("  {} -> {}", remote.name.cyan(), remote.url);
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        }
+        
+        Push { remote, branch, force } => {
+            let (dot_rev, current_branch) = get_repository()?;
+            let mut store = dot_rev.store()?;
+            
+            // Get the branch to push
+            let branch_to_push = branch.as_ref().unwrap_or(&current_branch);
+            
+            // Get remote configuration
+            let remote_config = dot_rev.get_remote(&remote)?
+                .ok_or_else(|| AppError::Other(format!("Remote '{}' not found. Use 'revtool remote add' to configure it.", remote)))?;
+            
+            // Create HTTP client
+            let client = HttpRemoteClient::new(remote_config.url.clone())
+                .map_err(|e| AppError::Other(format!("Failed to connect to remote: {}", e)))?;
+            
+            // Get the local snapshot to push
+            let local_snapshot_id = dot_rev.branch_snapshot_id(branch_to_push)?;
+            
+            println!("Pushing branch '{}' to remote '{}'...", branch_to_push.cyan(), remote.cyan());
+            
+            // Push the branch
+            sync::push_branch(&client, &mut store, branch_to_push, local_snapshot_id, force)
+                .map_err(|e| AppError::Other(format!("Push failed: {}", e)))?;
+            
+            println!("{}", "Push completed successfully!".green().bold());
+            Ok(())
+        }
+        
+        Pull { remote, branch } => {
+            let (dot_rev, current_branch) = get_repository()?;
+            let mut store = dot_rev.store()?;
+            
+            // Get the branch to pull
+            let branch_to_pull = branch.as_ref().unwrap_or(&current_branch);
+            
+            // Get remote configuration
+            let remote_config = dot_rev.get_remote(&remote)?
+                .ok_or_else(|| AppError::Other(format!("Remote '{}' not found. Use 'revtool remote add' to configure it.", remote)))?;
+            
+            // Create HTTP client
+            let client = HttpRemoteClient::new(remote_config.url.clone())
+                .map_err(|e| AppError::Other(format!("Failed to connect to remote: {}", e)))?;
+            
+            println!("Pulling branch '{}' from remote '{}'...", branch_to_pull.cyan(), remote.cyan());
+            
+            // Pull the branch
+            match sync::pull_branch(&client, &mut store, branch_to_pull)
+                .map_err(|e| AppError::Other(format!("Pull failed: {}", e)))? {
+                Some(new_snapshot_id) => {
+                    // Check if this is a new branch
+                    let is_new_branch = !dot_rev.branch_exists(branch_to_pull)?;
+                    
+                    // Update the local branch pointer (this creates the branch if it doesn't exist)
+                    dot_rev.set_branch_snapshot_id(branch_to_pull, new_snapshot_id)?;
+                    
+                    // If we pulled the current branch, update the working directory
+                    if branch_to_pull == &current_branch {
+                        let snapshot: SnapShot = store.read_json(new_snapshot_id)?;
+                        let directory: Directory = store.read_json(snapshot.directory)?;
+                        
+                        let cwd = current_dir()?;
+                        directory.write(&store, &cwd, false)
+                            .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
+                        
+                        println!("Updated working directory to match remote snapshot");
+                    }
+                    
+                    if is_new_branch {
+                        println!("{}", format!("Created new branch '{}' from remote", branch_to_pull).green().bold());
+                    }
+                    
+                    println!("{}", format!("Pull completed successfully! Branch '{}' updated to {}", 
+                        branch_to_pull, new_snapshot_id.to_string().cyan()).green().bold());
+                },
+                None => {
+                    println!("{}", format!("Branch '{}' not found on remote '{}'", branch_to_pull, remote).yellow());
+                }
+            }
+            
+            Ok(())
+        }
+        
+        Serve { port, host } => {
+            let (dot_rev, _) = get_repository()?;
+            
+            // Create the server
+            let server = HttpRemoteServer::new(dot_rev.root().clone())
+                .map_err(|e| AppError::Other(format!("Failed to create server: {}", e)))?;
+            
+            let addr = format!("{}:{}", host, port);
+            
+            // Create a runtime for the async server
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|e| AppError::Other(format!("Failed to create runtime: {}", e)))?;
+            
+            println!("Starting repository server on {}...", addr.cyan().bold());
+            println!("Other users can add this as a remote with:");
+            println!("  revtool remote add origin http://{}", addr);
+            
+            // Block on the server
+            runtime.block_on(async {
+                server.run(&addr).await
+                    .map_err(|e| AppError::Other(format!("Server error: {}", e)))
+            })?;
+            
             Ok(())
         }
     }

@@ -107,4 +107,27 @@ pub trait ObjectStore {
     ///
     /// * `Result<ObjectId, Self::Error>` - The `ObjectId` of the stored object
     fn insert(&mut self, object: &[u8]) -> Result<ObjectId, Self::Error>;
+
+    /// Inserts an object into the store with a pre-computed `ObjectId`.
+    ///
+    /// This method is useful when syncing objects from a remote store where
+    /// the ID has already been computed. The implementation should verify
+    /// that the provided ID matches the content hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The pre-computed `ObjectId` for the object
+    /// * `object` - The binary data to store
+    ///
+    /// # Returns
+    ///
+    /// * `Result<(), Self::Error>` - Ok if stored successfully
+    fn insert_with_id(&mut self, id: ObjectId, object: &[u8]) -> Result<(), Self::Error> {
+        let computed_id = self.insert(object)?;
+        if computed_id != id {
+            // In a real implementation, we'd want a proper error type
+            panic!("Provided ObjectId does not match computed hash");
+        }
+        Ok(())
+    }
 }
