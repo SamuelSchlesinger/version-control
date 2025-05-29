@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{read_dir, File},
-    io::{Read, Write},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -150,9 +150,22 @@ impl DirectoryEntry {
 impl Directory {
     /// Iterate over all files in the directory tree, returning (path, ObjectId) pairs
     pub fn files(&self) -> Vec<(PathBuf, ObjectId)> {
-        let mut files = Vec::new();
+        // Pre-allocate with estimated capacity to reduce reallocations
+        let mut files = Vec::with_capacity(self.estimate_file_count());
         self.collect_files(&mut files, PathBuf::new());
         files
+    }
+    
+    /// Estimate the number of files in this directory tree for pre-allocation
+    fn estimate_file_count(&self) -> usize {
+        let mut count = 0;
+        for entry in self.root.values() {
+            count += match entry {
+                DirectoryEntry::File(_) => 1,
+                DirectoryEntry::Directory(dir) => dir.estimate_file_count(),
+            }
+        }
+        count
     }
     
     fn collect_files(&self, files: &mut Vec<(PathBuf, ObjectId)>, current_path: PathBuf) {
@@ -197,19 +210,22 @@ impl Directory {
         with_content_diff: bool,
         store: Option<&Store>
     ) -> Diff {
-        let added: BTreeMap<String, DirectoryEntry> = other
-            .root
-            .iter()
-            .filter(|(file_name, _dir_entry)| !self.root.contains_key(*file_name))
-            .map(|(fname, dir_entry)| (fname.clone(), dir_entry.clone()))
-            .collect();
+        // Pre-allocate with reasonable capacity to reduce reallocations
+        let mut added = BTreeMap::new();
+        let mut deleted = BTreeSet::new();
 
-        let deleted: BTreeSet<String> = self
-            .root
-            .iter()
-            .filter(|(file_name, _dir_entry)| !other.root.contains_key(*file_name))
-            .map(|(fname, _dir_entry)| fname.clone())
-            .collect();
+        // Efficiently find added and deleted files in a single pass
+        for (file_name, dir_entry) in &other.root {
+            if !self.root.contains_key(file_name) {
+                added.insert(file_name.clone(), dir_entry.clone());
+            }
+        }
+
+        for file_name in self.root.keys() {
+            if !other.root.contains_key(file_name) {
+                deleted.insert(file_name.clone());
+            }
+        }
 
         let modified: BTreeMap<String, DiffEntry> = self
             .root
@@ -272,12 +288,14 @@ impl Directory {
                         let v = store.read(*id).map_err(Error::Store)?;
                         match v {
                             Some(v) => {
-                                let mut f = File::options()
+                                let f = File::options()
                                     .create(true)
                                     .write(true)
                                     .truncate(true)
                                     .open(path.join(file_name))?;
-                                f.write_all(&v)?;
+                                let mut writer = BufWriter::new(f);
+                                writer.write_all(&v)?;
+                                writer.flush()?; // Ensure data is written
                             }
                             None => return Err(Error::ObjectMissing(*id)),
                         }
@@ -399,6 +417,7 @@ impl Ignores {
     pub fn is_ignored(&self, path: &Path) -> bool {
         // Make sure the glob set is built
         if self.glob_set.is_none() {
+            log::warn!("Glob set not initialized, rebuilding on demand");
             let mut this = self.clone();
             this.build_glob_set();
             return this.is_ignored(path);
@@ -406,15 +425,15 @@ impl Ignores {
 
         // Match against the glob set
         if let Some(glob_set) = &self.glob_set {
-            // Check both the full path and just the file name
+            // Convert path to string once and reuse
             let path_str = path.to_string_lossy();
-            if glob_set.is_match(path_str.to_string()) {
+            if glob_set.is_match(&path_str) {
                 return true;
             }
 
             // Check just the file name
             if let Some(file_name) = path.file_name() {
-                let file_name_str = file_name.to_string_lossy().to_string();
+                let file_name_str = file_name.to_string_lossy();
                 if glob_set.is_match(&file_name_str) {
                     return true;
                 }
@@ -467,11 +486,12 @@ impl Directory {
                     DirectoryEntry::File(id),
                 );
                 let mut v = Vec::new();
-                let mut obj_file = File::options()
+                let obj_file = File::options()
                     .read(true)
                     .open(&path)
                     .map_err(Error::IO)?;
-                obj_file.read_to_end(&mut v).map_err(Error::IO)?;
+                let mut reader = BufReader::new(obj_file);
+                reader.read_to_end(&mut v).map_err(Error::IO)?;
                 store.insert(&v).map_err(Error::Store)?;
             } else {
                 log::warn!(
