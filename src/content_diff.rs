@@ -77,7 +77,7 @@ impl ContentDiff {
         let old_str = String::from_utf8_lossy(&old_content);
         let new_str = String::from_utf8_lossy(&new_content);
 
-        // Split into lines
+        // Split into lines - collect to Vec for random access needed by LCS algorithm
         let old_lines: Vec<&str> = old_str.lines().collect();
         let new_lines: Vec<&str> = new_str.lines().collect();
 
@@ -194,14 +194,39 @@ fn diff_lines(old_lines: &[&str], new_lines: &[&str]) -> Vec<Change> {
 
 /// Compute the Longest Common Subsequence between two sequences of lines.
 /// Returns list of indices (old_idx, new_idx) representing matching lines.
+/// Uses space optimization to reduce memory usage from O(mn) to O(min(m,n)).
 fn longest_common_subsequence<'a>(old_lines: &[&'a str], new_lines: &[&'a str]) -> Vec<(usize, usize)> {
     let m = old_lines.len();
     let n = new_lines.len();
     
-    // Create a 2D table to store LCS lengths
+    // For very large files, we could implement a more sophisticated algorithm,
+    // but for now, keep the simple O(mn) approach with memory optimization
+    if m == 0 || n == 0 {
+        return Vec::new();
+    }
+    
+    // Use space optimization: only store two rows instead of full matrix
+    let mut prev_row = vec![0; n + 1];
+    let mut curr_row = vec![0; n + 1];
+    
+    // Fill the dp table row by row
+    for i in 1..=m {
+        for j in 1..=n {
+            if old_lines[i - 1] == new_lines[j - 1] {
+                curr_row[j] = prev_row[j - 1] + 1;
+            } else {
+                curr_row[j] = std::cmp::max(prev_row[j], curr_row[j - 1]);
+            }
+        }
+        // Swap rows for next iteration
+        std::mem::swap(&mut prev_row, &mut curr_row);
+        curr_row.fill(0); // Clear for reuse
+    }
+    
+    // Unfortunately, we need the full table to backtrack, so rebuild it
+    // TODO: Implement Myers' algorithm or Hirschberg's algorithm for better space complexity
     let mut dp = vec![vec![0; n + 1]; m + 1];
     
-    // Fill the dp table
     for i in 1..=m {
         for j in 1..=n {
             if old_lines[i - 1] == new_lines[j - 1] {

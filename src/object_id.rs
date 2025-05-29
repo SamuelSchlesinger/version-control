@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fmt::{Debug, Display},
     fs::File,
-    io::Read,
+    io::{BufReader, Read},
     path::Path,
 };
 
@@ -130,9 +130,10 @@ impl ObjectId {
 impl TryFrom<File> for ObjectId {
     type Error = std::io::Error;
 
-    fn try_from(mut f: File) -> Result<Self, Self::Error> {
+    fn try_from(f: File) -> Result<Self, Self::Error> {
+        let mut reader = BufReader::new(f);
         let mut vec = Vec::new();
-        f.read_to_end(&mut vec)?;
+        reader.read_to_end(&mut vec)?;
         Ok((&vec).into())
     }
 }
