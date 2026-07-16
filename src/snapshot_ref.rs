@@ -36,12 +36,6 @@ impl From<DotRevError> for Error {
     }
 }
 
-impl From<hex::FromHexError> for Error {
-    fn from(_: hex::FromHexError) -> Self {
-        Error::InvalidHex("Invalid hex string".to_string())
-    }
-}
-
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -126,7 +120,11 @@ impl FromStr for ObjectIdRef {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // If it's a full 64-character hex string, treat it as a complete ID
         if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-            let bytes = hex::decode(s)?;
+            // Use the crate's own hex codec rather than the external `hex` crate,
+            // so there is a single hex implementation to reason about.
+            let bytes = crate::hex::Hex(s.as_bytes().to_vec())
+                .decode()
+                .map_err(Error::InvalidHex)?;
             let mut array = [0u8; 32];
             array.copy_from_slice(&bytes);
             Ok(ObjectIdRef::Complete(ObjectId::from_bytes(array)))
