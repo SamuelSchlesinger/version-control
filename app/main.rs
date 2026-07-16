@@ -818,7 +818,15 @@ where
                     println!("Launching editor: {}", editor);
 
                     use std::process::Command;
-                    let status = Command::new(editor)
+                    // Split on whitespace so editors with arguments work, e.g.
+                    // --editor "code -w" or --editor "emacsclient -nw". Command
+                    // does no shell parsing, so the flags must be separate args.
+                    let mut parts = editor.split_whitespace();
+                    let program = parts.next().ok_or_else(|| {
+                        AppError::Other("empty --editor value".to_string())
+                    })?;
+                    let status = Command::new(program)
+                        .args(parts)
                         .arg(&file_path)
                         .status()
                         .map_err(|e| AppError::Other(format!("Failed to launch editor {}: {}", editor, e)))?;
@@ -1276,6 +1284,8 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                     // Process strategy option if provided
                     let merge_strategy = if let Some(strategy_str) = &strategy {
                         match merge::MergeStrategy::from_str(strategy_str) {
+                            // 'normal' means manual resolution; treat as no strategy.
+                            Ok(merge::MergeStrategy::Normal) => None,
                             Ok(s) => Some(s),
                             Err(e) => {
                                 return Err(AppError::Other(e));
@@ -1540,6 +1550,10 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 // Process strategy option if provided
                 let merge_strategy = if let Some(strategy_str) = &strategy {
                     match merge::MergeStrategy::from_str(strategy_str) {
+                        // 'normal' means "no auto-resolution": fall through to
+                        // the manual, marker-based path, exactly as if no
+                        // strategy were given.
+                        Ok(merge::MergeStrategy::Normal) => None,
                         Ok(s) => Some(s),
                         Err(e) => {
                             return Err(AppError::Other(e));
