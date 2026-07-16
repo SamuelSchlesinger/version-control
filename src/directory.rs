@@ -28,7 +28,19 @@ pub enum Error<Store: ObjectStore> {
     IO(std::io::Error),
     /// A snapshot contained an entry name that is not a safe path component.
     UnsafeEntryName(String),
+    /// The working tree is nested more deeply than [`MAX_DIRECTORY_DEPTH`].
+    TooDeeplyNested { depth: usize, limit: usize },
 }
+
+/// Maximum directory nesting depth a snapshot may contain.
+///
+/// The tree is stored as nested JSON, and serde's default recursion limit (128)
+/// is exceeded at roughly 63 levels — after which the stored snapshot can no
+/// longer be *read back*, silently bricking the repository. We refuse to build
+/// (and therefore snapshot) a tree deeper than this well-below-the-limit bound,
+/// so a bricking snapshot can never be created. 50 levels is far beyond any real
+/// source tree.
+pub const MAX_DIRECTORY_DEPTH: usize = 50;
 
 /// Checks that a snapshot entry name is a single, ordinary path component.
 ///
@@ -191,6 +203,31 @@ impl Directory {
             }
         }
     }
+
+    /// The deepest directory nesting in this tree (0 for a flat tree of files).
+    pub fn max_depth(&self) -> usize {
+        self.root
+            .values()
+            .map(|entry| match entry {
+                DirectoryEntry::Directory(dir) => 1 + dir.max_depth(),
+                DirectoryEntry::File(_) => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Rejects a tree nested more deeply than [`MAX_DIRECTORY_DEPTH`], before it
+    /// can be stored and later become unreadable (see the constant's docs).
+    fn reject_if_too_deep<Store: ObjectStore>(&self) -> Result<(), Error<Store>> {
+        let depth = self.max_depth();
+        if depth > MAX_DIRECTORY_DEPTH {
+            return Err(Error::TooDeeplyNested {
+                depth,
+                limit: MAX_DIRECTORY_DEPTH,
+            });
+        }
+        Ok(())
+    }
     
     /// Compute the diff between this directory structure and the one
     /// which is currently located at the path.
@@ -248,11 +285,19 @@ impl Directory {
                                     .generate_content_diff(other_dir_entry, store)
                                     .map(|diff| (file_name.clone(), diff))
                             }
-                            // For directories, recursively apply content diffing
+                            // For directories, recursively apply content diffing —
+                            // but only if they actually differ. Without this
+                            // equality check (which the non-content path performs
+                            // via DirectoryEntry::diff) every unchanged directory
+                            // was reported as modified with an empty diff body.
                             (DirectoryEntry::Directory(dir), DirectoryEntry::Directory(other_dir)) => {
-                                // Recursively diff the directories with content diffing enabled
-                                let nested_diff = dir.diff_with_content(other_dir, with_content_diff, store);
-                                Some((file_name.clone(), DiffEntry::Directory(Box::new(nested_diff))))
+                                if dir == other_dir {
+                                    None
+                                } else {
+                                    let nested_diff =
+                                        dir.diff_with_content(other_dir, with_content_diff, store);
+                                    Some((file_name.clone(), DiffEntry::Directory(Box::new(nested_diff))))
+                                }
                             }
                             // For other mixed types, use regular diff
                             _ => dir_entry
@@ -302,23 +347,31 @@ impl Directory {
                     let v = store.read(*id).map_err(Error::Store)?;
                     match v {
                         Some(v) => {
+                            let target = path.join(file_name);
+                            // Never write *through* an existing symlink (which
+                            // could point outside the repo) or into a directory
+                            // sitting where a file belongs. Replace whatever is
+                            // there with a fresh regular file, exactly as git
+                            // does on checkout.
+                            remove_non_regular_file(&target)?;
                             let mut f = File::options()
                                 .create(true)
                                 .write(true)
                                 .truncate(true)
-                                .open(path.join(file_name))?;
+                                .open(&target)?;
                             f.write_all(&v)?;
                         }
                         None => return Err(Error::ObjectMissing(*id)),
                     }
                 }
                 DirectoryEntry::Directory(dir) => {
-                    let dir_path = PathBuf::from(path).join(file_name);
+                    let dir_path = path.join(file_name);
 
-                    // Create the directory if it doesn't exist
-                    if !Path::try_exists(&dir_path)? {
-                        std::fs::create_dir(&dir_path)?;
-                    }
+                    // Ensure a *real* directory is here before descending. If a
+                    // symlink (or other non-directory) occupies this path, remove
+                    // it and create a real directory — otherwise the recursive
+                    // write would follow the symlink and escape the repository.
+                    ensure_real_directory(&dir_path)?;
 
                     dir.write(store, dir_path.as_path(), delete_absent)?;
                 }
@@ -506,13 +559,17 @@ impl Directory {
                 continue;
             }
 
+            // A non-UTF-8 name can't be a key in our String-keyed tree; skip it
+            // with a warning rather than panicking (these are legal on Linux).
+            let file_name = match utf8_entry_name(&dir_entry) {
+                Some(name) => name,
+                None => continue,
+            };
+
             let file_type = dir_entry.file_type().map_err(Error::IO)?;
             if file_type.is_dir() {
                 let directory = Directory::new(path.as_path(), ignores, store)?;
-                root.insert(
-                    dir_entry.file_name().into_string().unwrap(),
-                    DirectoryEntry::Directory(Box::new(directory)),
-                );
+                root.insert(file_name, DirectoryEntry::Directory(Box::new(directory)));
             } else if file_type.is_file() {
                 // Read and hash the file exactly once: insert() hashes the bytes
                 // and returns the id, so a separate ObjectId::try_from (which
@@ -525,10 +582,7 @@ impl Directory {
                     .read_to_end(&mut v)
                     .map_err(Error::IO)?;
                 let id = store.insert(&v).map_err(Error::Store)?;
-                root.insert(
-                    dir_entry.file_name().into_string().unwrap(),
-                    DirectoryEntry::File(id),
-                );
+                root.insert(file_name, DirectoryEntry::File(id));
             } else {
                 log::warn!(
                     "Skipping unsupported file type (not a regular file or directory): {:?}",
@@ -536,7 +590,9 @@ impl Directory {
                 );
             }
         }
-        Ok(Directory { root })
+        let directory = Directory { root };
+        directory.reject_if_too_deep()?;
+        Ok(directory)
     }
 
     /// Builds the tree from the working directory using a [`SnapshotIndex`] so
@@ -552,7 +608,9 @@ impl Directory {
         index: &mut crate::snapshot_index::SnapshotIndex,
         consult: bool,
     ) -> Result<Self, Error<Store>> {
-        Self::build_indexed(root, root, ignores, store, index, consult)
+        let directory = Self::build_indexed(root, root, ignores, store, index, consult)?;
+        directory.reject_if_too_deep()?;
+        Ok(directory)
     }
 
     fn build_indexed<Store: ObjectStore>(
@@ -572,13 +630,15 @@ impl Directory {
                 continue;
             }
 
+            let file_name = match utf8_entry_name(&dir_entry) {
+                Some(name) => name,
+                None => continue,
+            };
+
             let file_type = dir_entry.file_type().map_err(Error::IO)?;
             if file_type.is_dir() {
                 let sub = Self::build_indexed(root, path.as_path(), ignores, store, index, consult)?;
-                map.insert(
-                    dir_entry.file_name().into_string().unwrap(),
-                    DirectoryEntry::Directory(Box::new(sub)),
-                );
+                map.insert(file_name, DirectoryEntry::Directory(Box::new(sub)));
             } else if file_type.is_file() {
                 let meta = dir_entry.metadata().map_err(Error::IO)?;
                 let rel = relative_key(root, &path);
@@ -602,10 +662,7 @@ impl Directory {
                         id
                     }
                 };
-                map.insert(
-                    dir_entry.file_name().into_string().unwrap(),
-                    DirectoryEntry::File(id),
-                );
+                map.insert(file_name, DirectoryEntry::File(id));
             } else {
                 log::warn!(
                     "Skipping unsupported file type (not a regular file or directory): {:?}",
@@ -614,6 +671,61 @@ impl Directory {
             }
         }
         Ok(Directory { root: map })
+    }
+}
+
+/// Returns a directory entry's file name as a `String`, or `None` (with a
+/// warning) if it is not valid UTF-8. Our tree keys are `String`s, so a
+/// non-UTF-8 name (legal on Linux) cannot be represented and is skipped rather
+/// than panicking the whole command.
+fn utf8_entry_name(entry: &std::fs::DirEntry) -> Option<String> {
+    match entry.file_name().into_string() {
+        Ok(name) => Some(name),
+        Err(raw) => {
+            log::warn!("skipping file with a non-UTF-8 name: {raw:?}");
+            None
+        }
+    }
+}
+
+/// Removes whatever is at `target` unless it is already a regular file.
+///
+/// This is the write-side defense against symlink attacks: a working-tree
+/// symlink at a tracked path must be unlinked (not followed) before we write,
+/// so content is never written through it to an arbitrary location. A directory
+/// occupying a file's path (a file/directory conflict) is likewise removed. A
+/// plain regular file is left in place for the caller to truncate and overwrite.
+fn remove_non_regular_file(target: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
+        Ok(meta) => {
+            if meta.file_type().is_dir() {
+                std::fs::remove_dir_all(target)
+            } else {
+                // Symlink, fifo, socket, etc. remove_file unlinks the entry
+                // itself, never following a symlink to its target.
+                std::fs::remove_file(target)
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Ensures `dir_path` is a real directory, creating one if nothing is there and
+/// replacing any symlink (or other non-directory) that occupies the path. This
+/// stops the recursive writer from descending *through* a symlinked directory,
+/// which would let a snapshot write outside the repository.
+fn ensure_real_directory(dir_path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir_path) {
+        Ok(meta) if meta.file_type().is_dir() => Ok(()),
+        Ok(_) => {
+            // A symlink or a file is in the way: remove it, then make a real dir.
+            std::fs::remove_file(dir_path)?;
+            std::fs::create_dir(dir_path)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(dir_path),
+        Err(e) => Err(e),
     }
 }
 
@@ -931,4 +1043,72 @@ fn test_malicious_snapshot_cannot_write_outside_target() {
         Err(Error::UnsafeEntryName(_))
     ));
     assert!(!tempdir.path().join("escaped2.txt").exists());
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn test_write_never_follows_symlinks() {
+    use crate::object_store::in_memory::InMemoryObjectStore;
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let repo = tempdir.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let victim = tempdir.path().join("victim.txt");
+    std::fs::write(&victim, b"PRISTINE").unwrap();
+
+    let mut store = InMemoryObjectStore::default();
+    let id = store.insert(b"tracked content").unwrap();
+
+    // Case 1: a final-component symlink where a tracked file belongs.
+    symlink(&victim, repo.join("data.txt")).unwrap();
+    let mut root = BTreeMap::new();
+    root.insert("data.txt".to_string(), DirectoryEntry::File(id));
+    Directory { root }.write(&store, &repo, false).unwrap();
+    assert_eq!(std::fs::read(&victim).unwrap(), b"PRISTINE", "wrote through symlink");
+    assert!(!repo.join("data.txt").symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read(repo.join("data.txt")).unwrap(), b"tracked content");
+
+    // Case 2: a leading-directory symlink pointing outside the repo.
+    let outside = tempdir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("f.txt"), b"PRISTINE").unwrap();
+    symlink(&outside, repo.join("d")).unwrap();
+    let mut inner = BTreeMap::new();
+    inner.insert("f.txt".to_string(), DirectoryEntry::File(id));
+    let mut outer = BTreeMap::new();
+    outer.insert("d".to_string(), DirectoryEntry::Directory(Box::new(Directory { root: inner })));
+    Directory { root: outer }.write(&store, &repo, false).unwrap();
+    assert_eq!(
+        std::fs::read(outside.join("f.txt")).unwrap(),
+        b"PRISTINE",
+        "wrote through a symlinked directory to outside the repo"
+    );
+    assert_eq!(std::fs::read(repo.join("d/f.txt")).unwrap(), b"tracked content");
+}
+
+#[test]
+fn test_reject_too_deeply_nested_tree() {
+    // Build a tree nested past the limit and confirm building it errors rather
+    // than producing a snapshot that later can't be read back.
+    fn nest(depth: usize) -> Directory {
+        if depth == 0 {
+            let mut root = BTreeMap::new();
+            root.insert("leaf".to_string(), DirectoryEntry::File(ObjectId::from(&b"x"[..])));
+            Directory { root }
+        } else {
+            let mut root = BTreeMap::new();
+            root.insert("a".to_string(), DirectoryEntry::Directory(Box::new(nest(depth - 1))));
+            Directory { root }
+        }
+    }
+    assert_eq!(nest(MAX_DIRECTORY_DEPTH).max_depth(), MAX_DIRECTORY_DEPTH);
+    assert!(nest(MAX_DIRECTORY_DEPTH)
+        .reject_if_too_deep::<crate::object_store::in_memory::InMemoryObjectStore>()
+        .is_ok());
+    assert!(matches!(
+        nest(MAX_DIRECTORY_DEPTH + 1)
+            .reject_if_too_deep::<crate::object_store::in_memory::InMemoryObjectStore>(),
+        Err(Error::TooDeeplyNested { .. })
+    ));
 }
