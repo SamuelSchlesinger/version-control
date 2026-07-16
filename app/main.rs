@@ -1304,6 +1304,447 @@ Use 'revtool usage <command>' for detailed help on a specific command.
 "###.to_string()
 }
 
+/// Handler for `revtool merge` (abort / continue / fresh merge, with optional
+/// strategy or editor). Extracted from run_command to keep that dispatcher small.
+fn cmd_merge(
+    branch: Option<String>,
+    message: Option<String>,
+    abort: bool,
+    r#continue: bool,
+    strategy: Option<String>,
+    editor: Option<String>,
+    interactive: bool,
+) -> AppResult<()> {
+    let (dot_rev, current_branch) = get_repository()?;
+    let mut store = dot_rev.store()?;
+
+    // Handle abort case
+    if abort {
+        // Check if there's a merge in progress
+        if !dot_rev.is_merge_in_progress()? {
+            return Err(AppError::NoMergeInProgress);
+        }
+
+        // Get the merge state
+        let merge_state = dot_rev.get_merge_state()?;
+
+        // Reset to the backup snapshot
+        let snapshot_id = merge_state.backup_snapshot_id;
+        let snapshot: SnapShot = store.read_json(snapshot_id)?;
+        let directory: Directory = store.read_json(snapshot.directory)?;
+
+        // Reset files
+        let cwd = dot_rev.work_dir().to_path_buf();
+        directory.write(&store, &cwd, false)
+            .map_err(|e| AppError::FailedToResetFiles(format!("{}", e)))?;
+
+        // Restore the branch pointer too, so the tip and the working
+        // tree agree again even if a snapshot was taken mid-merge.
+        dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+
+        // Clear the merge state
+        dot_rev.clear_merge_state()?;
+
+        println!("Merge aborted. Files and branch reset to their state before the merge.");
+        return Ok(());
+    }
+
+    // Handle continue case
+    if r#continue {
+        // Check if there's a merge in progress
+        if !dot_rev.is_merge_in_progress()? {
+            return Err(AppError::NoMergeInProgress);
+        }
+
+        // Get the merge state
+        let mut merge_state = dot_rev.get_merge_state()?;
+
+        // Check if there are unresolved conflicts
+        if merge_state.merge_result.has_unresolved_conflicts() {
+            // Process strategy option if provided
+            let merge_strategy = if let Some(strategy_str) = &strategy {
+                match merge::MergeStrategy::from_str(strategy_str) {
+                    // 'normal' means manual resolution; treat as no strategy.
+                    Ok(merge::MergeStrategy::Normal) => None,
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        return Err(AppError::Other(e));
+                    }
+                }
+            } else {
+                None
+            };
+
+            // In interactive mode, help resolve conflicts
+            if interactive {
+                let merge_result = interactive_merge_conflict_resolution(
+                    &dot_rev,
+                    &merge_state.merge_result.conflicts,
+                    &mut store,
+                    editor.as_deref(),
+                    merge_strategy
+                )?;
+
+                // Create a merge snapshot
+                let merge_msg = message.clone().or_else(|| merge_state.message.clone()).unwrap_or_else(||
+                    format!("Merge branch '{}' into {}",
+                        merge_state.merge_branch,
+                        merge_state.current_branch
+                    )
+                );
+
+                let snapshot_id = merge_result.create_snapshot(&mut store, merge_msg)?;
+
+                // Update the branch pointer
+                dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+                refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
+
+                // Clear the merge state
+                dot_rev.clear_merge_state()?;
+
+                println!("Merge completed successfully: created snapshot {}",
+                    snapshot_id.to_string().cyan());
+                return Ok(());
+            } else if let Some(strategy) = merge_strategy {
+                // In non-interactive mode but with a strategy, we can try to resolve conflicts automatically
+                if strategy == merge::MergeStrategy::Normal {
+                    // Normal strategy needs interactive mode
+                    return Err(AppError::Other(
+                        "Normal merge strategy requires interactive mode. Use 'revtool merge -i'".to_string()
+                    ));
+                }
+
+                println!("Applying {} merge strategy to all conflicts...",
+                    if strategy == merge::MergeStrategy::Ours { "ours".cyan() } else { "theirs".cyan() });
+
+                // Apply the strategy to every unresolved conflict.
+                let all_resolved =
+                    apply_strategy_to_conflicts(&mut store, &mut merge_state, strategy)?;
+
+                // Check if all conflicts are now resolved
+                if all_resolved || merge_state.merge_result.conflicts.iter().all(|c| c.resolved) {
+                    println!("\n{}", "All conflicts resolved automatically!".green().bold());
+
+                    // Create the merge snapshot
+                    let merge_msg = message.clone().or_else(|| merge_state.message.clone()).unwrap_or_else(||
+                        format!("Merge branch '{}' into {} (strategy: {})",
+                            merge_state.merge_branch,
+                            merge_state.current_branch,
+                            if strategy == merge::MergeStrategy::Ours { "ours" } else { "theirs" }
+                        )
+                    );
+
+                    let snapshot_id = merge_state.merge_result.create_snapshot(&mut store, merge_msg)?;
+
+                    // Update the branch pointer
+                    dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+                    refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
+
+                    // Clear the merge state
+                    dot_rev.clear_merge_state()?;
+
+                    println!("Merge completed successfully: created snapshot {}",
+                        snapshot_id.to_string().cyan());
+                    return Ok(());
+                } else {
+                    // Not all conflicts could be resolved automatically
+                    dot_rev.save_merge_state(&merge_state)?;
+                    return Err(AppError::MergeConflicts(merge_state.merge_result.conflicts.clone()));
+                }
+            } else {
+                // Non-interactive continue with no strategy: pick up the
+                // resolutions the user made by editing the working-tree
+                // files, the standard git-style workflow.
+                let work_dir = dot_rev.work_dir().to_path_buf();
+                let mut still_conflicted: Vec<PathBuf> = Vec::new();
+
+                let unresolved: Vec<_> = merge_state
+                    .merge_result
+                    .conflicts
+                    .iter()
+                    .filter(|c| !c.resolved)
+                    .map(|c| c.path.clone())
+                    .collect();
+
+                for path in unresolved {
+                    let full = work_dir.join(&path);
+                    let content = match std::fs::read(&full) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            still_conflicted.push(path);
+                            continue;
+                        }
+                    };
+                    if content_has_conflict_markers(&content) {
+                        still_conflicted.push(path);
+                        continue;
+                    }
+                    let resolved_id = store.insert(&content)
+                        .map_err(|e| AppError::Other(format!("Failed to store resolved file: {:?}", e)))?;
+                    for c in merge_state.merge_result.conflicts.iter_mut() {
+                        if c.path == path {
+                            c.resolved = true;
+                            c.resolution_id = Some(resolved_id);
+                            break;
+                        }
+                    }
+                }
+
+                if !still_conflicted.is_empty() {
+                    // No need to persist progress: the working-tree edits
+                    // themselves are the progress, and the next
+                    // --continue re-reads them.
+                    let mut msg = String::from(
+                        "Some files still contain conflict markers:\n",
+                    );
+                    for path in &still_conflicted {
+                        msg.push_str(&format!("  {}\n", path.display()));
+                    }
+                    msg.push_str("Edit them to remove the markers, then run 'revtool merge --continue'");
+                    return Err(AppError::Other(msg));
+                }
+                // All conflicts resolved from the working tree; fall
+                // through to finalization below.
+            }
+        }
+
+        // All conflicts are resolved, create the merge snapshot
+        let merge_msg = message.clone().or_else(|| merge_state.message.clone()).unwrap_or_else(||
+            format!("Merge branch '{}' into {}",
+                merge_state.merge_branch,
+                merge_state.current_branch
+            )
+        );
+
+        let snapshot_id = merge_state.merge_result.create_snapshot(&mut store, merge_msg)?;
+
+        // Update the branch pointer
+        dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+        refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
+
+        // Clear the merge state
+        dot_rev.clear_merge_state()?;
+
+        println!("Merge completed successfully: created snapshot {}",
+            snapshot_id.to_string().cyan());
+        return Ok(());
+    }
+
+    // Handle new merge case
+    if dot_rev.is_merge_in_progress()? {
+        return Err(AppError::MergeInProgress);
+    }
+
+    // Make sure a branch is specified
+    let merge_branch = match branch {
+        Some(b) => b,
+        None if interactive => {
+            // In interactive mode, let the user select a branch
+            let branches = dot_rev.list_branches()?;
+            let filtered_branches: Vec<String> = branches
+                .into_iter()
+                .filter(|b| b != &current_branch)
+                .collect();
+
+            if filtered_branches.is_empty() {
+                return Err(AppError::Other("No other branches found to merge".to_string()));
+            }
+
+            let theme = ColorfulTheme::default();
+            let selection = Select::with_theme(&theme)
+                .with_prompt("Select branch to merge")
+                .items(&filtered_branches)
+                .default(0)
+                .interact()
+                .map_err(|_| AppError::Other("Failed to get user input".to_string()))?;
+
+            filtered_branches[selection].clone()
+        },
+        None => {
+            return Err(AppError::Other("No branch specified for merge. Use 'revtool merge <branch>' to specify a branch.".to_string()));
+        }
+    };
+
+    // Merging a branch into itself is never meaningful.
+    if merge_branch == current_branch {
+        return Err(AppError::Other(
+            "cannot merge a branch into itself".to_string(),
+        ));
+    }
+
+    // Check if the branch exists
+    if !dot_rev.branch_exists(&merge_branch)? {
+        return Err(AppError::BranchNotFound(merge_branch));
+    }
+
+    // Get the snapshot IDs
+    let ours_id = dot_rev.branch_snapshot_id(&current_branch)?;
+    let theirs_id = dot_rev.branch_snapshot_id(&merge_branch)?;
+
+    // Find common ancestor
+    let base_id = match merge::find_common_ancestor(&store, ours_id, theirs_id)? {
+        Some(id) => id,
+        None => return Err(AppError::Other("No common ancestor found between branches".to_string())),
+    };
+
+    // If the other branch is already an ancestor of ours, there is
+    // nothing to merge — don't create an empty merge snapshot.
+    if base_id == theirs_id {
+        println!("{}", format!("Already up to date; '{merge_branch}' is already merged.").green());
+        return Ok(());
+    }
+
+    // Perform the merge
+    let merge_result = merge::merge(&mut store, base_id, ours_id, theirs_id, &current_branch, &merge_branch, true)?;
+
+    // If there are conflicts, handle them
+    if !merge_result.success {
+        println!("{}", "Merge resulted in conflicts".yellow().bold());
+
+        // Save merge state for later continuation
+        let merge_state = MergeState {
+            current_branch: current_branch.clone(),
+            merge_branch: merge_branch.clone(),
+            merge_result: merge_result.clone(),
+            backup_snapshot_id: ours_id,
+            // Remember the message so it survives the conflict.
+            message: message.clone(),
+        };
+
+        dot_rev.save_merge_state(&merge_state)?;
+
+        // Process strategy option if provided
+        let merge_strategy = if let Some(strategy_str) = &strategy {
+            match merge::MergeStrategy::from_str(strategy_str) {
+                // 'normal' means "no auto-resolution": fall through to
+                // the manual, marker-based path, exactly as if no
+                // strategy were given.
+                Ok(merge::MergeStrategy::Normal) => None,
+                Ok(s) => Some(s),
+                Err(e) => {
+                    return Err(AppError::Other(e));
+                }
+            }
+        } else {
+            None
+        };
+
+        // In interactive mode, help resolve conflicts
+        if interactive {
+            let merge_result = interactive_merge_conflict_resolution(
+                &dot_rev,
+                &merge_result.conflicts,
+                &mut store,
+                editor.as_deref(),
+                merge_strategy
+            )?;
+
+            // Create a merge snapshot
+            let merge_msg = message.unwrap_or_else(||
+                format!("Merge branch '{}' into {}", merge_branch, current_branch)
+            );
+
+            let snapshot_id = merge_result.create_snapshot(&mut store, merge_msg)?;
+
+            // Update the branch pointer
+            dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+            refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
+
+            // Clear the merge state
+            dot_rev.clear_merge_state()?;
+
+            println!("Merge completed successfully: created snapshot {}",
+                snapshot_id.to_string().cyan());
+            return Ok(());
+        } else if let Some(strategy) = merge_strategy {
+            // In non-interactive mode but with a strategy, we can try to resolve conflicts automatically
+            if strategy == merge::MergeStrategy::Normal {
+                // Normal strategy needs interactive mode
+                return Err(AppError::Other(
+                    "Normal merge strategy requires interactive mode. Use 'revtool merge -i'".to_string()
+                ));
+            }
+
+            println!("Applying {} merge strategy to all conflicts...",
+                if strategy == merge::MergeStrategy::Ours { "ours".cyan() } else { "theirs".cyan() });
+
+            // Apply the strategy to every conflict.
+            let mut merge_state = dot_rev.get_merge_state()?;
+            let all_resolved =
+                apply_strategy_to_conflicts(&mut store, &mut merge_state, strategy)?;
+
+            // If all conflicts were resolved, create the merge snapshot
+            if all_resolved {
+                println!("\n{}", "All conflicts resolved automatically!".green().bold());
+
+                // Create the merge snapshot
+                let merge_msg = message.unwrap_or_else(||
+                    format!("Merge branch '{}' into {} (strategy: {})",
+                        merge_branch,
+                        current_branch,
+                        if strategy == merge::MergeStrategy::Ours { "ours" } else { "theirs" }
+                    )
+                );
+
+                let snapshot_id = merge_state.merge_result.create_snapshot(&mut store, merge_msg)?;
+
+                // Update the branch pointer
+                dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+                refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
+
+                // Clear the merge state
+                dot_rev.clear_merge_state()?;
+
+                println!("Merge completed successfully: created snapshot {}",
+                    snapshot_id.to_string().cyan());
+                return Ok(());
+            } else {
+                // Not all conflicts could be resolved automatically
+                dot_rev.save_merge_state(&merge_state)?;
+                return Err(AppError::MergeConflicts(merge_state.merge_result.conflicts.clone()));
+            }
+        } else {
+            // In non-interactive mode, just report the conflicts
+            return Err(AppError::MergeConflicts(merge_result.conflicts));
+        }
+    }
+
+    // No conflicts, create the merge snapshot directly
+    let merge_msg = message.unwrap_or_else(||
+        format!("Merge branch '{}' into {}", merge_branch, current_branch)
+    );
+
+    if let Some(merged_dir) = merge_result.merged_directory {
+        // Save the merged directory
+        let dir_id = store.insert_json(&merged_dir)?;
+
+        // Create a merge snapshot with parents in mainline order:
+        // ours (the current branch) first, then theirs.
+        let snapshot = SnapShot {
+            message: merge_msg,
+            directory: dir_id,
+            previous: vec![ours_id, theirs_id],
+        };
+
+        // Save the snapshot
+        let snapshot_id = store.insert_json(&snapshot)?;
+
+        // Update the branch pointer
+        dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+
+        // Write the new directory to the working directory
+        let cwd = dot_rev.work_dir().to_path_buf();
+        merged_dir.write(&store, &cwd, false)
+            .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
+
+        println!("Merge completed successfully: created snapshot {}",
+            snapshot_id.to_string().cyan());
+        Ok(())
+    } else {
+        Err(AppError::Other("Unexpected error: Merge succeeded but no merged directory available".to_string()))
+    }
+}
+
 fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
     use Command::*;
     use std::io::IsTerminal;
@@ -1348,434 +1789,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
         },
 
         Merge { branch, message, abort, r#continue, strategy, editor } => {
-            let (dot_rev, current_branch) = get_repository()?;
-            let mut store = dot_rev.store()?;
-
-            // Handle abort case
-            if abort {
-                // Check if there's a merge in progress
-                if !dot_rev.is_merge_in_progress()? {
-                    return Err(AppError::NoMergeInProgress);
-                }
-
-                // Get the merge state
-                let merge_state = dot_rev.get_merge_state()?;
-
-                // Reset to the backup snapshot
-                let snapshot_id = merge_state.backup_snapshot_id;
-                let snapshot: SnapShot = store.read_json(snapshot_id)?;
-                let directory: Directory = store.read_json(snapshot.directory)?;
-
-                // Reset files
-                let cwd = dot_rev.work_dir().to_path_buf();
-                directory.write(&store, &cwd, false)
-                    .map_err(|e| AppError::FailedToResetFiles(format!("{}", e)))?;
-
-                // Restore the branch pointer too, so the tip and the working
-                // tree agree again even if a snapshot was taken mid-merge.
-                dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-
-                // Clear the merge state
-                dot_rev.clear_merge_state()?;
-
-                println!("Merge aborted. Files and branch reset to their state before the merge.");
-                return Ok(());
-            }
-
-            // Handle continue case
-            if r#continue {
-                // Check if there's a merge in progress
-                if !dot_rev.is_merge_in_progress()? {
-                    return Err(AppError::NoMergeInProgress);
-                }
-
-                // Get the merge state
-                let mut merge_state = dot_rev.get_merge_state()?;
-
-                // Check if there are unresolved conflicts
-                if merge_state.merge_result.has_unresolved_conflicts() {
-                    // Process strategy option if provided
-                    let merge_strategy = if let Some(strategy_str) = &strategy {
-                        match merge::MergeStrategy::from_str(strategy_str) {
-                            // 'normal' means manual resolution; treat as no strategy.
-                            Ok(merge::MergeStrategy::Normal) => None,
-                            Ok(s) => Some(s),
-                            Err(e) => {
-                                return Err(AppError::Other(e));
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    // In interactive mode, help resolve conflicts
-                    if interactive {
-                        let merge_result = interactive_merge_conflict_resolution(
-                            &dot_rev,
-                            &merge_state.merge_result.conflicts,
-                            &mut store,
-                            editor.as_deref(),
-                            merge_strategy
-                        )?;
-
-                        // Create a merge snapshot
-                        let merge_msg = message.clone().or_else(|| merge_state.message.clone()).unwrap_or_else(||
-                            format!("Merge branch '{}' into {}",
-                                merge_state.merge_branch,
-                                merge_state.current_branch
-                            )
-                        );
-
-                        let snapshot_id = merge_result.create_snapshot(&mut store, merge_msg)?;
-
-                        // Update the branch pointer
-                        dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-                        refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
-
-                        // Clear the merge state
-                        dot_rev.clear_merge_state()?;
-
-                        println!("Merge completed successfully: created snapshot {}",
-                            snapshot_id.to_string().cyan());
-                        return Ok(());
-                    } else if let Some(strategy) = merge_strategy {
-                        // In non-interactive mode but with a strategy, we can try to resolve conflicts automatically
-                        if strategy == merge::MergeStrategy::Normal {
-                            // Normal strategy needs interactive mode
-                            return Err(AppError::Other(
-                                "Normal merge strategy requires interactive mode. Use 'revtool merge -i'".to_string()
-                            ));
-                        }
-
-                        println!("Applying {} merge strategy to all conflicts...",
-                            if strategy == merge::MergeStrategy::Ours { "ours".cyan() } else { "theirs".cyan() });
-
-                        // Apply the strategy to every unresolved conflict.
-                        let all_resolved =
-                            apply_strategy_to_conflicts(&mut store, &mut merge_state, strategy)?;
-
-                        // Check if all conflicts are now resolved
-                        if all_resolved || merge_state.merge_result.conflicts.iter().all(|c| c.resolved) {
-                            println!("\n{}", "All conflicts resolved automatically!".green().bold());
-
-                            // Create the merge snapshot
-                            let merge_msg = message.clone().or_else(|| merge_state.message.clone()).unwrap_or_else(||
-                                format!("Merge branch '{}' into {} (strategy: {})",
-                                    merge_state.merge_branch,
-                                    merge_state.current_branch,
-                                    if strategy == merge::MergeStrategy::Ours { "ours" } else { "theirs" }
-                                )
-                            );
-
-                            let snapshot_id = merge_state.merge_result.create_snapshot(&mut store, merge_msg)?;
-
-                            // Update the branch pointer
-                            dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-                            refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
-
-                            // Clear the merge state
-                            dot_rev.clear_merge_state()?;
-
-                            println!("Merge completed successfully: created snapshot {}",
-                                snapshot_id.to_string().cyan());
-                            return Ok(());
-                        } else {
-                            // Not all conflicts could be resolved automatically
-                            dot_rev.save_merge_state(&merge_state)?;
-                            return Err(AppError::MergeConflicts(merge_state.merge_result.conflicts.clone()));
-                        }
-                    } else {
-                        // Non-interactive continue with no strategy: pick up the
-                        // resolutions the user made by editing the working-tree
-                        // files, the standard git-style workflow.
-                        let work_dir = dot_rev.work_dir().to_path_buf();
-                        let mut still_conflicted: Vec<PathBuf> = Vec::new();
-
-                        let unresolved: Vec<_> = merge_state
-                            .merge_result
-                            .conflicts
-                            .iter()
-                            .filter(|c| !c.resolved)
-                            .map(|c| c.path.clone())
-                            .collect();
-
-                        for path in unresolved {
-                            let full = work_dir.join(&path);
-                            let content = match std::fs::read(&full) {
-                                Ok(c) => c,
-                                Err(_) => {
-                                    still_conflicted.push(path);
-                                    continue;
-                                }
-                            };
-                            if content_has_conflict_markers(&content) {
-                                still_conflicted.push(path);
-                                continue;
-                            }
-                            let resolved_id = store.insert(&content)
-                                .map_err(|e| AppError::Other(format!("Failed to store resolved file: {:?}", e)))?;
-                            for c in merge_state.merge_result.conflicts.iter_mut() {
-                                if c.path == path {
-                                    c.resolved = true;
-                                    c.resolution_id = Some(resolved_id);
-                                    break;
-                                }
-                            }
-                        }
-
-                        if !still_conflicted.is_empty() {
-                            // No need to persist progress: the working-tree edits
-                            // themselves are the progress, and the next
-                            // --continue re-reads them.
-                            let mut msg = String::from(
-                                "Some files still contain conflict markers:\n",
-                            );
-                            for path in &still_conflicted {
-                                msg.push_str(&format!("  {}\n", path.display()));
-                            }
-                            msg.push_str("Edit them to remove the markers, then run 'revtool merge --continue'");
-                            return Err(AppError::Other(msg));
-                        }
-                        // All conflicts resolved from the working tree; fall
-                        // through to finalization below.
-                    }
-                }
-
-                // All conflicts are resolved, create the merge snapshot
-                let merge_msg = message.clone().or_else(|| merge_state.message.clone()).unwrap_or_else(||
-                    format!("Merge branch '{}' into {}",
-                        merge_state.merge_branch,
-                        merge_state.current_branch
-                    )
-                );
-
-                let snapshot_id = merge_state.merge_result.create_snapshot(&mut store, merge_msg)?;
-
-                // Update the branch pointer
-                dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-                refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
-
-                // Clear the merge state
-                dot_rev.clear_merge_state()?;
-
-                println!("Merge completed successfully: created snapshot {}",
-                    snapshot_id.to_string().cyan());
-                return Ok(());
-            }
-
-            // Handle new merge case
-            if dot_rev.is_merge_in_progress()? {
-                return Err(AppError::MergeInProgress);
-            }
-
-            // Make sure a branch is specified
-            let merge_branch = match branch {
-                Some(b) => b,
-                None if interactive => {
-                    // In interactive mode, let the user select a branch
-                    let branches = dot_rev.list_branches()?;
-                    let filtered_branches: Vec<String> = branches
-                        .into_iter()
-                        .filter(|b| b != &current_branch)
-                        .collect();
-
-                    if filtered_branches.is_empty() {
-                        return Err(AppError::Other("No other branches found to merge".to_string()));
-                    }
-
-                    let theme = ColorfulTheme::default();
-                    let selection = Select::with_theme(&theme)
-                        .with_prompt("Select branch to merge")
-                        .items(&filtered_branches)
-                        .default(0)
-                        .interact()
-                        .map_err(|_| AppError::Other("Failed to get user input".to_string()))?;
-
-                    filtered_branches[selection].clone()
-                },
-                None => {
-                    return Err(AppError::Other("No branch specified for merge. Use 'revtool merge <branch>' to specify a branch.".to_string()));
-                }
-            };
-
-            // Merging a branch into itself is never meaningful.
-            if merge_branch == current_branch {
-                return Err(AppError::Other(
-                    "cannot merge a branch into itself".to_string(),
-                ));
-            }
-
-            // Check if the branch exists
-            if !dot_rev.branch_exists(&merge_branch)? {
-                return Err(AppError::BranchNotFound(merge_branch));
-            }
-
-            // Get the snapshot IDs
-            let ours_id = dot_rev.branch_snapshot_id(&current_branch)?;
-            let theirs_id = dot_rev.branch_snapshot_id(&merge_branch)?;
-
-            // Find common ancestor
-            let base_id = match merge::find_common_ancestor(&store, ours_id, theirs_id)? {
-                Some(id) => id,
-                None => return Err(AppError::Other("No common ancestor found between branches".to_string())),
-            };
-
-            // If the other branch is already an ancestor of ours, there is
-            // nothing to merge — don't create an empty merge snapshot.
-            if base_id == theirs_id {
-                println!("{}", format!("Already up to date; '{merge_branch}' is already merged.").green());
-                return Ok(());
-            }
-
-            // Perform the merge
-            let merge_result = merge::merge(&mut store, base_id, ours_id, theirs_id, &current_branch, &merge_branch, true)?;
-
-            // If there are conflicts, handle them
-            if !merge_result.success {
-                println!("{}", "Merge resulted in conflicts".yellow().bold());
-
-                // Save merge state for later continuation
-                let merge_state = MergeState {
-                    current_branch: current_branch.clone(),
-                    merge_branch: merge_branch.clone(),
-                    merge_result: merge_result.clone(),
-                    backup_snapshot_id: ours_id,
-                    // Remember the message so it survives the conflict.
-                    message: message.clone(),
-                };
-
-                dot_rev.save_merge_state(&merge_state)?;
-
-                // Process strategy option if provided
-                let merge_strategy = if let Some(strategy_str) = &strategy {
-                    match merge::MergeStrategy::from_str(strategy_str) {
-                        // 'normal' means "no auto-resolution": fall through to
-                        // the manual, marker-based path, exactly as if no
-                        // strategy were given.
-                        Ok(merge::MergeStrategy::Normal) => None,
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            return Err(AppError::Other(e));
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                // In interactive mode, help resolve conflicts
-                if interactive {
-                    let merge_result = interactive_merge_conflict_resolution(
-                        &dot_rev,
-                        &merge_result.conflicts,
-                        &mut store,
-                        editor.as_deref(),
-                        merge_strategy
-                    )?;
-
-                    // Create a merge snapshot
-                    let merge_msg = message.unwrap_or_else(||
-                        format!("Merge branch '{}' into {}", merge_branch, current_branch)
-                    );
-
-                    let snapshot_id = merge_result.create_snapshot(&mut store, merge_msg)?;
-
-                    // Update the branch pointer
-                    dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-                    refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
-
-                    // Clear the merge state
-                    dot_rev.clear_merge_state()?;
-
-                    println!("Merge completed successfully: created snapshot {}",
-                        snapshot_id.to_string().cyan());
-                    return Ok(());
-                } else if let Some(strategy) = merge_strategy {
-                    // In non-interactive mode but with a strategy, we can try to resolve conflicts automatically
-                    if strategy == merge::MergeStrategy::Normal {
-                        // Normal strategy needs interactive mode
-                        return Err(AppError::Other(
-                            "Normal merge strategy requires interactive mode. Use 'revtool merge -i'".to_string()
-                        ));
-                    }
-
-                    println!("Applying {} merge strategy to all conflicts...",
-                        if strategy == merge::MergeStrategy::Ours { "ours".cyan() } else { "theirs".cyan() });
-
-                    // Apply the strategy to every conflict.
-                    let mut merge_state = dot_rev.get_merge_state()?;
-                    let all_resolved =
-                        apply_strategy_to_conflicts(&mut store, &mut merge_state, strategy)?;
-
-                    // If all conflicts were resolved, create the merge snapshot
-                    if all_resolved {
-                        println!("\n{}", "All conflicts resolved automatically!".green().bold());
-
-                        // Create the merge snapshot
-                        let merge_msg = message.unwrap_or_else(||
-                            format!("Merge branch '{}' into {} (strategy: {})",
-                                merge_branch,
-                                current_branch,
-                                if strategy == merge::MergeStrategy::Ours { "ours" } else { "theirs" }
-                            )
-                        );
-
-                        let snapshot_id = merge_state.merge_result.create_snapshot(&mut store, merge_msg)?;
-
-                        // Update the branch pointer
-                        dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-                        refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
-
-                        // Clear the merge state
-                        dot_rev.clear_merge_state()?;
-
-                        println!("Merge completed successfully: created snapshot {}",
-                            snapshot_id.to_string().cyan());
-                        return Ok(());
-                    } else {
-                        // Not all conflicts could be resolved automatically
-                        dot_rev.save_merge_state(&merge_state)?;
-                        return Err(AppError::MergeConflicts(merge_state.merge_result.conflicts.clone()));
-                    }
-                } else {
-                    // In non-interactive mode, just report the conflicts
-                    return Err(AppError::MergeConflicts(merge_result.conflicts));
-                }
-            }
-
-            // No conflicts, create the merge snapshot directly
-            let merge_msg = message.unwrap_or_else(||
-                format!("Merge branch '{}' into {}", merge_branch, current_branch)
-            );
-
-            if let Some(merged_dir) = merge_result.merged_directory {
-                // Save the merged directory
-                let dir_id = store.insert_json(&merged_dir)?;
-
-                // Create a merge snapshot with parents in mainline order:
-                // ours (the current branch) first, then theirs.
-                let snapshot = SnapShot {
-                    message: merge_msg,
-                    directory: dir_id,
-                    previous: vec![ours_id, theirs_id],
-                };
-
-                // Save the snapshot
-                let snapshot_id = store.insert_json(&snapshot)?;
-
-                // Update the branch pointer
-                dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-
-                // Write the new directory to the working directory
-                let cwd = dot_rev.work_dir().to_path_buf();
-                merged_dir.write(&store, &cwd, false)
-                    .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
-
-                println!("Merge completed successfully: created snapshot {}",
-                    snapshot_id.to_string().cyan());
-                Ok(())
-            } else {
-                Err(AppError::Other("Unexpected error: Merge succeeded but no merged directory available".to_string()))
-            }
+            cmd_merge(branch, message, abort, r#continue, strategy, editor, interactive)
         },
 
         Ignore { pattern, remove } => {
