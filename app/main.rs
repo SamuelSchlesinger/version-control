@@ -25,12 +25,8 @@ use lib::{
 enum AppError {
     DotRevError(DotRevError),
     IoError(std::io::Error),
-    #[allow(dead_code)]
     BranchNotFound(String),
     NoChangesToSnapshot,
-    #[allow(dead_code)]
-    DirectoryError(String),
-    #[allow(dead_code)]
     MissingObject(ObjectId),
     FailedToReadDirectory(String),
     FailedToResetFiles(String),
@@ -88,8 +84,12 @@ impl std::fmt::Display for AppError {
                 DotRevError::BranchNotFound(branch) => write!(f, "Branch '{}' not found. Use 'revtool branch' to list available branches.", branch),
                 DotRevError::RepositoryNotInitialized => write!(f, "Repository not initialized. Use 'revtool init' first to create a repository."),
                 DotRevError::CorruptRepository(msg) => write!(f, "Corrupt repository: {}. Consider reinitializing or restoring from backup.", msg),
-                DotRevError::MergeInProgress => write!(f, "A merge is already in progress. Resolve conflicts and use 'revtool merge --continue' or use 'revtool merge --abort' to cancel"),
-                DotRevError::NoMergeInProgress => write!(f, "No merge is in progress"),
+                // MergeInProgress/NoMergeInProgress are remapped to the flat
+                // AppError variants by From<DotRevError>, so they're handled
+                // there and are unreachable here.
+                DotRevError::MergeInProgress | DotRevError::NoMergeInProgress => {
+                    write!(f, "{err}")
+                }
                 DotRevError::InvalidBranchName { name, reason } => write!(
                     f,
                     "Invalid branch name '{name}': {reason}.\n\
@@ -113,7 +113,6 @@ impl std::fmt::Display for AppError {
             },
             AppError::BranchNotFound(branch) => write!(f, "Branch '{}' does not exist. Use 'revtool branch' to list existing branches or create this branch first.", branch),
             AppError::NoChangesToSnapshot => write!(f, "No changes to record in snapshot. Make changes to files before creating a snapshot."),
-            AppError::DirectoryError(msg) => write!(f, "Directory error: {}. Check directory permissions and structure.", msg),
             AppError::MissingObject(id) => write!(f, "Object '{}' missing from repository. Repository may be corrupted or incomplete.", id),
             AppError::FailedToReadDirectory(reason) => write!(f, "Failed to read current directory: {}. Check permissions and retry.", reason),
             AppError::FailedToResetFiles(reason) => write!(f, "Failed to reset files: {}. Ensure you have write permissions in the directory.", reason),
@@ -469,7 +468,7 @@ fn build_working_tree(
     let root = dot_rev.work_dir().to_path_buf();
     let mut index = dot_rev.load_index();
     let directory = Directory::from_working_tree(&root, &ignores, store, &mut index, consult)
-        .map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
+        .map_err(|e| AppError::FailedToReadDirectory(format!("{}", e)))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -556,7 +555,7 @@ fn refresh_worktree_to_snapshot(
     let cwd = dot_rev.work_dir().to_path_buf();
     directory
         .write(&*store, &cwd, false)
-        .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
+        .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
     Ok(())
 }
 
@@ -1338,7 +1337,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 // Reset files
                 let cwd = dot_rev.work_dir().to_path_buf();
                 directory.write(&store, &cwd, false)
-                    .map_err(|e| AppError::FailedToResetFiles(format!("{:?}", e)))?;
+                    .map_err(|e| AppError::FailedToResetFiles(format!("{}", e)))?;
 
                 // Restore the branch pointer too, so the tip and the working
                 // tree agree again even if a snapshot was taken mid-merge.
@@ -1795,7 +1794,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 // Write the new directory to the working directory
                 let cwd = dot_rev.work_dir().to_path_buf();
                 merged_dir.write(&store, &cwd, false)
-                    .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
+                    .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
 
                 println!("Merge completed successfully: created snapshot {}",
                     snapshot_id.to_string().cyan());
@@ -1919,7 +1918,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             // Restore files from snapshot
             let cwd = dot_rev.work_dir().to_path_buf();
             directory.write(&store, &cwd, delete_absent)
-                .map_err(|e| AppError::FailedToResetFiles(format!("{:?}", e)))?;
+                .map_err(|e| AppError::FailedToResetFiles(format!("{}", e)))?;
 
             println!("Reset to the last snapshot on branch '{}' ({})",
                 branch.green().bold(),
@@ -2236,7 +2235,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let cwd = dot_rev.work_dir().to_path_buf();
             remove_tracked_absent(&current_tree, &target_tree, &cwd)?;
             target_tree.write(&store, &cwd, false)
-                .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
+                .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
 
             // Only move the branch pointer once the working tree is in place.
             dot_rev.set_branch(&branch_to_checkout)?;
@@ -2256,7 +2255,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 dot_rev.work_dir(),
                 &ignores,
                 &mut store
-            ).map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
+            ).map_err(|e| AppError::FailedToReadDirectory(format!("{}", e)))?;
 
             let snapshot: SnapShot = store.read_json(old_tip)?;
             let old_directory: Directory = store.read_json(snapshot.directory)?;
@@ -2504,7 +2503,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 let cwd = dot_rev.work_dir().to_path_buf();
                 remove_tracked_absent(&old_tree, &new_tree, &cwd)?;
                 new_tree.write(&store, &cwd, false)
-                    .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
+                    .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
 
                 dot_rev.set_branch_snapshot_id(&branch_to_pull, remote_id)?;
                 println!("{}", format!(

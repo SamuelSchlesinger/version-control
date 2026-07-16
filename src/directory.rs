@@ -70,6 +70,26 @@ impl<Store: ObjectStore> From<std::io::Error> for Error<Store> {
     }
 }
 
+impl<Store: ObjectStore> fmt::Display for Error<Store>
+where
+    Store::Error: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::ObjectMissing(id) => write!(f, "object {id} is missing from the store"),
+            Error::Store(e) => write!(f, "{e}"),
+            Error::IO(e) => write!(f, "{e}"),
+            Error::UnsafeEntryName(name) => {
+                write!(f, "snapshot contains an unsafe entry name: {name:?}")
+            }
+            Error::TooDeeplyNested { depth, limit } => write!(
+                f,
+                "directory nesting is too deep ({depth} levels); the maximum is {limit}"
+            ),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct Diff {
     pub deleted: BTreeSet<String>,
