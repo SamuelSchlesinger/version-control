@@ -84,24 +84,18 @@ fn test_find_common_ancestor() {
         ]
     );
     
-    // Test finding common ancestors
+    // Assert the *exact* lowest common ancestor, not merely that one exists —
+    // returning the wrong ancestor is the bug class that matters for merge
+    // correctness.
 
-    // C and E should have a common ancestor - in these tests we're serializing the
-    // data, so the actual IDs will change. Just make sure we have a common ancestor.
-    let ancestor = merge::find_common_ancestor(&store, c_id, e_id).unwrap();
-    assert!(ancestor.is_some());
-
-    // C and D should have a common ancestor
-    let ancestor = merge::find_common_ancestor(&store, c_id, d_id).unwrap();
-    assert!(ancestor.is_some());
-
-    // B and E should have a common ancestor
-    let ancestor = merge::find_common_ancestor(&store, b_id, e_id).unwrap();
-    assert!(ancestor.is_some());
-
-    // A and E should have a common ancestor
-    let ancestor = merge::find_common_ancestor(&store, a_id, e_id).unwrap();
-    assert!(ancestor.is_some());
+    // C (C<-B<-A) and E (E<-D<-B<-A): their LCA is B.
+    assert_eq!(merge::find_common_ancestor(&store, c_id, e_id).unwrap(), Some(b_id));
+    // C and D are both children of B.
+    assert_eq!(merge::find_common_ancestor(&store, c_id, d_id).unwrap(), Some(b_id));
+    // B is an ancestor of E, so it is the base.
+    assert_eq!(merge::find_common_ancestor(&store, b_id, e_id).unwrap(), Some(b_id));
+    // A is an ancestor of E.
+    assert_eq!(merge::find_common_ancestor(&store, a_id, e_id).unwrap(), Some(a_id));
 }
 
 #[test]

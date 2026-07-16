@@ -23,36 +23,15 @@ use std::{
 ///
 /// The identifier is displayed and serialized in hexadecimal format for readability.
 ///
-/// # Examples
-///
-/// Creating an `ObjectId` from a byte slice:
-///
 /// ```
-/// # fn main() {
-/// # // This object is available in this context
-/// # struct ObjectId;
-/// # impl ObjectId {
-/// #    fn from<T>(_: T) -> Self { ObjectId }
-/// # }
-/// let data = b"Hello, world!";
-/// let id = ObjectId::from(data.as_ref());
-/// # }
-/// ```
+/// use lib::object_id::ObjectId;
 ///
-/// Creating an `ObjectId` from a file:
-///
-/// ```no_run
-/// # fn main() -> Result<(), std::io::Error> {
-/// # // This object is available in this context
-/// # struct ObjectId;
-/// # impl ObjectId {
-/// #    fn try_from<T>(_: T) -> Result<Self, std::io::Error> { Ok(ObjectId) }
-/// # }
-/// use std::path::Path;
-///
-/// let id = ObjectId::try_from(Path::new("README.md"))?;
-/// # Ok(())
-/// # }
+/// // The same bytes always hash to the same id; different bytes (almost surely) don't.
+/// let a = ObjectId::from(&b"Hello, world!"[..]);
+/// let b = ObjectId::from(&b"Hello, world!"[..]);
+/// let c = ObjectId::from(&b"different"[..]);
+/// assert_eq!(a, b);
+/// assert_ne!(a, c);
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId(Hash);

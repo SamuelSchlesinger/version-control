@@ -28,46 +28,14 @@ pub mod in_memory;
 /// - `directory`: A persistent filesystem-based implementation
 /// - `in_memory`: An ephemeral in-memory implementation used primarily for testing
 ///
-/// # Examples
-///
-/// Using the in-memory object store:
-///
 /// ```
-/// # fn main() {
-/// # // Mock objects for doctest
-/// # struct ObjectId;
-/// # struct InMemoryObjectStore {
-/// #     data: std::collections::HashMap<ObjectId, Vec<u8>>
-/// # }
-/// # impl InMemoryObjectStore {
-/// #     fn new() -> Self {
-/// #         InMemoryObjectStore { data: std::collections::HashMap::new() }
-/// #     }
-/// # }
-/// # trait ObjectStore {
-/// #     type Error;
-/// #     fn read(&self, id: ObjectId) -> Result<Option<Vec<u8>>, Self::Error>;
-/// #     fn insert(&mut self, object: &[u8]) -> Result<ObjectId, Self::Error>;
-/// # }
-/// # impl ObjectStore for InMemoryObjectStore {
-/// #     type Error = ();
-/// #     fn read(&self, _id: ObjectId) -> Result<Option<Vec<u8>>, Self::Error> {
-/// #         Ok(Some(b"Hello, world!".to_vec()))
-/// #     }
-/// #     fn insert(&mut self, _object: &[u8]) -> Result<ObjectId, Self::Error> {
-/// #         Ok(ObjectId)
-/// #     }
-/// # }
+/// use lib::object_store::ObjectStore;
+/// use lib::object_store::in_memory::InMemoryObjectStore;
+///
 /// let mut store = InMemoryObjectStore::new();
-/// let data = b"Hello, world!";
-///
-/// // Store the data and get its ObjectId
-/// let id = store.insert(data).unwrap();
-///
-/// // Retrieve the data using its ObjectId
-/// let retrieved = store.read(id).unwrap().unwrap();
-/// assert_eq!(retrieved, data);
-/// # }
+/// let id = store.insert(b"Hello, world!").unwrap();
+/// // Content is addressed by its hash, so it reads back byte-for-byte.
+/// assert_eq!(store.read(id).unwrap().unwrap(), b"Hello, world!");
 /// ```
 pub trait ObjectStore {
     /// The error type returned by operations on this store.
