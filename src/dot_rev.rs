@@ -404,11 +404,20 @@ impl DotRev {
         Ok(Path::try_exists(&merge_state_path)?)
     }
 
-    /// Saves the current merge state
+    /// Starts a merge by persisting its state. Refuses if a merge is already in
+    /// progress (use [`update_merge_state`](Self::update_merge_state) to record
+    /// progress on the current one).
     pub fn save_merge_state(&self, state: &MergeState) -> Result<(), Error> {
         if self.is_merge_in_progress()? {
             return Err(Error::MergeInProgress);
         }
+        write_json(state, &self.root.join("merge_state"))
+    }
+
+    /// Overwrites the state of the merge already in progress (e.g. to record
+    /// conflicts resolved so far). Unlike [`save_merge_state`](Self::save_merge_state)
+    /// this does not treat an existing merge as an error.
+    pub fn update_merge_state(&self, state: &MergeState) -> Result<(), Error> {
         write_json(state, &self.root.join("merge_state"))
     }
 

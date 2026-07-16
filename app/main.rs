@@ -735,13 +735,15 @@ where
                     }
                 }
 
-                // If all conflicts were resolved, return early
+                // If all conflicts were resolved, hand the resolved result back
+                // to the caller to finalize (create the snapshot and clear the
+                // merge state). We must NOT re-save the merge state here: it is
+                // already persisted, and save_merge_state refuses to overwrite an
+                // in-progress merge — which previously aborted this path with a
+                // spurious "merge already in progress" error, leaving markers on
+                // disk.
                 if all_resolved {
                     println!("\n{}", "All conflicts resolved automatically!".green().bold());
-
-                    // Update the merge state
-                    dot_rev.save_merge_state(&merge_state)?;
-
                     return Ok(merge_state.merge_result);
                 } else {
                     println!("\n{}", "Some conflicts could not be resolved automatically:".yellow().bold());
@@ -950,16 +952,13 @@ where
     let all_resolved = merge_state.merge_result.conflicts.iter().all(|c| c.resolved);
 
     if all_resolved {
+        // The caller finalizes (creates the snapshot and clears the merge
+        // state); no need to re-persist the in-progress state here.
         println!("\n{}", "All conflicts resolved!".green().bold());
-
-        // Update the merge state
-        dot_rev.save_merge_state(&merge_state)?;
     } else {
         println!("\n{}", "Some conflicts are still unresolved.".yellow().bold());
-
-        // Update the merge state
-        dot_rev.save_merge_state(&merge_state)?;
-
+        // Persist the progress made so a later 'merge --continue' sees it.
+        dot_rev.update_merge_state(&merge_state)?;
         return Err(AppError::MergeConflicts(merge_state.merge_result.conflicts.clone()));
     }
 
@@ -1846,6 +1845,17 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let (dot_rev, branch) = get_repository()?;
             let mut store = dot_rev.store()?;
 
+            // A reset in the middle of a merge would wipe the conflict markers
+            // while leaving the merge "in progress", so a later --continue would
+            // commit a bogus resolution that silently drops one side. Require the
+            // merge to be finished or aborted first.
+            if dot_rev.is_merge_in_progress()? {
+                return Err(AppError::Other(
+                    "a merge is in progress; run 'revtool merge --continue' or \
+                     'revtool merge --abort' before resetting".to_string(),
+                ));
+            }
+
             // Reset discards uncommitted changes to tracked files, and with
             // --delete-absent it also deletes untracked files. Both are
             // irreversible, so require --force rather than doing it silently.
@@ -2104,6 +2114,16 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
         Checkout { branch, create, force } => {
             let (dot_rev, current_branch) = get_repository()?;
             let mut store = dot_rev.store()?;
+
+            // Switching branches mid-merge would abandon the merge in an
+            // inconsistent state (markers discarded, merge still "in progress").
+            // Require the merge to be resolved or aborted first.
+            if dot_rev.is_merge_in_progress()? {
+                return Err(AppError::Other(
+                    "a merge is in progress; run 'revtool merge --continue' or \
+                     'revtool merge --abort' before switching branches".to_string(),
+                ));
+            }
 
             // Get the branch to checkout - either from command line or interactively
             let branch_to_checkout = match branch {
