@@ -1,3 +1,26 @@
+//! The repository sync server.
+//!
+//! # Protocol
+//!
+//! A single `POST /api` endpoint accepts a JSON [`RemoteRequest`] (an enum
+//! tagged by a `"type"` field) and replies with a JSON [`RemoteResponse`].
+//! Object bytes are carried inline in the JSON. Business outcomes such as a
+//! non-fast-forward push are reported as a successful HTTP response with a
+//! `success: false` body (git-style), while malformed input yields a 4xx and
+//! genuine server faults a 5xx.
+//!
+//! # Trust boundary & auth
+//!
+//! Every request arrives from an untrusted network client. Object ids and
+//! branch names are validated on the way in ([`crate::object_id`],
+//! [`crate::dot_rev::validate_branch_name`]), uploaded objects are verified to
+//! hash to their claimed id before storage, and a push is rejected unless its
+//! whole object graph is already present. When the server is started with a
+//! token, an [`auth_middleware`] layer requires `Authorization: Bearer <token>`
+//! on *every* request (reads included) and rejects unauthenticated ones before
+//! their body is read. There is no TLS: run behind a TLS-terminating proxy, or
+//! only over a trusted network, when using a token.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use axum::{
@@ -53,10 +76,19 @@ impl HttpRemoteServer {
     
     /// Build the router for the HTTP server
     pub fn router(self) -> Router {
+        let state = Arc::new(self);
         Router::new()
             .route("/api", post(handle_request))
+            // Auth runs as a route layer, i.e. BEFORE the handler's body
+            // extractor, so an unauthenticated request is rejected without the
+            // server buffering or parsing its (up to 64 MB) body. Applying it as
+            // a layer here also means it can't be forgotten on a new route.
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-            .with_state(Arc::new(self))
+            .with_state(state)
     }
     
     /// Run the server on the specified address
@@ -69,24 +101,32 @@ impl HttpRemoteServer {
     }
 }
 
-/// Handle incoming requests
-async fn handle_request(
+/// Rejects unauthenticated requests before the handler (and its body extractor)
+/// runs, when the server is configured with a token.
+async fn auth_middleware(
     State(server): State<Arc<HttpRemoteServer>>,
-    headers: HeaderMap,
-    Json(request): Json<RemoteRequest>,
-) -> impl IntoResponse {
-    // Enforce bearer-token auth if the server was started with a token.
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
     if let Some(expected) = &server.token {
-        if !bearer_token_matches(&headers, expected) {
+        if !bearer_token_matches(request.headers(), expected) {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(RemoteResponse::Error {
                     message: "missing or invalid authentication token".to_string(),
                 }),
-            );
+            )
+                .into_response();
         }
     }
+    next.run(request).await
+}
 
+/// Handle incoming requests (authentication has already run in the layer above).
+async fn handle_request(
+    State(server): State<Arc<HttpRemoteServer>>,
+    Json(request): Json<RemoteRequest>,
+) -> impl IntoResponse {
     match process_request(&server, request).await {
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(e) => {
@@ -255,14 +295,23 @@ async fn process_request(
         },
         
         RemoteRequest::UploadObjects { objects } => {
+            if objects.len() > MAX_OBJECTS_PER_REQUEST {
+                return Ok(RemoteResponse::Error {
+                    message: format!(
+                        "too many objects in one upload ({}); the limit is {}",
+                        objects.len(),
+                        MAX_OBJECTS_PER_REQUEST
+                    ),
+                });
+            }
             let dot_rev = server.dot_rev.read().await;
             let mut store = dot_rev.store()?;
             let count = objects.len();
-            
+
             for (id, data) in objects {
                 store.insert_with_id(id, &data)?;
             }
-            
+
             Ok(RemoteResponse::UploadResult {
                 success: true,
                 message: format!("{} objects uploaded successfully", count),
