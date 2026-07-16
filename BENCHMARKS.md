@@ -21,7 +21,7 @@ tradeoffs are called out.
 | Operation | git | revtool | Winner |
 |-----------|-----|---------|--------|
 | **Cold snapshot** (first commit of the whole tree) | ~2185 ms | ~327 ms | **revtool ~6.7× faster** |
-| **Incremental** (re-snapshot after changing 1 of 3,000 files) | ~37 ms | ~135 ms | **git ~3.6× faster** |
+| **Incremental** (re-snapshot after changing 1 of 3,000 files) | ~37 ms | ~87 ms | **git ~2.4× faster** |
 | Storage after one commit (incompressible data) | ~72 MB | ~72 MB | tie |
 
 ## Where the speedup comes from

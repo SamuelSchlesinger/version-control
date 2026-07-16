@@ -206,12 +206,13 @@ impl ObjectStore for DirectoryObjectStore {
         if Path::try_exists(&path)? {
             log::info!("{path:?} already exists on disk");
 
-            // Read it into cache for future reads
-            let mut f = File::options().read(true).open(&path)?;
-            let mut data = Vec::new();
-            f.read_to_end(&mut data)?;
-            self.cache_object(id, data);
-
+            // The object is already stored; content addressing guarantees the
+            // bytes are identical, so there is nothing to write. We deliberately
+            // do NOT read it back to warm the cache: during a snapshot this is
+            // the common case for every unchanged file, and reading each stored
+            // object off disk just to populate a cache the snapshot never reads
+            // doubled the I/O of the whole operation. A later read() will cache
+            // it on demand.
             return Ok(id);
         }
 
