@@ -78,6 +78,29 @@ While Git offers more advanced features and widespread adoption, RevTool provide
 - Educational environments
 - Projects that benefit from interactive merge resolution
 
+### Known limitations
+
+RevTool deliberately keeps a small surface area. Be aware of these differences
+before relying on it for a given workflow:
+
+- **Symlinks and file modes are not tracked.** A snapshot records regular file
+  contents only. Symlinks are skipped, and executable/permission bits are not
+  preserved — files are restored as regular `0644`. (Writes are still hardened
+  against symlink attacks; symlinks are simply never stored.)
+- **Ignoring a tracked file drops it from the next snapshot.** Unlike Git,
+  where `.gitignore` never affects already-tracked files, adding an ignore
+  pattern that matches a committed file excludes it from subsequent snapshots.
+  Earlier snapshots still contain it.
+- **No repository lock.** Running two mutating `revtool` commands in the same
+  repository at the same time can race; run commands serially.
+- **Working-tree updates are not atomic.** If `checkout`/`reset` is interrupted
+  partway (crash, power loss, a permission error mid-write), the working tree
+  can be left partially updated. Re-running the command reconciles it.
+- **No remote-tracking refs or fetch-only.** Recovering a clone whose branch has
+  diverged from a force-pushed remote currently means re-cloning.
+- **No TLS in the built-in server.** Run it behind a TLS-terminating proxy, or
+  only over a trusted network, when using a token.
+
 **Performance:** RevTool's simpler object model makes whole-tree operations
 substantially faster — snapshotting a ~72 MB / 3,000-file tree is measured at
 about **6.6× faster than `git commit`** (it skips zlib compression and delta
