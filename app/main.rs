@@ -95,6 +95,11 @@ impl std::fmt::Display for AppError {
                     "Invalid branch name '{name}': {reason}.\n\
                      Branch names must be a single name with no '/', no '..', and no leading '-'."
                 ),
+                DotRevError::InvalidTagName { name, reason } => write!(
+                    f,
+                    "Invalid tag name '{name}': {reason}.\n\
+                     Tag names must be a single name with no '/', no '..', and no leading '-'."
+                ),
                 DotRevError::RemoteExists(name) => {
                     write!(f, "A remote named '{name}' already exists. Use a different name or remove it first.")
                 }
@@ -538,16 +543,30 @@ fn build_working_tree(
     Ok(directory)
 }
 
-/// Returns the paths that differ between the working tree and the current
-/// branch's snapshot: files added, modified, or deleted but not yet snapped.
+/// How a working-tree path differs from the current snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeKind {
+    /// Present in the working tree but not the snapshot (untracked/new).
+    Added,
+    /// Present in both, with different content.
+    Modified,
+    /// Present in the snapshot but removed from the working tree.
+    Deleted,
+}
+
+/// Returns the changes between the working tree and the current branch's
+/// snapshot: files added, modified, or deleted but not yet snapped, each tagged
+/// with its [`ChangeKind`].
 ///
 /// This is the "dirty set" used to protect uncommitted work before an operation
 /// that would overwrite it (checkout, reset). An empty result means the working
-/// tree matches the snapshot and is safe to replace.
+/// tree matches the snapshot and is safe to replace. Callers that only care
+/// whether the tree is clean can check `.is_empty()`; callers that report the
+/// paths (reset, checkout) use the kind to label each one accurately.
 fn uncommitted_changes(
     dot_rev: &DotRev,
     store: &mut lib::object_store::directory::DirectoryObjectStore,
-) -> AppResult<Vec<PathBuf>> {
+) -> AppResult<Vec<(ChangeKind, PathBuf)>> {
     let working = build_working_tree(dot_rev, store, true)?;
 
     let tip = dot_rev.current_snapshot_id()?;
@@ -555,12 +574,12 @@ fn uncommitted_changes(
     let committed: Directory = store.read_json(snapshot.directory)?;
 
     let diff = committed.diff(&working);
-    let mut paths: Vec<PathBuf> = Vec::new();
-    paths.extend(diff.added.keys().map(PathBuf::from));
-    paths.extend(diff.deleted.iter().map(PathBuf::from));
-    paths.extend(diff.modified.keys().map(PathBuf::from));
-    paths.sort();
-    Ok(paths)
+    let mut changes: Vec<(ChangeKind, PathBuf)> = Vec::new();
+    changes.extend(diff.added.keys().map(|p| (ChangeKind::Added, PathBuf::from(p))));
+    changes.extend(diff.deleted.iter().map(|p| (ChangeKind::Deleted, PathBuf::from(p))));
+    changes.extend(diff.modified.keys().map(|p| (ChangeKind::Modified, PathBuf::from(p))));
+    changes.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(changes)
 }
 
 /// Refuses the operation if the working tree has uncommitted changes, unless
@@ -581,13 +600,47 @@ fn ensure_clean_or_forced(
     let mut msg = format!(
         "You have uncommitted changes that {action} would overwrite:\n"
     );
-    for path in &dirty {
-        msg.push_str(&format!("  {}\n", path.display()));
+    for (kind, path) in &dirty {
+        let label = match kind {
+            ChangeKind::Added => "A",
+            ChangeKind::Modified => "M",
+            ChangeKind::Deleted => "D",
+        };
+        msg.push_str(&format!("  {label} {}\n", display_path(path)));
     }
     msg.push_str(
         "\nSnapshot them with 'revtool snap -m <message>' first, or re-run with --force to discard them",
     );
     Err(AppError::Other(msg))
+}
+
+/// Renders a path for display, quoting and escaping it when it contains control
+/// characters (newlines, tabs, etc.) or a double quote. A filename may legally
+/// contain a newline; printed raw into `status`/`diff` output it forges what
+/// looks like a second, independent status line (e.g. a file literally named
+/// `evil.txt\nD real.txt`). Quoting neutralizes that, matching how git renders
+/// unusual pathnames.
+fn display_path(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    if s.chars().any(|c| c.is_control() || c == '"') {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    } else {
+        s.into_owned()
+    }
 }
 
 /// True if any line of `content` is a conflict marker, i.e. begins with a run
@@ -1318,6 +1371,14 @@ fn cmd_merge(
     let (dot_rev, current_branch) = get_repository()?;
     let mut store = dot_rev.store()?;
 
+    // Validate the strategy string up front, before any merge state is written.
+    // A typo like `--strategy huors` used to save the merge state first and only
+    // then fail, leaving a half-started merge that every later command reported
+    // as "already in progress" with no hint that --abort was needed.
+    if let Some(s) = &strategy {
+        merge::MergeStrategy::from_str(s).map_err(AppError::Other)?;
+    }
+
     // Handle abort case
     if abort {
         // Check if there's a merge in progress
@@ -1865,9 +1926,21 @@ fn cmd_checkout(branch: Option<String>, create: bool, force: bool, interactive: 
         }
     };
 
-    // Don't do anything if trying to checkout the current branch
+    // Checking out the current branch is a no-op — except with --force, which
+    // (as documented) discards uncommitted changes. `git checkout -f <current>`
+    // resets tracked files to the branch tip; do the same here rather than
+    // silently ignoring the request.
     if branch_to_checkout == current_branch {
-        println!("Already on branch '{}'", branch_to_checkout.green().bold());
+        if force {
+            let snapshot_id = dot_rev.branch_snapshot_id(&current_branch)?;
+            refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
+            println!(
+                "Discarded uncommitted changes; working tree reset to branch '{}'",
+                branch_to_checkout.green().bold()
+            );
+        } else {
+            println!("Already on branch '{}'", branch_to_checkout.green().bold());
+        }
         return Ok(());
     }
 
@@ -2035,19 +2108,28 @@ fn cmd_reset(delete_absent: bool, force: bool) -> AppResult<()> {
         ));
     }
 
-    // Reset discards uncommitted changes to tracked files, and with
-    // --delete-absent it also deletes untracked files. Both are
-    // irreversible, so require --force rather than doing it silently.
+    // Reset restores tracked files to the snapshot (discarding modifications
+    // and undoing deletions), and with --delete-absent it also removes
+    // untracked files. Only warn about the changes THIS reset would actually
+    // destroy, labeling each accurately instead of a blanket "modified/absent".
     if !force {
         let dirty = uncommitted_changes(&dot_rev, &mut store)?;
-        let deletes_untracked = delete_absent;
-        if !dirty.is_empty() || deletes_untracked {
+        let at_risk: Vec<(&str, &PathBuf)> = dirty
+            .iter()
+            .filter_map(|(kind, path)| match kind {
+                ChangeKind::Modified => Some(("modified (will be reverted)", path)),
+                ChangeKind::Deleted => Some(("deleted (will be restored)", path)),
+                // An untracked file is only touched with --delete-absent.
+                ChangeKind::Added if delete_absent => {
+                    Some(("untracked (will be deleted)", path))
+                }
+                ChangeKind::Added => None,
+            })
+            .collect();
+        if !at_risk.is_empty() {
             let mut msg = String::from("'reset' discards uncommitted work:\n");
-            for path in &dirty {
-                msg.push_str(&format!("  modified/absent: {}\n", path.display()));
-            }
-            if deletes_untracked {
-                msg.push_str("  --delete-absent will also remove every untracked file\n");
+            for (label, path) in &at_risk {
+                msg.push_str(&format!("  {label}: {}\n", display_path(path)));
             }
             msg.push_str("\nRe-run with --force to confirm");
             return Err(AppError::Other(msg));
@@ -2103,16 +2185,19 @@ fn cmd_diff(first_ref: Option<String>, second_ref: Option<String>, content: bool
             (source, target)
         },
         (None, None) => {
-            // No refs provided - show help info about the new syntax
-            println!("Diff command requires at least one snapshot reference.");
-            println!("Example usage:");
-            println!("  revtool diff branch_name           # Compare current branch with branch_name");
-            println!("  revtool diff HEAD~1                # Compare current branch with its parent");
-            println!("  revtool diff abc123                # Compare current branch with snapshot abc123");
-            println!("  revtool diff branch1 branch2       # Compare branch1 with branch2");
-            println!("  revtool diff HEAD~1 feature        # Compare parent of HEAD with feature branch");
-            println!("\nUse 'revtool usage diff' for more examples.");
-            return Ok(());
+            // No refs provided is a usage error, not a success: return non-zero
+            // so scripts checking $? don't mistake it for a completed diff.
+            return Err(AppError::Other(
+                "diff requires at least one snapshot reference.\n\
+                 Example usage:\n\
+                \x20 revtool diff branch_name           # Compare current branch with branch_name\n\
+                \x20 revtool diff HEAD~1                # Compare current branch with its parent\n\
+                \x20 revtool diff abc123                # Compare current branch with snapshot abc123\n\
+                \x20 revtool diff branch1 branch2       # Compare branch1 with branch2\n\
+                \x20 revtool diff HEAD~1 feature        # Compare parent of HEAD with feature branch\n\
+                 \nUse 'revtool usage diff' for more examples."
+                    .to_string(),
+            ));
         }
     };
 

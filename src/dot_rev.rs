@@ -41,6 +41,11 @@ pub enum Error {
         name: String,
         reason: &'static str,
     },
+    /// A tag name is not usable as a single filesystem component
+    InvalidTagName {
+        name: String,
+        reason: &'static str,
+    },
     /// A remote with the given name already exists
     RemoteExists(String),
     /// A tag with the given name already exists
@@ -67,39 +72,59 @@ const MAX_BRANCH_NAME_LEN: usize = 200;
 /// rewritten or stripped, because silently accepting a *different* branch than
 /// the user typed is its own bug.
 pub fn validate_branch_name(name: &str) -> Result<(), Error> {
-    let reject = |reason: &'static str| {
-        Err(Error::InvalidBranchName {
-            name: name.to_string(),
-            reason,
-        })
-    };
+    validate_simple_name(name).map_err(|reason| Error::InvalidBranchName {
+        name: name.to_string(),
+        reason,
+    })
+}
 
+/// Checks that `name` is safe to use as a single path component under
+/// `.rev/tags`. Tag names carry exactly the same filesystem risks as branch
+/// names (see [`validate_branch_name`]); this only differs in the error variant
+/// so the user is told a *tag* name was invalid, not a branch name.
+pub fn validate_tag_name(name: &str) -> Result<(), Error> {
+    validate_simple_name(name).map_err(|reason| Error::InvalidTagName {
+        name: name.to_string(),
+        reason,
+    })
+}
+
+/// The shared allowlist behind [`validate_branch_name`] and
+/// [`validate_tag_name`]. Returns the reason a name is rejected, letting each
+/// caller wrap it in the appropriate error variant.
+fn validate_simple_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
-        return reject("it is empty");
+        return Err("it is empty");
     }
     if name.len() > MAX_BRANCH_NAME_LEN {
-        return reject("it is longer than 200 bytes");
+        return Err("it is longer than 200 bytes");
     }
-    if name == "." || name == ".." {
-        return reject("it refers to a directory rather than a branch");
+    if name == "." {
+        return Err("it refers to the current directory");
+    }
+    // Reject '..' anywhere, not just a name that is exactly "..": this both
+    // blocks path traversal and makes the "no '..'" rule we advertise truthful
+    // (`foo..bar` used to be accepted despite the message).
+    if name.contains("..") {
+        return Err("it contains '..'");
     }
     if name.contains('/') || name.contains('\\') {
-        return reject("it contains a path separator");
+        return Err("it contains a path separator");
     }
     if name.contains('\0') {
-        return reject("it contains a null byte");
+        return Err("it contains a null byte");
     }
     if name.chars().any(|c| c.is_control()) {
-        return reject("it contains a control character");
+        return Err("it contains a control character");
     }
     // Leading '-' would be swallowed as a flag by any CLI that echoes the name
     // back into a command line, and leading/trailing whitespace is invisible in
     // `revtool branch` output.
     if name.starts_with('-') {
-        return reject("it starts with '-'");
+        return Err("it starts with '-'");
     }
     if name.trim() != name {
-        return reject("it has leading or trailing whitespace");
+        return Err("it has leading or trailing whitespace");
     }
 
     // Belt and braces: whatever the rules above allow must still be exactly one
@@ -108,7 +133,7 @@ pub fn validate_branch_name(name: &str) -> Result<(), Error> {
     let mut components = Path::new(name).components();
     match (components.next(), components.next()) {
         (Some(std::path::Component::Normal(c)), None) if c == name => Ok(()),
-        _ => reject("it is not a simple name"),
+        _ => Err("it is not a simple name"),
     }
 }
 
@@ -144,6 +169,11 @@ impl std::fmt::Display for Error {
             Error::InvalidBranchName { name, reason } => write!(
                 f,
                 "Invalid branch name {name:?}: {reason}. Branch names must be a single \
+                 name without '/' or '..'"
+            ),
+            Error::InvalidTagName { name, reason } => write!(
+                f,
+                "Invalid tag name {name:?}: {reason}. Tag names must be a single \
                  name without '/' or '..'"
             ),
             Error::RemoteExists(name) => write!(f, "A remote named '{name}' already exists"),
@@ -329,7 +359,7 @@ impl DotRev {
     /// The path of a tag ref, validated the same way as a branch name (a tag is
     /// stored as a single file under `.rev/tags`).
     fn tag_path(&self, tag: &str) -> Result<PathBuf, Error> {
-        validate_branch_name(tag)?;
+        validate_tag_name(tag)?;
         Ok(self.root.join("tags").join(tag))
     }
 
@@ -610,7 +640,6 @@ mod tests {
             "release/2.0".replace('/', "-").as_str(),
             "a",
             "ünïcode",
-            "..dotted",
             "dot.ted",
         ] {
             assert!(
@@ -627,6 +656,10 @@ mod tests {
             "",
             ".",
             "..",
+            // Consecutive dots are rejected anywhere (git's rule), not only when
+            // the whole name is "..".
+            "..dotted",
+            "foo..bar",
             "../evil",
             "../../pwned",
             "../branch",
