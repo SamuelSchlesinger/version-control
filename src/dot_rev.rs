@@ -650,6 +650,20 @@ mod tests {
     }
 
     #[test]
+    fn test_tag_name_validation_reports_tag_not_branch() {
+        // The same rules apply, but the error must say "tag", not "branch".
+        assert!(matches!(
+            validate_tag_name("release/v1"),
+            Err(Error::InvalidTagName { .. })
+        ));
+        assert!(validate_tag_name("v1.0").is_ok());
+        assert!(matches!(
+            validate_tag_name("v1..0"),
+            Err(Error::InvalidTagName { .. })
+        ));
+    }
+
+    #[test]
     fn test_branch_name_traversal_is_rejected() {
         // Each of these previously resolved to a path outside .rev/branches.
         for name in [

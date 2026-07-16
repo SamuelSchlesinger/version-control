@@ -509,6 +509,14 @@ impl Ignores {
         let mut builder = GlobSetBuilder::new();
 
         for pattern in &self.patterns {
+            // A trailing slash is gitignore's "directory only" marker (`build/`).
+            // The glob crate would match it literally and never fire against the
+            // directory entry `build` or the paths under it, so the pattern
+            // silently did nothing. Strip it so `build/` behaves like `build`.
+            let pattern = pattern.strip_suffix('/').unwrap_or(pattern);
+            if pattern.is_empty() {
+                continue;
+            }
             match Glob::new(pattern) {
                 Ok(glob) => { builder.add(glob); },
                 Err(e) => { log::warn!("Invalid glob pattern '{pattern}': {e}"); }
@@ -1105,6 +1113,18 @@ fn test_write_never_follows_symlinks() {
         "wrote through a symlinked directory to outside the repo"
     );
     assert_eq!(std::fs::read(repo.join("d/f.txt")).unwrap(), b"tracked content");
+}
+
+#[test]
+fn test_trailing_slash_ignore_matches_directory() {
+    // gitignore's `build/` directory syntax must actually exclude the directory
+    // (and its contents), not silently do nothing.
+    let ignores = Ignores::new(vec!["build/".to_string()]);
+    assert!(ignores.is_ignored(Path::new("build")));
+    assert!(ignores.is_ignored(Path::new("/repo/build")));
+    // A pattern that is only a slash normalizes away and matches nothing.
+    let only_slash = Ignores::new(vec!["/".to_string()]);
+    assert!(!only_slash.is_ignored(Path::new("anything")));
 }
 
 #[test]
