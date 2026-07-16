@@ -252,10 +252,12 @@ revtool checkout feature-name  # Switch to a branch
 ```
 
 #### Comparing Versions
+`diff` compares snapshots (not the live working tree). With one reference it
+compares the current branch's latest snapshot against that reference.
 ```bash
-revtool diff main feature      # Compare two branches
-revtool diff HEAD~1            # Compare with previous snapshot
-revtool diff --content main    # Show content-level differences
+revtool diff dev feature       # Compare two branches
+revtool diff HEAD~1            # Compare current branch with its previous snapshot
+revtool diff --content dev     # Show content-level differences
 ```
 
 #### Viewing History
@@ -276,7 +278,7 @@ revtool ignore -i             # Interactive pattern management
 ```bash
 revtool tag v1.0            # Tag the current snapshot as v1.0
 revtool tag                 # List all tags
-revtool diff v1.0           # Diff the working tree against a tagged snapshot
+revtool diff v1.0           # Diff the current branch's snapshot against the tag
 revtool tag --delete v1.0   # Delete a tag
 ```
 Tags are immutable named references to a snapshot, usable anywhere a snapshot
@@ -422,6 +424,9 @@ revtool snap -i       # Interactive snapshot creation
 revtool checkout -i   # Interactive branch selection
 revtool ignore -i     # Interactive ignore management
 ```
+
+Interactive mode requires a real terminal; in a pipe or script, run the command
+without `-i` (for example, pass `-m` for a snapshot message).
 
 ## Architecture
 

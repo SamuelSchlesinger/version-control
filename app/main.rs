@@ -186,7 +186,7 @@ enum Command {
     #[clap(
         about = "Check the difference between snapshots",
         long_about = "Compares two snapshots and displays the differences between them",
-        after_help = "Examples:\n  revtool diff dev                  # Current branch vs dev branch\n  revtool diff main                 # Current branch vs main branch\n  revtool diff HEAD~1                # Current branch vs its parent\n  revtool diff abc123                # Current branch vs specific snapshot (by ID or prefix)\n  revtool diff main HEAD~2           # Compare main branch with grandparent of current branch\n  revtool diff abc123 def456         # Compare two specific snapshots\n  revtool diff --content main        # Show content-level diffs"
+        after_help = "Examples:\n  revtool diff dev                  # Current branch vs the dev branch\n  revtool diff feature              # Current branch vs the feature branch\n  revtool diff HEAD~1                # Current branch vs its parent\n  revtool diff abc123                # Current branch vs a specific snapshot (by ID or prefix)\n  revtool diff dev HEAD~2            # Compare dev with the grandparent of current branch\n  revtool diff abc123 def456         # Compare two specific snapshots\n  revtool diff --content dev        # Show content-level diffs"
     )]
     Diff {
         #[arg(help = "First snapshot reference (defaults to current branch if omitted when second ref is provided)")]
@@ -284,7 +284,7 @@ enum Command {
     #[clap(
         about = "Switch to a branch",
         long_about = "Changes the current branch to the specified branch and updates the working directory to match",
-        after_help = "Example:\n  revtool checkout dev\n  revtool checkout main"
+        after_help = "Examples:\n  revtool checkout dev            # Switch to an existing branch\n  revtool checkout -b feature     # Create a branch and switch to it"
     )]
     Checkout {
         #[arg(help = "Branch to checkout")]
@@ -374,7 +374,7 @@ enum Command {
     #[clap(
         about = "Push changes to a remote repository",
         long_about = "Upload local snapshots and update the remote branch reference",
-        after_help = "Examples:\n  revtool push origin                # Push current branch to origin\n  revtool push origin main           # Push main branch to origin\n  revtool push origin main --force   # Force push (overwrite remote)"
+        after_help = "Examples:\n  revtool push origin                # Push current branch to origin\n  revtool push origin dev           # Push the dev branch to origin\n  revtool push origin dev --force   # Force push (overwrite remote)"
     )]
     Push {
         #[arg(help = "Remote repository name")]
@@ -1084,12 +1084,11 @@ When conflicts occur:
 3. Run 'revtool merge --continue' to complete the merge
 
 Example workflow:
-  revtool branch feature     # Create a feature branch
-  revtool checkout feature   # Switch to it
+  revtool checkout -b feature  # Create a feature branch and switch to it
   # Make changes...
-  revtool snap -m "Add X"    # Commit changes on feature branch
-  revtool checkout main      # Switch back to main branch
-  revtool merge feature      # Merge feature branch into main
+  revtool snap -m "Add X"      # Commit changes on the feature branch
+  revtool checkout dev         # Switch back to the dev branch
+  revtool merge feature        # Merge the feature branch into dev
 
 Options:
   --continue                 # Continue a merge after resolving conflicts
@@ -1110,14 +1109,14 @@ Snapshot reference syntax:
   abc123~N          # N snapshots back from specific snapshot
 
 Examples:
-  revtool diff main                # Compare current branch with main
+  revtool diff dev                 # Compare current branch with dev
   revtool diff HEAD~1              # Compare current branch with its parent
-  revtool diff a1f2305             # Compare current branch with specific snapshot (using ID prefix)
-  revtool diff main dev            # Compare main branch with dev branch
-  revtool diff main~1 dev~2        # Compare main's parent with dev's grandparent
+  revtool diff a1f2305             # Compare current branch with a specific snapshot (ID prefix)
+  revtool diff dev feature         # Compare the dev branch with the feature branch
+  revtool diff dev~1 feature~2     # Compare dev's parent with feature's grandparent
   revtool diff --content HEAD~1    # Show content-level diffs with parent
   revtool diff --context 5 HEAD~1  # Show diffs with 5 lines of context
-  revtool diff --no-color main     # Show without colors
+  revtool diff --no-color dev      # Show without colors
 
 With --content, shows line-by-line differences within modified files."#.to_string()),
         "status" => Some(r#"
@@ -1127,23 +1126,26 @@ Show the current status of the working directory:
 Shows which files are modified, added, or deleted compared to the latest snapshot."#.to_string()),
         "snap" => Some(r#"
 Create a new snapshot (like a commit):
-  revtool snap -m "message"
+  revtool snap -m "message"    # Snapshot the working tree
+  revtool snap -m "message" --rehash   # Re-hash every file, bypassing the stat cache
 
 Examples:
   revtool snap -m "Add login feature"
   revtool snap -m "Fix bug in error handling"
 
-The message should be descriptive and explain what changes are included in the snapshot."#.to_string()),
+Snapshots use a stat cache to skip unchanged files; --rehash forces a full re-read."#.to_string()),
         "checkout" => Some(r#"
 Switch to a different branch:
-  revtool checkout <branch>
+  revtool checkout <branch>       # Switch to an existing branch
+  revtool checkout -b <branch>    # Create the branch, then switch to it
+  revtool checkout <branch> -f    # Discard uncommitted changes and switch
 
 Examples:
-  revtool checkout main     # Switch to main branch
-  revtool checkout dev      # Switch to dev branch
-  revtool checkout feature  # Switch to feature branch
+  revtool checkout dev            # Switch to the default 'dev' branch
+  revtool checkout -b feature     # Create and switch to 'feature'
 
-Will create the branch if it doesn't exist."#.to_string()),
+Checking out a branch that does not exist is an error unless you pass -b.
+Switching is refused if you have uncommitted changes, unless you pass --force."#.to_string()),
         "branch" => Some(r#"
 Create or list branches:
   revtool branch            # List all branches
@@ -1154,12 +1156,24 @@ Examples:
   revtool branch feature    # Create a new branch named "feature"
 
 Creating a branch doesn't automatically switch to it. Use 'checkout' to switch."#.to_string()),
-        "reset" => Some(r#"
-Reset working directory to match the latest snapshot:
-  revtool reset                   # Reset keeping untracked files
-  revtool reset --delete-absent   # Reset and delete untracked files
+        "tag" => Some(r#"
+Create, list, or delete tags (immutable references to a snapshot, for releases):
+  revtool tag                 # List all tags
+  revtool tag <name>          # Tag the current snapshot
+  revtool tag --delete <name> # Delete a tag
 
-Use with caution, especially with --delete-absent, as it will permanently delete files."#.to_string()),
+Examples:
+  revtool tag v1.0            # Tag the current snapshot as v1.0
+  revtool diff v1.0           # Diff against a tagged snapshot
+
+A tag can be used anywhere a snapshot reference is accepted."#.to_string()),
+        "reset" => Some(r#"
+Reset tracked files to match the latest snapshot:
+  revtool reset --force                   # Restore tracked files, keep untracked
+  revtool reset --force --delete-absent   # Also delete untracked files
+
+reset discards uncommitted changes, so it requires --force. --delete-absent
+additionally removes untracked files, and is irreversible."#.to_string()),
         "log" => Some(r#"
 Show history of snapshots:
   revtool log           # Show 10 most recent snapshots
@@ -1171,10 +1185,10 @@ Examples:
 
 Each snapshot shows its ID and commit message."#.to_string()),
         "changes" => Some(r#"
-Show detailed information about changes since last snapshot:
-  revtool changes
-
-Shows a JSON representation of all changes in the working directory."#.to_string()),
+Show files and directories changed since the latest snapshot:
+  revtool changes            # Human-readable summary (default)
+  revtool changes --content  # Include line-by-line content diffs
+  revtool changes --json     # Machine-readable JSON output"#.to_string()),
         "remote" => Some(r#"
 Manage remote repositories:
   revtool remote                    # List all configured remotes
@@ -1195,7 +1209,7 @@ Push changes to a remote repository:
 
 Examples:
   revtool push origin               # Push current branch to origin
-  revtool push origin main          # Push main branch to origin
+  revtool push origin dev          # Push the dev branch to origin
   revtool push origin dev --force   # Force push dev branch
 
 Push uploads your local snapshots to the remote repository."#.to_string()),
@@ -1206,7 +1220,7 @@ Pull changes from a remote repository:
 
 Examples:
   revtool pull origin               # Pull current branch from origin
-  revtool pull origin main          # Pull main branch from origin
+  revtool pull origin dev          # Pull the dev branch from origin
 
 Pull downloads snapshots from the remote and updates your local branch."#.to_string()),
         "serve" => Some(r#"
@@ -1242,19 +1256,18 @@ Common workflows:
    revtool snap -m "Message" # Create a snapshot
 
 3. Working with branches:
-   revtool branch feature    # Create a branch named "feature"
-   revtool checkout feature  # Switch to the branch
+   revtool checkout -b feature  # Create a "feature" branch and switch to it
    # make some changes
    revtool snap -m "Work on feature"
 
 4. Comparing branches:
-   revtool checkout main
-   revtool diff feature      # See changes in feature compared to main
+   revtool checkout dev
+   revtool diff feature      # See changes in feature compared to dev
 
 5. Working with remotes:
    revtool remote add origin http://server:8080  # Add a remote
-   revtool push origin main      # Push changes
-   revtool pull origin main      # Pull changes
+   revtool push origin dev       # Push changes
+   revtool pull origin dev       # Pull changes
 
 Use 'revtool usage <command>' for detailed help on a specific command.
 "###.to_string()
