@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::post,
@@ -12,8 +12,19 @@ use crate::{
     dot_rev::{DotRev, InsertJson},
     object_store::ObjectStore,
     object_id::ObjectId,
+    snapshot::SnapShot,
+    directory::Directory,
 };
 use super::{RemoteRequest, RemoteResponse};
+
+/// Largest request body the server will buffer. Bounds memory against a client
+/// that streams an enormous payload. Object transfers are chunked below this.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Largest number of object ids a single GetObjects request may ask for.
+/// Without a cap, a client could request one object millions of times and
+/// amplify a small request into an unbounded response (memory-exhaustion DoS).
+const MAX_OBJECTS_PER_REQUEST: usize = 10_000;
 
 /// HTTP server for hosting a remote repository
 pub struct HttpRemoteServer {
@@ -33,6 +44,7 @@ impl HttpRemoteServer {
     pub fn router(self) -> Router {
         Router::new()
             .route("/api", post(handle_request))
+            .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(Arc::new(self))
     }
     
@@ -111,27 +123,55 @@ async fn process_request(
         },
         
         RemoteRequest::GetObjects { ids } => {
+            if ids.len() > MAX_OBJECTS_PER_REQUEST {
+                return Ok(RemoteResponse::Error {
+                    message: format!(
+                        "too many objects requested ({}); the limit is {}",
+                        ids.len(),
+                        MAX_OBJECTS_PER_REQUEST
+                    ),
+                });
+            }
             let dot_rev = server.dot_rev.read().await;
             let store = dot_rev.store()?;
             let mut objects = Vec::new();
-            
+
+            // De-duplicate so a request listing the same id thousands of times
+            // cannot amplify into a huge response.
+            let mut seen = std::collections::BTreeSet::new();
             for id in ids {
+                if !seen.insert(id) {
+                    continue;
+                }
                 let data = store.read(id)?;
                 objects.push((id, data));
             }
-            
+
             Ok(RemoteResponse::Objects { objects })
         },
         
         RemoteRequest::PushSnapshot { branch, snapshot_id, force } => {
             let dot_rev = server.dot_rev.write().await;
-            
+            let mut store = dot_rev.store()?;
+
+            // Refuse to move a branch onto a snapshot whose object graph is not
+            // fully present. Without this, a client could point a branch at a
+            // dangling id and brick the branch for the host and every puller.
+            if let Some(missing) = first_missing_object(&mut store, snapshot_id)? {
+                return Ok(RemoteResponse::PushResult {
+                    success: false,
+                    message: format!(
+                        "Push rejected: object {missing} is missing. Upload all objects before moving the branch."
+                    ),
+                    new_snapshot_id: None,
+                });
+            }
+
             // Check if branch exists and if we need to force push
             if dot_rev.branch_exists(&branch)? && !force {
                 let current_id = dot_rev.branch_snapshot_id(&branch)?;
-                
+
                 // Check if the new snapshot is a descendant of the current one
-                let mut store = dot_rev.store()?;
                 if !is_ancestor(&mut store, current_id, snapshot_id)? {
                     return Ok(RemoteResponse::PushResult {
                         success: false,
@@ -140,10 +180,11 @@ async fn process_request(
                     });
                 }
             }
-            
-            // Update the branch
+
+            // Update the branch. Branch-name validation happens inside
+            // set_branch_snapshot_id, so a traversal name is rejected here.
             dot_rev.set_branch_snapshot_id(&branch, snapshot_id)?;
-            
+
             Ok(RemoteResponse::PushResult {
                 success: true,
                 message: format!("Branch '{}' updated to {}", branch, snapshot_id),
@@ -179,6 +220,55 @@ async fn process_request(
             })
         },
     }
+}
+
+/// Walks the entire object graph reachable from `root_snapshot` (ancestor
+/// snapshots, their directory objects, and every file blob) and returns the
+/// first object that is not present in the store, or `None` if the graph is
+/// complete. Used to reject a push that would leave a branch pointing at a
+/// dangling snapshot.
+fn first_missing_object<S>(
+    store: &mut S,
+    root_snapshot: ObjectId,
+) -> Result<Option<ObjectId>, Box<dyn std::error::Error + Send + Sync>>
+where
+    S: ObjectStore + InsertJson,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    use std::collections::{HashSet, VecDeque};
+
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(root_snapshot);
+
+    while let Some(sid) = queue.pop_front() {
+        if !visited.insert(sid) {
+            continue;
+        }
+        let snap_bytes = match store.read(sid)? {
+            Some(b) => b,
+            None => return Ok(Some(sid)),
+        };
+        let snapshot: SnapShot = serde_json::from_slice(&snap_bytes)?;
+
+        let dir_bytes = match store.read(snapshot.directory)? {
+            Some(b) => b,
+            None => return Ok(Some(snapshot.directory)),
+        };
+        let directory: Directory = serde_json::from_slice(&dir_bytes)?;
+
+        for (_, blob_id) in directory.files() {
+            if !store.has(blob_id)? {
+                return Ok(Some(blob_id));
+            }
+        }
+
+        for parent in snapshot.previous {
+            queue.push_back(parent);
+        }
+    }
+
+    Ok(None)
 }
 
 /// Check if one snapshot is an ancestor of another

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::object_id::ObjectId;
 
 /// A persistent implementation using a directory structure on the filesystem.
@@ -122,12 +124,53 @@ pub trait ObjectStore {
     /// # Returns
     ///
     /// * `Result<(), Self::Error>` - Ok if stored successfully
-    fn insert_with_id(&mut self, id: ObjectId, object: &[u8]) -> Result<(), Self::Error> {
-        let computed_id = self.insert(object)?;
+    fn insert_with_id(
+        &mut self,
+        id: ObjectId,
+        object: &[u8],
+    ) -> Result<(), InsertWithIdError<Self::Error>> {
+        // Verify the hash BEFORE storing. A remote (client or server) can send
+        // a lying id; the old code inserted the bytes first and then panicked,
+        // both crashing the process and leaving orphaned data behind.
+        let computed_id = ObjectId::from(object);
         if computed_id != id {
-            // In a real implementation, we'd want a proper error type
-            panic!("Provided ObjectId does not match computed hash");
+            return Err(InsertWithIdError::HashMismatch {
+                expected: id,
+                actual: computed_id,
+            });
         }
+        self.insert(object).map_err(InsertWithIdError::Store)?;
         Ok(())
+    }
+}
+
+/// Failure modes of [`ObjectStore::insert_with_id`].
+#[derive(Debug)]
+pub enum InsertWithIdError<E> {
+    /// The underlying store failed to store the object.
+    Store(E),
+    /// The provided id did not match the hash of the object. This means the
+    /// data was corrupted in transit or the sender is misbehaving.
+    HashMismatch { expected: ObjectId, actual: ObjectId },
+}
+
+impl<E: fmt::Display> fmt::Display for InsertWithIdError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InsertWithIdError::Store(e) => write!(f, "failed to store object: {e}"),
+            InsertWithIdError::HashMismatch { expected, actual } => write!(
+                f,
+                "object id mismatch: claimed {expected} but content hashes to {actual}"
+            ),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for InsertWithIdError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            InsertWithIdError::Store(e) => Some(e),
+            InsertWithIdError::HashMismatch { .. } => None,
+        }
     }
 }

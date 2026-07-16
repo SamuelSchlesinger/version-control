@@ -73,11 +73,16 @@ impl<'de> Deserialize<'de> for ObjectId {
         D: serde::Deserializer<'de>,
     {
         let b: hex::Hex = Deserialize::deserialize(deserializer)?;
-        let v: Vec<u8> = b.into();
-        let mut bytes: [u8; 32] = [0; 32];
-        for i in 0..32 {
-            bytes[i] = v[i];
-        }
+        let v: Vec<u8> = b.decode().map_err(serde::de::Error::custom)?;
+        // A BLAKE3 hash is exactly 32 bytes. Reject anything else instead of
+        // indexing past the end (a short id used to panic the process).
+        let bytes: [u8; 32] = v.as_slice().try_into().map_err(|_| {
+            serde::de::Error::custom(format!(
+                "object id must be 32 bytes ({} hex chars), got {}",
+                64,
+                v.len() * 2
+            ))
+        })?;
         Ok(ObjectId(Hash::from(bytes)))
     }
 }
@@ -144,6 +149,20 @@ impl<'a> TryFrom<&Path> for ObjectId {
         let f = File::options().read(true).open(p)?;
         ObjectId::try_from(f)
     }
+}
+
+#[test]
+fn test_deserialize_rejects_malformed_ids() {
+    // A well-formed 64-hex-char id round-trips.
+    let id: ObjectId = (b"hello" as &[u8]).into();
+    let json = serde_json::to_string(&id).unwrap();
+    assert_eq!(serde_json::from_str::<ObjectId>(&json).unwrap(), id);
+
+    // Short, over-long, and non-hex ids are errors, not panics. These are the
+    // exact inputs that used to crash the remote server.
+    assert!(serde_json::from_str::<ObjectId>("\"aabb\"").is_err());
+    assert!(serde_json::from_str::<ObjectId>("\"zzzz\"").is_err());
+    assert!(serde_json::from_str::<ObjectId>(&format!("\"{}\"", "a".repeat(66))).is_err());
 }
 
 #[test]

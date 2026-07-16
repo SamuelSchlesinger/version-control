@@ -24,8 +24,20 @@ impl<'de> Deserialize<'de> for Hex {
         D: serde::Deserializer<'de>,
     {
         let s: String = String::deserialize(deserializer)?;
-        let b: Vec<u8> = s.into_bytes().to_vec();
-        Ok(Hex(b))
+        let bytes = s.into_bytes();
+        // Uphold the "valid hexadecimal encoding" invariant here, at the trust
+        // boundary, rather than panicking later during decode. Input arrives
+        // from the network, so a malformed string must be an error, not a crash.
+        if bytes.len() % 2 != 0 {
+            return Err(serde::de::Error::custom("hex string has odd length"));
+        }
+        if let Some(&bad) = bytes.iter().find(|&&b| !b.is_ascii_hexdigit()) {
+            return Err(serde::de::Error::custom(format!(
+                "invalid hex digit: {:?}",
+                bad as char
+            )));
+        }
+        Ok(Hex(bytes))
     }
 }
 
@@ -59,32 +71,41 @@ impl From<&[u8]> for Hex {
     }
 }
 
-impl From<Hex> for Vec<u8> {
-    fn from(value: Hex) -> Self {
-        fn unhex_digit(h: u8) -> u8 {
-            if (b'0'..=b'9').contains(&h) {
-                h - b'0'
-            } else if (b'a'..=b'f').contains(&h) {
-                h - b'a' + 10
-            } else {
-                unreachable!("bad hex undigit: {}", h)
+impl Hex {
+    /// Decodes the hex text into bytes.
+    ///
+    /// Returns an error instead of panicking on odd length or a non-hex digit,
+    /// so untrusted input (e.g. an object id from the network) can never crash
+    /// the process. Accepts both lower- and upper-case digits.
+    pub fn decode(&self) -> Result<Vec<u8>, String> {
+        fn unhex_digit(h: u8) -> Result<u8, String> {
+            match h {
+                b'0'..=b'9' => Ok(h - b'0'),
+                b'a'..=b'f' => Ok(h - b'a' + 10),
+                b'A'..=b'F' => Ok(h - b'A' + 10),
+                _ => Err(format!("invalid hex digit: {:?}", h as char)),
             }
         }
-        let n = value.0.len();
-
+        let n = self.0.len();
         if n % 2 != 0 {
-            unreachable!("hex length is not even");
+            return Err("hex length is not even".to_string());
         }
 
         let mut v = vec![0u8; n / 2];
-
-        for (i, item) in v.iter_mut().enumerate().take(n / 2) {
+        for (i, item) in v.iter_mut().enumerate() {
             let j = i * 2;
-            *item |= unhex_digit(value.0[j]) << 4;
-            *item |= unhex_digit(value.0[j + 1]);
+            *item |= unhex_digit(self.0[j])? << 4;
+            *item |= unhex_digit(self.0[j + 1])?;
         }
+        Ok(v)
+    }
+}
 
-        v
+impl TryFrom<Hex> for Vec<u8> {
+    type Error = String;
+
+    fn try_from(value: Hex) -> Result<Self, Self::Error> {
+        value.decode()
     }
 }
 
@@ -92,9 +113,26 @@ impl From<Hex> for Vec<u8> {
 fn test_hex_round_trip() {
     let example: &[u8] = b"hello, world";
     let hex: Hex = Hex::from(example);
-    let bytes: Vec<u8> = hex.into();
+    let bytes: Vec<u8> = hex.decode().unwrap();
     let bytes_ref: &[u8] = &bytes;
     assert_eq!(example, bytes_ref);
+}
+
+#[test]
+fn test_hex_decode_rejects_bad_input() {
+    // Uppercase is accepted (round-trips to the same bytes as lowercase).
+    assert_eq!(Hex(b"AABB".to_vec()).decode().unwrap(), vec![0xaa, 0xbb]);
+    // Odd length and non-hex digits are errors, never panics.
+    assert!(Hex(b"abc".to_vec()).decode().is_err());
+    assert!(Hex(b"zz".to_vec()).decode().is_err());
+}
+
+#[test]
+fn test_hex_deserialize_rejects_malformed() {
+    // The trust boundary: a malformed string must not deserialize into a Hex.
+    assert!(serde_json::from_str::<Hex>("\"zzzz\"").is_err());
+    assert!(serde_json::from_str::<Hex>("\"abc\"").is_err());
+    assert!(serde_json::from_str::<Hex>("\"aabb\"").is_ok());
 }
 
 #[test]
