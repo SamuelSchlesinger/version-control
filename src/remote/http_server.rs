@@ -207,7 +207,7 @@ async fn process_request(
         RemoteRequest::GetObject { id } => {
             let dot_rev = server.dot_rev.read().await;
             let store = dot_rev.store()?;
-            let data = store.read(id)?;
+            let data = store.read(id)?.map(super::Blob);
             Ok(RemoteResponse::Object { id, data })
         },
         
@@ -232,7 +232,7 @@ async fn process_request(
                 if !seen.insert(id) {
                     continue;
                 }
-                let data = store.read(id)?;
+                let data = store.read(id)?.map(super::Blob);
                 objects.push((id, data));
             }
 
@@ -286,8 +286,8 @@ async fn process_request(
             let mut store = dot_rev.store()?;
             
             // Verify the object ID matches the data
-            store.insert_with_id(id, &data)?;
-            
+            store.insert_with_id(id, &data.0)?;
+
             Ok(RemoteResponse::UploadResult {
                 success: true,
                 message: format!("Object {} uploaded successfully", id),
@@ -309,7 +309,7 @@ async fn process_request(
             let count = objects.len();
 
             for (id, data) in objects {
-                store.insert_with_id(id, &data)?;
+                store.insert_with_id(id, &data.0)?;
             }
 
             Ok(RemoteResponse::UploadResult {

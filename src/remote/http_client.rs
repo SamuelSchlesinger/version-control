@@ -122,7 +122,7 @@ impl RemoteRepository for HttpRemoteClient {
         let request = RemoteRequest::GetObject { id };
         
         match self.send_request(&request)? {
-            RemoteResponse::Object { id: _, data } => Ok(data),
+            RemoteResponse::Object { id: _, data } => Ok(data.map(|b| b.0)),
             RemoteResponse::Error { message } => Err(HttpClientError::ServerError(message)),
             _ => Err(HttpClientError::InvalidResponse("Expected Object response".to_string())),
         }
@@ -134,7 +134,9 @@ impl RemoteRepository for HttpRemoteClient {
         };
         
         match self.send_request(&request)? {
-            RemoteResponse::Objects { objects } => Ok(objects),
+            RemoteResponse::Objects { objects } => {
+                Ok(objects.into_iter().map(|(id, data)| (id, data.map(|b| b.0))).collect())
+            }
             RemoteResponse::Error { message } => Err(HttpClientError::ServerError(message)),
             _ => Err(HttpClientError::InvalidResponse("Expected Objects response".to_string())),
         }
@@ -163,7 +165,7 @@ impl RemoteRepository for HttpRemoteClient {
     fn upload_object(&self, id: ObjectId, data: &[u8]) -> Result<(), Self::Error> {
         let request = RemoteRequest::UploadObject {
             id,
-            data: data.to_vec(),
+            data: super::Blob(data.to_vec()),
         };
         
         match self.send_request(&request)? {
@@ -181,7 +183,7 @@ impl RemoteRepository for HttpRemoteClient {
     
     fn upload_objects(&self, objects: &[(ObjectId, Vec<u8>)]) -> Result<(), Self::Error> {
         let request = RemoteRequest::UploadObjects {
-            objects: objects.to_vec(),
+            objects: objects.iter().map(|(id, d)| (*id, super::Blob(d.clone()))).collect(),
         };
         
         match self.send_request(&request)? {

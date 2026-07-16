@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use base64::Engine as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::object_id::ObjectId;
 use crate::snapshot::SnapShot;
 use crate::directory::Directory;
@@ -11,6 +12,43 @@ pub mod http_server;
 
 /// A fetched object: its id and its bytes, or `None` if the remote didn't have it.
 pub type FetchedObject = (ObjectId, Option<Vec<u8>>);
+
+/// Object bytes on the wire.
+///
+/// Serialized as a base64 string rather than serde_json's default `Vec<u8>`
+/// encoding (a JSON array of integers), which is ~4x larger and emits one JSON
+/// token per byte — dominating bandwidth and CPU for multi-MB blobs. Converts
+/// freely to/from `Vec<u8>` so call sites keep working with raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blob(pub Vec<u8>);
+
+impl From<Vec<u8>> for Blob {
+    fn from(v: Vec<u8>) -> Self {
+        Blob(v)
+    }
+}
+
+impl From<Blob> for Vec<u8> {
+    fn from(b: Blob) -> Self {
+        b.0
+    }
+}
+
+impl Serialize for Blob {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Blob {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(s.as_bytes())
+            .map(Blob)
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 /// Configuration for a remote repository
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,12 +91,12 @@ pub enum RemoteRequest {
     /// Upload an object
     UploadObject {
         id: ObjectId,
-        data: Vec<u8>,
+        data: Blob,
     },
     
     /// Upload multiple objects
     UploadObjects {
-        objects: Vec<(ObjectId, Vec<u8>)>,
+        objects: Vec<(ObjectId, Blob)>,
     },
 }
 
@@ -92,12 +130,12 @@ pub enum RemoteResponse {
     /// Object data
     Object {
         id: ObjectId,
-        data: Option<Vec<u8>>,
+        data: Option<Blob>,
     },
     
     /// Multiple objects data
     Objects {
-        objects: Vec<(ObjectId, Option<Vec<u8>>)>,
+        objects: Vec<(ObjectId, Option<Blob>)>,
     },
     
     /// Push result
