@@ -172,6 +172,23 @@ impl ObjectStore for DirectoryObjectStore {
                 let mut v = Vec::new();
                 f.read_to_end(&mut v)?;
 
+                // The store is content-addressed: an object's bytes must hash to
+                // the id they were looked up by. Re-verify on read so on-disk
+                // corruption (bit rot, a failing disk, tampering) surfaces as an
+                // error instead of being silently served — and, worse, written
+                // into the working tree on checkout/reset. A missing object is
+                // already handled below; this catches the *present but wrong*
+                // case that used to pass through undetected.
+                let actual = ObjectId::from(v.as_slice());
+                if actual != id {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "object {id} is corrupted: its stored bytes hash to {actual}"
+                        ),
+                    ));
+                }
+
                 // Cache the object for future reads
                 self.cache_object(id, v.clone());
 
@@ -250,4 +267,27 @@ fn test_directory_object_store() {
     let b: &[u8] = b"hello, world";
     assert!(store.has(b.into()).unwrap());
     assert_eq!(store.read(b.into()).unwrap(), Some(Vec::from(b)));
+}
+
+#[test]
+fn test_read_detects_corrupted_object() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let root: std::path::PathBuf = tempdir.path().into();
+    let id = {
+        let mut store = DirectoryObjectStore::new(root.clone()).unwrap();
+        store.insert(b"authentic content").unwrap()
+    };
+
+    // Flip a byte in the stored object file, simulating bit rot / tampering.
+    let s = format!("{id}");
+    let path = root.join(&s[0..2]).join(&s[2..]);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[0] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
+    // A fresh store (cold cache) must refuse to serve the corrupted bytes
+    // rather than returning them as if authentic.
+    let store = DirectoryObjectStore::new(root).unwrap();
+    let err = store.read(id).expect_err("corrupted read should be an error");
+    assert_eq!(err.kind(), ErrorKind::InvalidData);
 }
