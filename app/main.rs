@@ -1745,6 +1745,191 @@ fn cmd_merge(
     }
 }
 
+/// Handler for `revtool pull`.
+fn cmd_pull(remote: String, branch: Option<String>, force: bool) -> AppResult<()> {
+    let (dot_rev, current_branch) = get_repository()?;
+    let mut store = dot_rev.store()?;
+
+    let branch_to_pull = branch.as_ref().unwrap_or(&current_branch).clone();
+
+    let remote_config = dot_rev.get_remote(&remote)?
+        .ok_or_else(|| AppError::Other(format!("Remote '{}' not found. Use 'revtool remote add' to configure it.", remote)))?;
+
+    // Create HTTP client, authenticating with REVTOOL_TOKEN if set.
+    let token = std::env::var("REVTOOL_TOKEN").ok();
+    let client = HttpRemoteClient::with_token(remote_config.url.clone(), token)
+        .map_err(|e| AppError::Other(format!("Failed to connect to remote: {}", e)))?;
+
+    println!("Pulling branch '{}' from remote '{}'...", branch_to_pull.cyan(), remote.cyan());
+
+    // Download the objects and learn the remote's tip. This does NOT move
+    // any local ref yet.
+    let remote_id = sync::pull_branch(&client, &mut store, &branch_to_pull)
+        .map_err(|e| AppError::Other(format!("Pull failed: {}", e)))?
+        .ok_or_else(|| AppError::Other(format!(
+            "Branch '{branch_to_pull}' does not exist on remote '{remote}'"
+        )))?;
+
+    let branch_existed = dot_rev.branch_exists(&branch_to_pull)?;
+
+    // Refuse to move the local branch backward or sideways: only a
+    // fast-forward (the remote is a descendant of our tip) is allowed, so
+    // local commits can never be silently discarded.
+    if branch_existed {
+        let local_tip = dot_rev.branch_snapshot_id(&branch_to_pull)?;
+        if local_tip == remote_id {
+            println!("{}", "Already up to date.".green());
+            return Ok(());
+        }
+        match merge::find_common_ancestor(&store, local_tip, remote_id)? {
+            Some(base) if base == local_tip => {} // fast-forward: remote is ahead
+            Some(base) if base == remote_id => {
+                println!("{}", "Already up to date (local branch is ahead of the remote).".green());
+                return Ok(());
+            }
+            _ => {
+                return Err(AppError::Other(format!(
+                    "Refusing to pull: local branch '{branch_to_pull}' has diverged from the \
+                     remote and pulling would discard your local commits. Push your work, or \
+                     reset the branch to the remote first."
+                )));
+            }
+        }
+    }
+
+    let pulling_current = branch_to_pull == current_branch;
+
+    if pulling_current {
+        // Protect uncommitted work, then bring the working tree exactly in
+        // line with the pulled snapshot: remove files that were dropped
+        // upstream and lay down the new ones.
+        ensure_clean_or_forced(&dot_rev, &mut store, force, "pulling")?;
+
+        let old_tip = dot_rev.branch_snapshot_id(&current_branch)?;
+        let old_snap: SnapShot = store.read_json(old_tip)?;
+        let old_tree: Directory = store.read_json(old_snap.directory)?;
+        let new_snap: SnapShot = store.read_json(remote_id)?;
+        let new_tree: Directory = store.read_json(new_snap.directory)?;
+
+        let cwd = dot_rev.work_dir().to_path_buf();
+        remove_tracked_absent(&old_tree, &new_tree, &cwd)?;
+        new_tree.write(&store, &cwd, false)
+            .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
+
+        dot_rev.set_branch_snapshot_id(&branch_to_pull, remote_id)?;
+        println!("{}", format!(
+            "Fast-forwarded '{branch_to_pull}' to {} and updated the working tree.",
+            remote_id.to_string().cyan()
+        ).green().bold());
+    } else {
+        // Pulling a branch we're not on: only update its ref. Don't touch
+        // the working tree, and say so plainly rather than claiming a
+        // working-directory update happened.
+        dot_rev.set_branch_snapshot_id(&branch_to_pull, remote_id)?;
+        let verb = if branch_existed { "Fast-forwarded" } else { "Created" };
+        println!("{}", format!(
+            "{verb} branch '{branch_to_pull}' to {}. Run 'revtool checkout {branch_to_pull}' to check it out.",
+            remote_id.to_string().cyan()
+        ).green().bold());
+    }
+
+    Ok(())
+}
+
+/// Handler for `revtool checkout`.
+fn cmd_checkout(branch: Option<String>, create: bool, force: bool, interactive: bool) -> AppResult<()> {
+    let (dot_rev, current_branch) = get_repository()?;
+    let mut store = dot_rev.store()?;
+
+    // Switching branches mid-merge would abandon the merge in an
+    // inconsistent state (markers discarded, merge still "in progress").
+    // Require the merge to be resolved or aborted first.
+    if dot_rev.is_merge_in_progress()? {
+        return Err(AppError::Other(
+            "a merge is in progress; run 'revtool merge --continue' or \
+             'revtool merge --abort' before switching branches".to_string(),
+        ));
+    }
+
+    // Get the branch to checkout - either from command line or interactively
+    let branch_to_checkout = match branch {
+        Some(b) => b,
+        None if interactive => {
+            match interactive_branch_selection(&dot_rev, &current_branch)? {
+                Some(b) => b,
+                None => return Ok(()) // User aborted
+            }
+        },
+        None => {
+            return Err(AppError::Other("No branch specified. Please provide a branch name or use interactive mode with -i".to_string()));
+        }
+    };
+
+    // Don't do anything if trying to checkout the current branch
+    if branch_to_checkout == current_branch {
+        println!("Already on branch '{}'", branch_to_checkout.green().bold());
+        return Ok(());
+    }
+
+    // Protect uncommitted work BEFORE any state change: switching
+    // overwrites tracked files. Doing this first also means a refused
+    // 'checkout -b' doesn't leave the new branch created behind.
+    ensure_clean_or_forced(&dot_rev, &mut store, force, "switching branches")?;
+
+    // If the branch doesn't exist, only create it on explicit intent
+    // (`-b`, or a confirmation in interactive mode). A bare typo used to
+    // silently create a phantom branch; now it errors and points at how
+    // to create one on purpose.
+    if !dot_rev.branch_exists(&branch_to_checkout)? {
+        let should_create = create
+            || (interactive
+                && Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt(format!(
+                        "Branch '{}' doesn't exist. Create it?",
+                        branch_to_checkout
+                    ))
+                    .default(true)
+                    .interact()
+                    .unwrap_or(false));
+        if should_create {
+            println!("Creating new branch '{}'", branch_to_checkout.green().bold());
+            dot_rev.create_branch(&branch_to_checkout)?;
+        } else if interactive {
+            println!("Branch creation aborted.");
+            return Ok(());
+        } else {
+            return Err(AppError::Other(format!(
+                "Branch '{0}' does not exist. Use 'revtool checkout -b {0}' to create it, \
+                 or 'revtool branch {0}' first",
+                branch_to_checkout
+            )));
+        }
+    }
+
+    // Capture the branch we're leaving so we can remove files that exist
+    // only on it, then lay down the target branch's files.
+    let current_snapshot_id = dot_rev.branch_snapshot_id(&current_branch)?;
+    let current_snap: SnapShot = store.read_json(current_snapshot_id)?;
+    let current_tree: Directory = store.read_json(current_snap.directory)?;
+
+    let snapshot_id = dot_rev.branch_snapshot_id(&branch_to_checkout)?;
+    let snapshot: SnapShot = store.read_json(snapshot_id)?;
+    let target_tree: Directory = store.read_json(snapshot.directory)?;
+
+    let cwd = dot_rev.work_dir().to_path_buf();
+    remove_tracked_absent(&current_tree, &target_tree, &cwd)?;
+    target_tree.write(&store, &cwd, false)
+        .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
+
+    // Only move the branch pointer once the working tree is in place.
+    dot_rev.set_branch(&branch_to_checkout)?;
+
+    println!("Switched to branch '{}' (snapshot: {})",
+        branch_to_checkout.green().bold(),
+        snapshot_id.to_string().cyan());
+    Ok(())
+}
+
 fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
     use Command::*;
     use std::io::IsTerminal;
@@ -2141,98 +2326,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             }
             Ok(())
         }
-        Checkout { branch, create, force } => {
-            let (dot_rev, current_branch) = get_repository()?;
-            let mut store = dot_rev.store()?;
-
-            // Switching branches mid-merge would abandon the merge in an
-            // inconsistent state (markers discarded, merge still "in progress").
-            // Require the merge to be resolved or aborted first.
-            if dot_rev.is_merge_in_progress()? {
-                return Err(AppError::Other(
-                    "a merge is in progress; run 'revtool merge --continue' or \
-                     'revtool merge --abort' before switching branches".to_string(),
-                ));
-            }
-
-            // Get the branch to checkout - either from command line or interactively
-            let branch_to_checkout = match branch {
-                Some(b) => b,
-                None if interactive => {
-                    match interactive_branch_selection(&dot_rev, &current_branch)? {
-                        Some(b) => b,
-                        None => return Ok(()) // User aborted
-                    }
-                },
-                None => {
-                    return Err(AppError::Other("No branch specified. Please provide a branch name or use interactive mode with -i".to_string()));
-                }
-            };
-
-            // Don't do anything if trying to checkout the current branch
-            if branch_to_checkout == current_branch {
-                println!("Already on branch '{}'", branch_to_checkout.green().bold());
-                return Ok(());
-            }
-
-            // Protect uncommitted work BEFORE any state change: switching
-            // overwrites tracked files. Doing this first also means a refused
-            // 'checkout -b' doesn't leave the new branch created behind.
-            ensure_clean_or_forced(&dot_rev, &mut store, force, "switching branches")?;
-
-            // If the branch doesn't exist, only create it on explicit intent
-            // (`-b`, or a confirmation in interactive mode). A bare typo used to
-            // silently create a phantom branch; now it errors and points at how
-            // to create one on purpose.
-            if !dot_rev.branch_exists(&branch_to_checkout)? {
-                let should_create = create
-                    || (interactive
-                        && Confirm::with_theme(&ColorfulTheme::default())
-                            .with_prompt(format!(
-                                "Branch '{}' doesn't exist. Create it?",
-                                branch_to_checkout
-                            ))
-                            .default(true)
-                            .interact()
-                            .unwrap_or(false));
-                if should_create {
-                    println!("Creating new branch '{}'", branch_to_checkout.green().bold());
-                    dot_rev.create_branch(&branch_to_checkout)?;
-                } else if interactive {
-                    println!("Branch creation aborted.");
-                    return Ok(());
-                } else {
-                    return Err(AppError::Other(format!(
-                        "Branch '{0}' does not exist. Use 'revtool checkout -b {0}' to create it, \
-                         or 'revtool branch {0}' first",
-                        branch_to_checkout
-                    )));
-                }
-            }
-
-            // Capture the branch we're leaving so we can remove files that exist
-            // only on it, then lay down the target branch's files.
-            let current_snapshot_id = dot_rev.branch_snapshot_id(&current_branch)?;
-            let current_snap: SnapShot = store.read_json(current_snapshot_id)?;
-            let current_tree: Directory = store.read_json(current_snap.directory)?;
-
-            let snapshot_id = dot_rev.branch_snapshot_id(&branch_to_checkout)?;
-            let snapshot: SnapShot = store.read_json(snapshot_id)?;
-            let target_tree: Directory = store.read_json(snapshot.directory)?;
-
-            let cwd = dot_rev.work_dir().to_path_buf();
-            remove_tracked_absent(&current_tree, &target_tree, &cwd)?;
-            target_tree.write(&store, &cwd, false)
-                .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
-
-            // Only move the branch pointer once the working tree is in place.
-            dot_rev.set_branch(&branch_to_checkout)?;
-
-            println!("Switched to branch '{}' (snapshot: {})",
-                branch_to_checkout.green().bold(),
-                snapshot_id.to_string().cyan());
-            Ok(())
-        }
+        Checkout { branch, create, force } => cmd_checkout(branch, create, force, interactive),
         Changes { content, json, context, no_color } => {
             let (dot_rev, branch) = get_repository()?;
             let mut store = dot_rev.store()?;
@@ -2423,95 +2517,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             Ok(())
         }
         
-        Pull { remote, branch, force } => {
-            let (dot_rev, current_branch) = get_repository()?;
-            let mut store = dot_rev.store()?;
-
-            let branch_to_pull = branch.as_ref().unwrap_or(&current_branch).clone();
-
-            let remote_config = dot_rev.get_remote(&remote)?
-                .ok_or_else(|| AppError::Other(format!("Remote '{}' not found. Use 'revtool remote add' to configure it.", remote)))?;
-
-            // Create HTTP client, authenticating with REVTOOL_TOKEN if set.
-            let token = std::env::var("REVTOOL_TOKEN").ok();
-            let client = HttpRemoteClient::with_token(remote_config.url.clone(), token)
-                .map_err(|e| AppError::Other(format!("Failed to connect to remote: {}", e)))?;
-
-            println!("Pulling branch '{}' from remote '{}'...", branch_to_pull.cyan(), remote.cyan());
-
-            // Download the objects and learn the remote's tip. This does NOT move
-            // any local ref yet.
-            let remote_id = sync::pull_branch(&client, &mut store, &branch_to_pull)
-                .map_err(|e| AppError::Other(format!("Pull failed: {}", e)))?
-                .ok_or_else(|| AppError::Other(format!(
-                    "Branch '{branch_to_pull}' does not exist on remote '{remote}'"
-                )))?;
-
-            let branch_existed = dot_rev.branch_exists(&branch_to_pull)?;
-
-            // Refuse to move the local branch backward or sideways: only a
-            // fast-forward (the remote is a descendant of our tip) is allowed, so
-            // local commits can never be silently discarded.
-            if branch_existed {
-                let local_tip = dot_rev.branch_snapshot_id(&branch_to_pull)?;
-                if local_tip == remote_id {
-                    println!("{}", "Already up to date.".green());
-                    return Ok(());
-                }
-                match merge::find_common_ancestor(&store, local_tip, remote_id)? {
-                    Some(base) if base == local_tip => {} // fast-forward: remote is ahead
-                    Some(base) if base == remote_id => {
-                        println!("{}", "Already up to date (local branch is ahead of the remote).".green());
-                        return Ok(());
-                    }
-                    _ => {
-                        return Err(AppError::Other(format!(
-                            "Refusing to pull: local branch '{branch_to_pull}' has diverged from the \
-                             remote and pulling would discard your local commits. Push your work, or \
-                             reset the branch to the remote first."
-                        )));
-                    }
-                }
-            }
-
-            let pulling_current = branch_to_pull == current_branch;
-
-            if pulling_current {
-                // Protect uncommitted work, then bring the working tree exactly in
-                // line with the pulled snapshot: remove files that were dropped
-                // upstream and lay down the new ones.
-                ensure_clean_or_forced(&dot_rev, &mut store, force, "pulling")?;
-
-                let old_tip = dot_rev.branch_snapshot_id(&current_branch)?;
-                let old_snap: SnapShot = store.read_json(old_tip)?;
-                let old_tree: Directory = store.read_json(old_snap.directory)?;
-                let new_snap: SnapShot = store.read_json(remote_id)?;
-                let new_tree: Directory = store.read_json(new_snap.directory)?;
-
-                let cwd = dot_rev.work_dir().to_path_buf();
-                remove_tracked_absent(&old_tree, &new_tree, &cwd)?;
-                new_tree.write(&store, &cwd, false)
-                    .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
-
-                dot_rev.set_branch_snapshot_id(&branch_to_pull, remote_id)?;
-                println!("{}", format!(
-                    "Fast-forwarded '{branch_to_pull}' to {} and updated the working tree.",
-                    remote_id.to_string().cyan()
-                ).green().bold());
-            } else {
-                // Pulling a branch we're not on: only update its ref. Don't touch
-                // the working tree, and say so plainly rather than claiming a
-                // working-directory update happened.
-                dot_rev.set_branch_snapshot_id(&branch_to_pull, remote_id)?;
-                let verb = if branch_existed { "Fast-forwarded" } else { "Created" };
-                println!("{}", format!(
-                    "{verb} branch '{branch_to_pull}' to {}. Run 'revtool checkout {branch_to_pull}' to check it out.",
-                    remote_id.to_string().cyan()
-                ).green().bold());
-            }
-
-            Ok(())
-        }
+        Pull { remote, branch, force } => cmd_pull(remote, branch, force),
         
         Serve { port, host, token } => {
             let (dot_rev, _) = get_repository()?;
