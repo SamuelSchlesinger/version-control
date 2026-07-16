@@ -1848,7 +1848,8 @@ fn cmd_pull(remote: String, branch: Option<String>, force: bool) -> AppResult<()
                 return Err(AppError::Other(format!(
                     "Refusing to pull: local branch '{branch_to_pull}' has diverged from the \
                      remote and pulling would discard your local commits. Push your work, or \
-                     reset the branch to the remote first."
+                     reset the branch to the remote first. (--force only discards uncommitted \
+                     working-tree changes, not committed divergence.)"
                 )));
             }
         }
@@ -2051,7 +2052,11 @@ fn cmd_ignore(pattern: Option<String>, remove: bool, interactive: bool) -> AppRe
                 dot_rev.set_ignores(&new_ignores)?;
                 println!("Removed '{}' from ignore patterns", pattern.red());
             } else {
-                println!("Pattern '{}' not found in ignore list", pattern.yellow());
+                // Removing something that isn't there is an error (exit 1), for
+                // consistency with 'tag --delete' and 'remote remove'.
+                return Err(AppError::Other(format!(
+                    "pattern '{pattern}' is not in the ignore list"
+                )));
             }
         },
         // No pattern provided for remove
