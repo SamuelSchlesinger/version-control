@@ -95,6 +95,9 @@ impl std::fmt::Display for AppError {
                     "Invalid branch name '{name}': {reason}.\n\
                      Branch names must be a single name with no '/', no '..', and no leading '-'."
                 ),
+                DotRevError::RemoteExists(name) => {
+                    write!(f, "A remote named '{name}' already exists. Use a different name or remove it first.")
+                }
             },
             AppError::IoError(err) => {
                 match err.kind() {
@@ -122,7 +125,7 @@ impl std::fmt::Display for AppError {
             AppError::MergeInProgress => write!(f, "A merge is already in progress. Resolve conflicts and use 'revtool merge --continue' or use 'revtool merge --abort' to cancel"),
             AppError::NoMergeInProgress => write!(f, "No merge is in progress"),
             AppError::MergeFailed(reason) => write!(f, "Merge failed: {}. Resolve the issues and try again.", reason),
-            AppError::Other(msg) => write!(f, "{}. Please check your command and try again.", msg),
+            AppError::Other(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -424,7 +427,7 @@ fn uncommitted_changes(
     store: &mut lib::object_store::directory::DirectoryObjectStore,
 ) -> AppResult<Vec<PathBuf>> {
     let ignores = dot_rev.ignores()?;
-    let cwd = current_dir()?;
+    let cwd = dot_rev.work_dir().to_path_buf();
     let working = Directory::new(cwd.as_path(), &ignores, store)
         .map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
 
@@ -1213,7 +1216,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 let directory: Directory = store.read_json(snapshot.directory)?;
 
                 // Reset files
-                let cwd = current_dir()?;
+                let cwd = dot_rev.work_dir().to_path_buf();
                 directory.write(&store, &cwd, false)
                     .map_err(|e| AppError::FailedToResetFiles(format!("{:?}", e)))?;
 
@@ -1590,7 +1593,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
 
                 // Write the new directory to the working directory
-                let cwd = current_dir()?;
+                let cwd = dot_rev.work_dir().to_path_buf();
                 merged_dir.write(&store, &cwd, false)
                     .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
 
@@ -1665,8 +1668,10 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                         dot_rev.set_ignores(&new_ignores)?;
                         println!("Removed '{}' from ignore patterns", pattern.red());
                     } else {
-                        println!("{}", "Error: Must specify a pattern to remove".red().bold());
-                        println!("Usage: revtool ignore --remove <pattern>");
+                        return Err(AppError::Other(
+                            "no pattern given to remove.\nUsage: revtool ignore --remove <pattern>"
+                                .to_string(),
+                        ));
                     }
                 }
             }
@@ -1701,7 +1706,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let directory: Directory = store.read_json(snapshot.directory)?;
 
             // Restore files from snapshot
-            let cwd = current_dir()?;
+            let cwd = dot_rev.work_dir().to_path_buf();
             directory.write(&store, &cwd, delete_absent)
                 .map_err(|e| AppError::FailedToResetFiles(format!("{:?}", e)))?;
 
@@ -1819,7 +1824,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let mut store = dot_rev.store()?;
             let old_tip: ObjectId = dot_rev.branch_snapshot_id(&branch)?;
             let ignores: Ignores = dot_rev.ignores()?;
-            let cwd = current_dir()?;
+            let cwd = dot_rev.work_dir().to_path_buf();
 
             // Calculate directory diff with or without content depending on options
             let directory = Directory::new(cwd.as_path(), &ignores, &mut store)
@@ -1956,7 +1961,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let snapshot: SnapShot = store.read_json(snapshot_id)?;
             let target_tree: Directory = store.read_json(snapshot.directory)?;
 
-            let cwd = current_dir()?;
+            let cwd = dot_rev.work_dir().to_path_buf();
             remove_tracked_absent(&current_tree, &target_tree, &cwd)?;
             target_tree.write(&store, &cwd, false)
                 .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
@@ -1976,7 +1981,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let ignores = dot_rev.ignores()?;
 
             let directory = Directory::new(
-                current_dir()?.as_path(),
+                dot_rev.work_dir(),
                 &ignores,
                 &mut store
             ).map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
@@ -2021,7 +2026,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
             // Create a snapshot of the current directory
             let directory = Directory::new(
-                current_dir()?.as_path(),
+                dot_rev.work_dir(),
                 &ignores,
                 &mut store
             ).map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
@@ -2065,7 +2070,26 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             Ok(())
         }
         Init => {
-            DotRev::init(current_dir()?.join(".rev"))?;
+            let cwd = current_dir()?;
+            let rev_path = cwd.join(".rev");
+
+            // Don't silently claim success (or nest a repo) when one already
+            // exists here or in a parent directory.
+            if rev_path.exists() {
+                return Err(AppError::Other(format!(
+                    "A repository already exists at {}",
+                    rev_path.display()
+                )));
+            }
+            if let Ok(existing) = DotRev::here() {
+                return Err(AppError::Other(format!(
+                    "Already inside a repository rooted at {}. \
+                     Initialising here would nest a second repository",
+                    existing.work_dir().display()
+                )));
+            }
+
+            DotRev::init(rev_path)?;
             println!("{}", "Initialized empty revision control repository in .rev/".green().bold());
             Ok(())
         }
@@ -2081,6 +2105,10 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                     Ok(())
                 },
                 Some(RemoteCommand::Remove { name }) => {
+                    // Don't report success for a remote that was never there.
+                    if dot_rev.get_remote(&name)?.is_none() {
+                        return Err(AppError::Other(format!("No remote named '{name}'")));
+                    }
                     dot_rev.remove_remote(&name)?;
                     println!("Removed remote '{}'", name.red().bold());
                     Ok(())
@@ -2161,7 +2189,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                         let snapshot: SnapShot = store.read_json(new_snapshot_id)?;
                         let directory: Directory = store.read_json(snapshot.directory)?;
                         
-                        let cwd = current_dir()?;
+                        let cwd = dot_rev.work_dir().to_path_buf();
                         directory.write(&store, &cwd, false)
                             .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
                         

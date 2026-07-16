@@ -42,6 +42,8 @@ pub enum Error {
         name: String,
         reason: &'static str,
     },
+    /// A remote with the given name already exists
+    RemoteExists(String),
 }
 
 /// Maximum length of a branch name, in bytes.
@@ -136,6 +138,7 @@ impl std::fmt::Display for Error {
                 "Invalid branch name {name:?}: {reason}. Branch names must be a single \
                  name without '/' or '..'"
             ),
+            Error::RemoteExists(name) => write!(f, "A remote named '{name}' already exists"),
         }
     }
 }
@@ -188,11 +191,29 @@ impl DotRev {
         Ok(DotRev { root })
     }
 
+    /// Finds the repository that contains the current directory by walking up
+    /// the directory tree looking for a `.rev`, like git's `.git` discovery.
+    /// This lets every command work from any subdirectory of the repository.
     pub fn here() -> Result<Self, Error> {
-        match current_dir() {
-            Ok(dir) => DotRev::existing(dir.join(".rev")),
-            Err(e) => Err(Error::IO(e)),
+        let start = current_dir().map_err(Error::IO)?;
+        let mut dir: &Path = start.as_path();
+        loop {
+            let candidate = dir.join(".rev");
+            if read_dir(&candidate).is_ok() {
+                return Ok(DotRev { root: candidate });
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent,
+                None => return Err(Error::RepositoryNotInitialized),
+            }
         }
+    }
+
+    /// The working-tree root: the directory that contains `.rev`. Snapshot and
+    /// status operations are relative to this, not to the current directory, so
+    /// they behave the same from anywhere inside the repository.
+    pub fn work_dir(&self) -> &Path {
+        self.root.parent().unwrap_or_else(|| Path::new("."))
     }
 
     pub fn existing(root: PathBuf) -> Result<Self, Error> {
@@ -345,7 +366,7 @@ impl DotRev {
         
         // Check if remote with same name already exists
         if remotes.iter().any(|r| r.name == remote.name) {
-            return Err(Error::CorruptRepository(format!("Remote '{}' already exists", remote.name)));
+            return Err(Error::RemoteExists(remote.name));
         }
         
         remotes.push(remote);
