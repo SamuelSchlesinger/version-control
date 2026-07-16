@@ -53,7 +53,7 @@ revtool checkout feature
 revtool status
 revtool snap -m "Add new functionality"
 
-# Merge changes back to main branch
+# Merge changes back to the dev branch
 revtool checkout dev
 revtool merge feature -m "Merge feature branch"
 ```
@@ -183,12 +183,31 @@ Commands:
   branch    Create or list branches
   reset     Reset all files to the last snapshot on this branch
   log       Show commit logs
+  remote    Manage remote repositories
+  push      Push changes to a remote repository
+  pull      Pull changes from a remote repository
+  serve     Start an HTTP server to host the repository
   help      Print this message or the help of the given subcommand(s)
 
 Options:
   -i, --interactive  Use interactive mode with prompts and confirmations
   -h, --help         Print help
   -V, --version      Print version
+```
+
+RevTool can be run from any subdirectory of a repository, like git.
+
+#### Safety flags
+
+Commands that overwrite the working tree refuse to discard uncommitted work
+unless you opt in:
+
+```bash
+revtool checkout other            # refused if you have uncommitted changes
+revtool checkout other --force    # discard local changes and switch
+revtool checkout -b new-branch    # create the branch and switch (like git switch -c)
+revtool reset --force             # restore tracked files, discarding local edits
+revtool reset --force --delete-absent  # also remove untracked files
 ```
 
 ### Key Commands
@@ -243,9 +262,20 @@ revtool ignore -i             # Interactive pattern management
 
 #### Resetting Files
 ```bash
-revtool reset                 # Reset to last snapshot
-revtool reset --delete-absent # Reset and delete untracked files
+revtool reset --force                 # Restore tracked files to the last snapshot
+revtool reset --force --delete-absent # Also delete untracked files
 ```
+`reset` discards uncommitted work, so it requires `--force`.
+
+#### Working with Remotes
+```bash
+revtool serve --port 8080             # Host the current repo over HTTP
+revtool remote add origin http://host:8080
+revtool push origin dev               # Upload the dev branch
+revtool pull origin dev               # Download the dev branch
+```
+The server is unauthenticated; bind it to a trusted network only (it defaults
+to `127.0.0.1`).
 
 ## Common Workflows
 
@@ -280,32 +310,35 @@ revtool snap -m "Add feature X"
 
 ### Working with Branches
 
+The default branch is `dev`. `checkout` switches to an existing branch; use
+`-b` to create one (checking out a name that doesn't exist is an error, so a
+typo can't silently make a stray branch).
+
 ```bash
 # Create and switch to a feature branch
-revtool branch new-feature
-revtool checkout new-feature
+revtool checkout -b new-feature
 
 # Make changes and commit them
 # ... edit files ...
 revtool snap -m "Work on new feature"
 
-# Compare with main branch
-revtool diff main
+# Compare with the dev branch
+revtool diff dev
 
-# Switch back to main
-revtool checkout main
+# Switch back to dev
+revtool checkout dev
 ```
 
 ### Merging Branches
 
 ```bash
-# Work on feature branch
-revtool checkout feature-branch
+# Work on a feature branch
+revtool checkout -b feature-branch
 # ... make changes and create snapshots ...
 
 # Switch to target branch and merge
-revtool checkout main
-revtool merge feature-branch -m "Merge feature-branch into main"
+revtool checkout dev
+revtool merge feature-branch -m "Merge feature-branch into dev"
 
 # If there are conflicts, you'll be prompted to resolve them
 # After resolving conflicts manually
