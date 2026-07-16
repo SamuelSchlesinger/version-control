@@ -123,6 +123,11 @@ pub struct MergeState {
     pub merge_result: MergeResult,
     /// Original state backup - the snapshot ID to reset to if aborting
     pub backup_snapshot_id: ObjectId,
+    /// The commit message the user supplied on the original `merge` command, so
+    /// it survives a conflict and is used by `merge --continue` (unless the user
+    /// supplies a new one).
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 impl std::fmt::Display for Error {

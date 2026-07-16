@@ -1375,7 +1375,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                         )?;
 
                         // Create a merge snapshot
-                        let merge_msg = message.unwrap_or_else(||
+                        let merge_msg = message.clone().or_else(|| merge_state.message.clone()).unwrap_or_else(||
                             format!("Merge branch '{}' into {}",
                                 merge_state.merge_branch,
                                 merge_state.current_branch
@@ -1445,7 +1445,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                             println!("\n{}", "All conflicts resolved automatically!".green().bold());
 
                             // Create the merge snapshot
-                            let merge_msg = message.unwrap_or_else(||
+                            let merge_msg = message.clone().or_else(|| merge_state.message.clone()).unwrap_or_else(||
                                 format!("Merge branch '{}' into {} (strategy: {})",
                                     merge_state.merge_branch,
                                     merge_state.current_branch,
@@ -1528,7 +1528,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 }
 
                 // All conflicts are resolved, create the merge snapshot
-                let merge_msg = message.unwrap_or_else(||
+                let merge_msg = message.clone().or_else(|| merge_state.message.clone()).unwrap_or_else(||
                     format!("Merge branch '{}' into {}",
                         merge_state.merge_branch,
                         merge_state.current_branch
@@ -1584,6 +1584,13 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 }
             };
 
+            // Merging a branch into itself is never meaningful.
+            if merge_branch == current_branch {
+                return Err(AppError::Other(
+                    "cannot merge a branch into itself".to_string(),
+                ));
+            }
+
             // Check if the branch exists
             if !dot_rev.branch_exists(&merge_branch)? {
                 return Err(AppError::BranchNotFound(merge_branch));
@@ -1599,6 +1606,13 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 None => return Err(AppError::Other("No common ancestor found between branches".to_string())),
             };
 
+            // If the other branch is already an ancestor of ours, there is
+            // nothing to merge — don't create an empty merge snapshot.
+            if base_id == theirs_id {
+                println!("{}", format!("Already up to date; '{merge_branch}' is already merged.").green());
+                return Ok(());
+            }
+
             // Perform the merge
             let merge_result = merge::merge(&mut store, base_id, ours_id, theirs_id, &current_branch, &merge_branch, true)?;
 
@@ -1612,6 +1626,8 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                     merge_branch: merge_branch.clone(),
                     merge_result: merge_result.clone(),
                     backup_snapshot_id: ours_id,
+                    // Remember the message so it survives the conflict.
+                    message: message.clone(),
                 };
 
                 dot_rev.save_merge_state(&merge_state)?;
@@ -1980,7 +1996,13 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
             match name {
                 Some(branch_name) => {
-                    // Create a new branch
+                    // Don't claim success for a branch that already exists
+                    // (create_branch is a silent no-op in that case).
+                    if dot_rev.branch_exists(&branch_name)? {
+                        return Err(AppError::Other(format!(
+                            "A branch named '{branch_name}' already exists"
+                        )));
+                    }
                     dot_rev.create_branch(&branch_name)?;
                     println!("Created branch '{}'", branch_name.green().bold());
                     Ok(())
@@ -2153,6 +2175,11 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 return Ok(());
             }
 
+            // Protect uncommitted work BEFORE any state change: switching
+            // overwrites tracked files. Doing this first also means a refused
+            // 'checkout -b' doesn't leave the new branch created behind.
+            ensure_clean_or_forced(&dot_rev, &mut store, force, "switching branches")?;
+
             // If the branch doesn't exist, only create it on explicit intent
             // (`-b`, or a confirmation in interactive mode). A bare typo used to
             // silently create a phantom branch; now it errors and points at how
@@ -2182,9 +2209,6 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                     )));
                 }
             }
-
-            // Protect uncommitted work: switching overwrites tracked files.
-            ensure_clean_or_forced(&dot_rev, &mut store, force, "switching branches")?;
 
             // Capture the branch we're leaving so we can remove files that exist
             // only on it, then lay down the target branch's files.

@@ -1,4 +1,7 @@
-use std::{collections::HashSet, str::FromStr};
+use std::{
+    collections::{BTreeSet, HashSet, VecDeque},
+    str::FromStr,
+};
 
 use crate::{
     dot_rev::{DotRev, Error as DotRevError, InsertJson},
@@ -70,45 +73,47 @@ impl ObjectIdRef {
         match self {
             ObjectIdRef::Complete(id) => Ok(*id),
             ObjectIdRef::Prefix(prefix) => {
+                // Ids are stored lowercase; match case-insensitively.
+                let prefix = prefix.to_lowercase();
                 let mut store = dot_rev.store()?;
-                let mut matches = Vec::new();
-                
-                // Gather all snapshot IDs 
+                let mut matches: BTreeSet<ObjectId> = BTreeSet::new();
+
+                // Walk the whole reachable history (all parents of every branch
+                // tip *and* every tag), not just first-parent chains, so a
+                // snapshot reachable only through a merge's second parent or a
+                // tag can still be found by prefix.
+                let mut visited = HashSet::new();
+                let mut queue: VecDeque<ObjectId> = VecDeque::new();
                 for branch_name in dot_rev.list_branches()? {
-                    let mut current_id = dot_rev.branch_snapshot_id(&branch_name)?;
-                    
-                    // Start a set to avoid processing the same snapshot twice
-                    let mut processed = HashSet::new();
-                    
-                    loop {
-                        // Check if we've seen this snapshot already
-                        if !processed.insert(current_id) {
-                            break;
+                    queue.push_back(dot_rev.branch_snapshot_id(&branch_name)?);
+                }
+                for tag_name in dot_rev.list_tags()? {
+                    queue.push_back(dot_rev.tag_snapshot_id(&tag_name)?);
+                }
+
+                while let Some(id) = queue.pop_front() {
+                    if !visited.insert(id) {
+                        continue;
+                    }
+                    if id.to_string().starts_with(&prefix) {
+                        matches.insert(id);
+                    }
+                    if let Ok(snapshot) = store.read_json::<SnapShot>(id) {
+                        for parent in snapshot.previous {
+                            queue.push_back(parent);
                         }
-                        
-                        // Check if this snapshot ID matches our prefix
-                        let id_str = current_id.to_string();
-                        if id_str.starts_with(prefix) {
-                            matches.push(current_id);
-                        }
-                        
-                        // Get the snapshot and move to its parents
-                        let snapshot: SnapShot = store.read_json(current_id)?;
-                        if snapshot.previous.is_empty() {
-                            break;
-                        }
-                        
-                        // Continue with the first parent
-                        current_id = *snapshot.previous.first().unwrap();
                     }
                 }
-                
-                // Return the result based on the number of matches
+
+                let matches: Vec<ObjectId> = matches.into_iter().collect();
                 match matches.len() {
-                    0 => Err(Error::NoMatchingPrefix(prefix.clone())),
+                    0 => Err(Error::NoMatchingPrefix(prefix)),
                     1 => Ok(matches[0]),
-                    _ => Err(Error::AmbiguousPrefix(format!("Prefix '{}' is ambiguous, matching {} snapshots", 
-                                                   prefix, matches.len()))),
+                    _ => Err(Error::AmbiguousPrefix(format!(
+                        "Prefix '{}' is ambiguous, matching {} snapshots",
+                        prefix,
+                        matches.len()
+                    ))),
                 }
             }
         }
@@ -190,7 +195,21 @@ impl SnapshotRef {
             }
 
             SnapshotRef::ObjectId(obj_ref) => {
-                obj_ref.resolve(dot_rev)
+                // A short hex string parses as an id prefix, but names like
+                // `dead`/`beef` can also be real branches or tags. If nothing
+                // matches the prefix, fall back to resolving it as a ref name.
+                match obj_ref.resolve(dot_rev) {
+                    Err(Error::NoMatchingPrefix(name)) => {
+                        if dot_rev.branch_exists(&name)? {
+                            dot_rev.branch_snapshot_id(&name).map_err(Error::from)
+                        } else if dot_rev.tag_exists(&name)? {
+                            dot_rev.tag_snapshot_id(&name).map_err(Error::from)
+                        } else {
+                            Err(Error::NoMatchingPrefix(name))
+                        }
+                    }
+                    other => other,
+                }
             }
 
             SnapshotRef::RelativeToSnapshot { snapshot_id, depth } => {
