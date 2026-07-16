@@ -1427,11 +1427,21 @@ fn cmd_merge(
             return Err(AppError::NoMergeInProgress);
         }
 
-        // Get the merge state
-        let merge_state = dot_rev.get_merge_state()?;
-
-        // Reset to the backup snapshot
-        let snapshot_id = merge_state.backup_snapshot_id;
+        // Determine the snapshot to restore to. Normally this is the backup
+        // recorded in the merge state. But if that file is corrupt or truncated
+        // (e.g. a crash mid-write), --abort must still let the user escape
+        // rather than failing the same way --continue does. An in-progress merge
+        // never advances the branch ref, so the branch's current tip is the
+        // pre-merge state and a safe fallback restore target.
+        let snapshot_id = match dot_rev.get_merge_state() {
+            Ok(state) => state.backup_snapshot_id,
+            Err(e) => {
+                log::warn!(
+                    "merge state is unreadable ({e}); aborting to the current branch tip"
+                );
+                dot_rev.branch_snapshot_id(&current_branch)?
+            }
+        };
         let snapshot: SnapShot = store.read_json(snapshot_id)?;
         let directory: Directory = store.read_json(snapshot.directory)?;
 
