@@ -506,15 +506,17 @@ fn read_json<A: for<'de> Deserialize<'de>>(path: &Path) -> Result<A, Error> {
 }
 
 fn write_json<A: Serialize>(thing: &A, path: &Path) -> Result<(), Error> {
-    // Serialize into memory then write once, for the same reason: to_writer
-    // against a raw File would make a syscall per token.
+    // Serialize into memory then write once (to_writer against a raw File makes
+    // a syscall per token), and write atomically via a temp file + rename so a
+    // crash can never leave a half-written branch pointer / index / merge state
+    // that would break the repository. Falls back to a direct write if the path
+    // has no parent (shouldn't happen for repo metadata).
     let bytes = serde_json::to_vec_pretty(thing)?;
-    let mut file = File::options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(&bytes)?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(&bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
 

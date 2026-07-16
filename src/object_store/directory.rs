@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs::{create_dir, File},
+    fs::create_dir,
     io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
@@ -216,14 +216,24 @@ impl ObjectStore for DirectoryObjectStore {
             return Ok(id);
         }
 
-        // Write new object
-        if !Path::try_exists(&subdir_path)? {
-            log::info!("creating subdir path {:?} in {:?}", subdir_path, self.root);
-            std::fs::create_dir(&subdir_path)?;
+        // Create the fan-out subdirectory, tolerating a concurrent creator
+        // (check-then-create races otherwise fail with AlreadyExists).
+        match std::fs::create_dir(&subdir_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
 
-        let mut f = File::options().create(true).truncate(true).write(true).open(path)?;
-        f.write_all(object)?;
+        // Write atomically: fill a temp file in the same directory, flush it,
+        // then rename into place. A crash or a concurrent writer can therefore
+        // never leave a truncated file at the content-addressed path (whose name
+        // must always match its bytes). The rename is atomic on the same
+        // filesystem, and if two processes store the same id concurrently the
+        // loser simply overwrites with byte-identical content.
+        let mut tmp = tempfile::NamedTempFile::new_in(&subdir_path)?;
+        tmp.write_all(object)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|e| e.error)?;
 
         // Add to cache
         self.cache_object(id, object.to_vec());
