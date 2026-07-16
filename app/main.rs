@@ -692,6 +692,28 @@ fn refresh_worktree_to_snapshot(
     Ok(())
 }
 
+/// Finalizes a resolved merge: records the merge snapshot, advances the current
+/// branch to it, refreshes the working tree, clears the merge state, and reports
+/// success. Every successful-merge path (interactive, --strategy, --continue)
+/// funnels through here so the sequence can't drift between copies.
+fn finalize_merge(
+    dot_rev: &DotRev,
+    store: &mut lib::object_store::directory::DirectoryObjectStore,
+    current_branch: &str,
+    merge_result: &merge::MergeResult,
+    message: String,
+) -> AppResult<()> {
+    let snapshot_id = merge_result.create_snapshot(store, message)?;
+    dot_rev.set_branch_snapshot_id(current_branch, snapshot_id)?;
+    refresh_worktree_to_snapshot(dot_rev, store, snapshot_id)?;
+    dot_rev.clear_merge_state()?;
+    println!(
+        "Merge completed successfully: created snapshot {}",
+        snapshot_id.to_string().cyan()
+    );
+    Ok(())
+}
+
 /// Masks the password in a `scheme://user:pass@host` URL so it is not printed
 /// to the terminal. Remotes are stored with whatever credentials the user
 /// embedded in the URL; displaying them verbatim leaks secrets to anyone
@@ -1473,18 +1495,7 @@ fn cmd_merge(
                     )
                 );
 
-                let snapshot_id = merge_result.create_snapshot(&mut store, merge_msg)?;
-
-                // Update the branch pointer
-                dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-                refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
-
-                // Clear the merge state
-                dot_rev.clear_merge_state()?;
-
-                println!("Merge completed successfully: created snapshot {}",
-                    snapshot_id.to_string().cyan());
-                return Ok(());
+                return finalize_merge(&dot_rev, &mut store, &current_branch, &merge_result, merge_msg);
             } else if let Some(strategy) = merge_strategy {
                 // In non-interactive mode but with a strategy, we can try to resolve conflicts automatically
                 if strategy == merge::MergeStrategy::Normal {
@@ -1514,18 +1525,7 @@ fn cmd_merge(
                         )
                     );
 
-                    let snapshot_id = merge_state.merge_result.create_snapshot(&mut store, merge_msg)?;
-
-                    // Update the branch pointer
-                    dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-                    refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
-
-                    // Clear the merge state
-                    dot_rev.clear_merge_state()?;
-
-                    println!("Merge completed successfully: created snapshot {}",
-                        snapshot_id.to_string().cyan());
-                    return Ok(());
+                    return finalize_merge(&dot_rev, &mut store, &current_branch, &merge_state.merge_result, merge_msg);
                 } else {
                     // Not all conflicts could be resolved automatically
                     dot_rev.save_merge_state(&merge_state)?;
@@ -1596,18 +1596,7 @@ fn cmd_merge(
             )
         );
 
-        let snapshot_id = merge_state.merge_result.create_snapshot(&mut store, merge_msg)?;
-
-        // Update the branch pointer
-        dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-        refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
-
-        // Clear the merge state
-        dot_rev.clear_merge_state()?;
-
-        println!("Merge completed successfully: created snapshot {}",
-            snapshot_id.to_string().cyan());
-        return Ok(());
+        return finalize_merge(&dot_rev, &mut store, &current_branch, &merge_state.merge_result, merge_msg);
     }
 
     // Handle new merge case
@@ -1724,18 +1713,7 @@ fn cmd_merge(
                 format!("Merge branch '{}' into {}", merge_branch, current_branch)
             );
 
-            let snapshot_id = merge_result.create_snapshot(&mut store, merge_msg)?;
-
-            // Update the branch pointer
-            dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-            refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
-
-            // Clear the merge state
-            dot_rev.clear_merge_state()?;
-
-            println!("Merge completed successfully: created snapshot {}",
-                snapshot_id.to_string().cyan());
-            return Ok(());
+            return finalize_merge(&dot_rev, &mut store, &current_branch, &merge_result, merge_msg);
         } else if let Some(strategy) = merge_strategy {
             // In non-interactive mode but with a strategy, we can try to resolve conflicts automatically
             if strategy == merge::MergeStrategy::Normal {
@@ -1766,18 +1744,7 @@ fn cmd_merge(
                     )
                 );
 
-                let snapshot_id = merge_state.merge_result.create_snapshot(&mut store, merge_msg)?;
-
-                // Update the branch pointer
-                dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
-                refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
-
-                // Clear the merge state
-                dot_rev.clear_merge_state()?;
-
-                println!("Merge completed successfully: created snapshot {}",
-                    snapshot_id.to_string().cyan());
-                return Ok(());
+                return finalize_merge(&dot_rev, &mut store, &current_branch, &merge_state.merge_result, merge_msg);
             } else {
                 // Not all conflicts could be resolved automatically
                 dot_rev.save_merge_state(&merge_state)?;
