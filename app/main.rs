@@ -468,6 +468,25 @@ fn ensure_clean_or_forced(
     Err(AppError::Other(msg))
 }
 
+/// Masks the password in a `scheme://user:pass@host` URL so it is not printed
+/// to the terminal. Remotes are stored with whatever credentials the user
+/// embedded in the URL; displaying them verbatim leaks secrets to anyone
+/// watching the screen or reading logs.
+fn redact_url_credentials(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after = scheme_end + 3;
+        let rest = &url[after..];
+        let host_start = rest.find('/').unwrap_or(rest.len());
+        if let Some(at) = rest[..host_start].find('@') {
+            let userinfo = &rest[..at];
+            if let Some(colon) = userinfo.find(':') {
+                return format!("{}{}:***@{}", &url[..after], &userinfo[..colon], &rest[at + 1..]);
+            }
+        }
+    }
+    url.to_string()
+}
+
 /// Removes working-tree files that were tracked on `current` but are absent
 /// from `target`, so switching branches does not leave the old branch's files
 /// polluting the new branch. Untracked files (in neither snapshot) are left
@@ -2058,7 +2077,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 Some(RemoteCommand::Add { name, url }) => {
                     let remote = RemoteConfig { name: name.clone(), url: url.clone() };
                     dot_rev.add_remote(remote)?;
-                    println!("Added remote '{}' with URL: {}", name.green().bold(), url);
+                    println!("Added remote '{}' with URL: {}", name.green().bold(), redact_url_credentials(&url));
                     Ok(())
                 },
                 Some(RemoteCommand::Remove { name }) => {
@@ -2074,7 +2093,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                     } else {
                         println!("{}", "Configured remotes:".green().bold());
                         for remote in remotes {
-                            println!("  {} -> {}", remote.name.cyan(), remote.url);
+                            println!("  {} -> {}", remote.name.cyan(), redact_url_credentials(&remote.url));
                         }
                     }
                     Ok(())
@@ -2177,6 +2196,21 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let runtime = tokio::runtime::Runtime::new()
                 .map_err(|e| AppError::Other(format!("Failed to create runtime: {}", e)))?;
             
+            // The server has no authentication: anyone who can reach the port
+            // can read every object and push to any branch. That is fine on
+            // loopback, but binding to a routable address exposes the repo to
+            // the whole network, so warn loudly.
+            let is_loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
+            if !is_loopback {
+                eprintln!(
+                    "{} serving on {} with no authentication. Anyone who can reach \
+                     this address can read and overwrite this repository. Only do this \
+                     on a trusted network.",
+                    "WARNING:".yellow().bold(),
+                    addr
+                );
+            }
+
             println!("Starting repository server on {}...", addr.cyan().bold());
             println!("Other users can add this as a remote with:");
             println!("  revtool remote add origin http://{}", addr);

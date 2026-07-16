@@ -256,50 +256,54 @@ pub mod sync {
         S: ObjectStore,
         S::Error: std::fmt::Debug,
     {
-        let mut needed = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut to_download = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(snapshot_id);
-        needed.insert(snapshot_id);
-        
+
         while let Some(obj_id) = queue.pop_front() {
-            // Check if we already have this object locally
-            if store.read(obj_id)
-                .map_err(|e| SyncError::LocalError(format!("Failed to check object: {:?}", e)))?
-                .is_some()
-            {
+            if !visited.insert(obj_id) {
                 continue;
             }
-            
-            // Get the object from remote to inspect it
-            let data = remote.get_object(obj_id)
-                .map_err(|e| SyncError::RemoteError(e.to_string()))?
-                .ok_or_else(|| SyncError::ObjectMissing(obj_id))?;
-            
+
+            // Get the object's bytes so we can inspect its children. Prefer the
+            // local copy; if it isn't present, fetch it from the remote and
+            // record that it must be downloaded. Crucially, we inspect children
+            // even for objects we already have locally: a prior interrupted pull
+            // can leave a snapshot present but a child blob missing, and the old
+            // code's "already local, skip" shortcut meant a re-pull computed an
+            // empty download set and could never repair the gap.
+            let data = match store
+                .read(obj_id)
+                .map_err(|e| SyncError::LocalError(format!("Failed to check object: {:?}", e)))?
+            {
+                Some(local) => local,
+                None => {
+                    to_download.insert(obj_id);
+                    remote
+                        .get_object(obj_id)
+                        .map_err(|e| SyncError::RemoteError(e.to_string()))?
+                        .ok_or(SyncError::ObjectMissing(obj_id))?
+                }
+            };
+
             // Try to parse as snapshot
             if let Ok(snapshot) = serde_json::from_slice::<SnapShot>(&data) {
-                // Add directory object
-                if needed.insert(snapshot.directory) {
-                    queue.push_back(snapshot.directory);
-                }
-                
-                // Add parent snapshots
+                queue.push_back(snapshot.directory);
                 for parent in snapshot.previous {
-                    if needed.insert(parent) {
-                        queue.push_back(parent);
-                    }
+                    queue.push_back(parent);
                 }
             }
-            
+
             // Try to parse as directory
             if let Ok(directory) = serde_json::from_slice::<Directory>(&data) {
-                // Add all file content objects
                 for (_, file_id) in directory.files() {
-                    needed.insert(file_id);
+                    queue.push_back(file_id);
                 }
             }
         }
-        
-        Ok(needed.into_iter().collect())
+
+        Ok(to_download.into_iter().collect())
     }
     
     /// Collect all objects needed for a local snapshot
