@@ -453,6 +453,56 @@ fn get_repository() -> AppResult<(DotRev, String)> {
     Ok((dot_rev, branch))
 }
 
+/// Applies a merge strategy (`ours`/`theirs`) to every still-unresolved
+/// conflict in `merge_state`, recording each resolution and printing progress.
+/// Returns whether all conflicts were resolved. Shared by the interactive,
+/// `--continue`, and fresh-merge strategy paths so the logic (and any fix to it)
+/// lives in one place.
+fn apply_strategy_to_conflicts<S>(
+    store: &mut S,
+    merge_state: &mut MergeState,
+    strategy: merge::MergeStrategy,
+) -> AppResult<bool>
+where
+    S: lib::object_store::ObjectStore + InsertJson + std::fmt::Debug,
+    S::Error: std::fmt::Debug,
+{
+    let unresolved: Vec<_> = merge_state
+        .merge_result
+        .conflicts
+        .iter()
+        .filter(|c| !c.resolved)
+        .cloned()
+        .collect();
+
+    let mut all_resolved = true;
+    for conflict in unresolved {
+        let resolver = ConflictResolver::new(
+            &*store,
+            conflict.clone(),
+            &merge_state.current_branch,
+            &merge_state.merge_branch,
+        )?;
+        match resolver.resolve_with_strategy(store, strategy)? {
+            Some(resolved_id) => {
+                for c in merge_state.merge_result.conflicts.iter_mut() {
+                    if c.path == conflict.path {
+                        c.resolved = true;
+                        c.resolution_id = Some(resolved_id);
+                        break;
+                    }
+                }
+                println!("Resolved: {} ({})", conflict.path.display(), conflict.conflict_type);
+            }
+            None => {
+                all_resolved = false;
+                println!("Could not resolve: {} ({})", conflict.path.display(), conflict.conflict_type);
+            }
+        }
+    }
+    Ok(all_resolved)
+}
+
 /// Whether colored diff output should be emitted: only when the user didn't
 /// pass `--no-color`, stdout is a real terminal, and NO_COLOR is unset. This
 /// keeps the diff formatter's hand-rolled ANSI consistent with the `colored`
@@ -715,53 +765,24 @@ where
                 println!("Applying {} merge strategy to all conflicts...",
                     if strategy == merge::MergeStrategy::Ours { "ours".cyan() } else { "theirs".cyan() });
 
-                // Track success or failure for each conflict
-                let mut all_resolved = true;
-                let mut failed_paths = Vec::new();
+                let all_resolved =
+                    apply_strategy_to_conflicts(store, &mut merge_state, strategy)?;
 
-                // Process each conflict with the given strategy
-                for conflict in conflicts {
-                    let resolver = ConflictResolver::new(store, conflict.clone(), &merge_state.current_branch, &merge_state.merge_branch)?;
-
-                    // Try to apply the strategy
-                    match resolver.resolve_with_strategy(store, strategy)? {
-                        Some(resolved_id) => {
-                            // Update the conflict in the merge result
-                            for c in merge_state.merge_result.conflicts.iter_mut() {
-                                if c.path == conflict.path {
-                                    c.resolved = true;
-                                    c.resolution_id = Some(resolved_id);
-                                    break;
-                                }
-                            }
-
-                            println!("Resolved: {} ({})", conflict.path.display(), conflict.conflict_type);
-                        },
-                        None => {
-                            // Strategy couldn't be applied
-                            all_resolved = false;
-                            failed_paths.push(conflict.path.display().to_string());
-                        }
-                    }
-                }
-
-                // If all conflicts were resolved, hand the resolved result back
-                // to the caller to finalize (create the snapshot and clear the
-                // merge state). We must NOT re-save the merge state here: it is
-                // already persisted, and save_merge_state refuses to overwrite an
-                // in-progress merge — which previously aborted this path with a
-                // spurious "merge already in progress" error, leaving markers on
-                // disk.
+                // On full resolution, hand the result back to the caller to
+                // finalize (create the snapshot, clear the merge state). We do
+                // NOT re-save the merge state here: it is already persisted, and
+                // save_merge_state refuses to overwrite an in-progress merge.
                 if all_resolved {
                     println!("\n{}", "All conflicts resolved automatically!".green().bold());
                     return Ok(merge_state.merge_result);
-                } else {
-                    println!("\n{}", "Some conflicts could not be resolved automatically:".yellow().bold());
-                    for path in &failed_paths {
-                        println!("  - {}", path);
-                    }
-                    println!("These conflicts will need to be resolved manually.");
                 }
+                println!(
+                    "\n{}",
+                    "Some conflicts could not be resolved automatically; resolve them manually."
+                        .yellow()
+                        .bold()
+                );
+                // Fall through to interactive manual resolution below.
             }
         }
     }
@@ -1429,39 +1450,9 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                         println!("Applying {} merge strategy to all conflicts...",
                             if strategy == merge::MergeStrategy::Ours { "ours".cyan() } else { "theirs".cyan() });
 
-                        // Process each conflict with the given strategy
-                        let mut all_resolved = true;
-
-                        // Clone conflicts for iteration
-                        let conflicts_to_process: Vec<_> = merge_state.merge_result.conflicts.iter()
-                            .filter(|c| !c.resolved)
-                            .cloned()
-                            .collect();
-
-                        for conflict in conflicts_to_process {
-                            let resolver = ConflictResolver::new(&store, conflict.clone(), &merge_state.current_branch, &merge_state.merge_branch)?;
-
-                            // Try to apply the strategy
-                            match resolver.resolve_with_strategy(&mut store, strategy)? {
-                                Some(resolved_id) => {
-                                    // Update the conflict in the merge result
-                                    for c in merge_state.merge_result.conflicts.iter_mut() {
-                                        if c.path == conflict.path {
-                                            c.resolved = true;
-                                            c.resolution_id = Some(resolved_id);
-                                            break;
-                                        }
-                                    }
-
-                                    println!("Resolved: {} ({})", conflict.path.display(), conflict.conflict_type);
-                                },
-                                None => {
-                                    // Strategy couldn't be applied
-                                    all_resolved = false;
-                                    println!("Could not resolve: {} ({})", conflict.path.display(), conflict.conflict_type);
-                                }
-                            }
-                        }
+                        // Apply the strategy to every unresolved conflict.
+                        let all_resolved =
+                            apply_strategy_to_conflicts(&mut store, &mut merge_state, strategy)?;
 
                         // Check if all conflicts are now resolved
                         if all_resolved || merge_state.merge_result.conflicts.iter().all(|c| c.resolved) {
@@ -1710,38 +1701,10 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                     println!("Applying {} merge strategy to all conflicts...",
                         if strategy == merge::MergeStrategy::Ours { "ours".cyan() } else { "theirs".cyan() });
 
-                    // Get the merge state
+                    // Apply the strategy to every conflict.
                     let mut merge_state = dot_rev.get_merge_state()?;
-                    let mut all_resolved = true;
-
-                    // Clone conflicts for iteration
-                    let conflicts_to_process: Vec<_> = merge_state.merge_result.conflicts.clone();
-
-                    // Process each conflict with the given strategy
-                    for conflict in conflicts_to_process {
-                        let resolver = ConflictResolver::new(&store, conflict.clone(), &merge_state.current_branch, &merge_state.merge_branch)?;
-
-                        // Try to apply the strategy
-                        match resolver.resolve_with_strategy(&mut store, strategy)? {
-                            Some(resolved_id) => {
-                                // Update the conflict in the merge result
-                                for c in merge_state.merge_result.conflicts.iter_mut() {
-                                    if c.path == conflict.path {
-                                        c.resolved = true;
-                                        c.resolution_id = Some(resolved_id);
-                                        break;
-                                    }
-                                }
-
-                                println!("Resolved: {} ({})", conflict.path.display(), conflict.conflict_type);
-                            },
-                            None => {
-                                // Strategy couldn't be applied
-                                all_resolved = false;
-                                println!("Could not resolve: {} ({})", conflict.path.display(), conflict.conflict_type);
-                            }
-                        }
-                    }
+                    let all_resolved =
+                        apply_strategy_to_conflicts(&mut store, &mut merge_state, strategy)?;
 
                     // If all conflicts were resolved, create the merge snapshot
                     if all_resolved {
