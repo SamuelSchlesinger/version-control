@@ -453,6 +453,17 @@ fn get_repository() -> AppResult<(DotRev, String)> {
     Ok((dot_rev, branch))
 }
 
+/// Whether colored diff output should be emitted: only when the user didn't
+/// pass `--no-color`, stdout is a real terminal, and NO_COLOR is unset. This
+/// keeps the diff formatter's hand-rolled ANSI consistent with the `colored`
+/// crate (which already auto-detects), so piped/redirected output is clean.
+fn should_colorize(no_color_flag: bool) -> bool {
+    use std::io::IsTerminal;
+    !no_color_flag
+        && std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+}
+
 /// Builds the working-tree directory, using the stat index to skip re-hashing
 /// unchanged files, and persists the refreshed index. When `consult` is false
 /// (the `--rehash` path) every file is re-read and re-hashed, but the index is
@@ -1990,7 +2001,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
             // Create format options based on user preferences
             let format_options = diff_format::FormatOptions {
-                use_color: !no_color,
+                use_color: should_colorize(no_color),
                 show_content: content,
                 context_lines: context,
                 show_stats: true,
@@ -2109,7 +2120,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
                 // Use our formatter for consistent display
                 let format_options = diff_format::FormatOptions {
-                    use_color: !no_color,
+                    use_color: should_colorize(no_color),
                     show_content: content,
                     context_lines: context,
                     show_stats: true,
@@ -2277,7 +2288,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
                 // Use our formatter for consistent display
                 let format_options = diff_format::FormatOptions {
-                    use_color: !no_color,
+                    use_color: should_colorize(no_color),
                     show_content: content,
                     context_lines: context,
                     show_stats: true,
