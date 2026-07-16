@@ -95,7 +95,7 @@ impl Ord for ObjectId {
 
 impl PartialOrd for ObjectId {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.as_bytes().partial_cmp(other.0.as_bytes())
+        Some(self.cmp(other))
     }
 }
 
@@ -114,13 +114,13 @@ impl Debug for ObjectId {
 
 impl From<&Vec<u8>> for ObjectId {
     fn from(vec: &Vec<u8>) -> Self {
-        ObjectId(blake3::hash(&vec))
+        ObjectId(blake3::hash(vec))
     }
 }
 
 impl From<&[u8]> for ObjectId {
     fn from(bytes: &[u8]) -> Self {
-        ObjectId(blake3::hash(&bytes))
+        ObjectId(blake3::hash(bytes))
     }
 }
 
@@ -142,7 +142,7 @@ impl TryFrom<File> for ObjectId {
     }
 }
 
-impl<'a> TryFrom<&Path> for ObjectId {
+impl TryFrom<&Path> for ObjectId {
     type Error = std::io::Error;
 
     fn try_from(p: &Path) -> Result<Self, Self::Error> {

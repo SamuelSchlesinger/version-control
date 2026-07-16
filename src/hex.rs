@@ -28,7 +28,7 @@ impl<'de> Deserialize<'de> for Hex {
         // Uphold the "valid hexadecimal encoding" invariant here, at the trust
         // boundary, rather than panicking later during decode. Input arrives
         // from the network, so a malformed string must be an error, not a crash.
-        if bytes.len() % 2 != 0 {
+        if !bytes.len().is_multiple_of(2) {
             return Err(serde::de::Error::custom("hex string has odd length"));
         }
         if let Some(&bad) = bytes.iter().find(|&&b| !b.is_ascii_hexdigit()) {
@@ -87,7 +87,7 @@ impl Hex {
             }
         }
         let n = self.0.len();
-        if n % 2 != 0 {
+        if !n.is_multiple_of(2) {
             return Err("hex length is not even".to_string());
         }
 

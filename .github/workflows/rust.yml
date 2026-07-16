@@ -16,6 +16,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Install clippy
+      run: rustup component add clippy
+    - name: Clippy (deny warnings)
+      # Gate on lints. This is what would have caught the two deny-by-default
+      # clippy errors that previously shipped, plus every warning.
+      run: cargo clippy --all-targets -- -D warnings
     - name: Build
       run: cargo build --verbose
     - name: Run tests

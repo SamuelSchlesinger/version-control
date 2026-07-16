@@ -68,18 +68,17 @@ pub struct Diff {
 impl Diff {
     /// Returns whether this diff contains any content-level diffs
     pub fn has_content_diffs(&self) -> bool {
-        for (_, entry) in &self.modified {
+        for entry in self.modified.values() {
             match entry {
                 DiffEntry::FileWithContentDiff { content_diff, .. } => {
                     if content_diff.is_some() {
                         return true;
                     }
                 }
-                DiffEntry::Directory(diff) => {
-                    if diff.has_content_diffs() {
+                DiffEntry::Directory(diff)
+                    if diff.has_content_diffs() => {
                         return true;
                     }
-                }
                 _ => {}
             }
         }
@@ -241,18 +240,18 @@ impl Directory {
             .filter_map(|(file_name, dir_entry)| {
                 other.root.get(file_name).and_then(|other_dir_entry| {
                     // If content diffing is enabled and we have an object store
-                    if with_content_diff && store.is_some() {
+                    if let (true, Some(store)) = (with_content_diff, store) {
                         match (dir_entry, other_dir_entry) {
                             // For files, use the content diff method
                             (DirectoryEntry::File(_), DirectoryEntry::File(_)) => {
                                 dir_entry
-                                    .generate_content_diff(other_dir_entry, store.unwrap())
+                                    .generate_content_diff(other_dir_entry, store)
                                     .map(|diff| (file_name.clone(), diff))
                             }
                             // For directories, recursively apply content diffing
                             (DirectoryEntry::Directory(dir), DirectoryEntry::Directory(other_dir)) => {
                                 // Recursively diff the directories with content diffing enabled
-                                let nested_diff = dir.diff_with_content(other_dir, with_content_diff, store.unwrap());
+                                let nested_diff = dir.diff_with_content(other_dir, with_content_diff, store);
                                 Some((file_name.clone(), DiffEntry::Directory(Box::new(nested_diff))))
                             }
                             // For other mixed types, use regular diff
@@ -737,7 +736,7 @@ fn test_directory() {
     )
     .unwrap();
     let readme_path = String::from("README.md");
-    assert!(codebase.root.get(&readme_path).is_some());
+    assert!(codebase.root.contains_key(&readme_path));
 }
 
 #[test]

@@ -13,15 +13,13 @@ use std::collections::BTreeMap;
 impl InsertJson for InMemoryObjectStore {
     fn insert_json<A: serde::Serialize>(&mut self, thing: &A) -> Result<ObjectId, crate::dot_rev::Error> {
         let json = serde_json::to_vec_pretty(thing).map_err(crate::dot_rev::Error::Serde)?;
-        Ok(self.insert(&json).map_err(|_| crate::dot_rev::Error::IO(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        self.insert(&json).map_err(|_| crate::dot_rev::Error::IO(std::io::Error::other(
             "Failed to insert into store"
-        )))?)
+        )))
     }
 
     fn read_json<A: for<'de> serde::Deserialize<'de>>(&mut self, object_id: ObjectId) -> Result<A, crate::dot_rev::Error> {
-        match self.read(object_id).map_err(|_| crate::dot_rev::Error::IO(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        match self.read(object_id).map_err(|_| crate::dot_rev::Error::IO(std::io::Error::other(
             "Failed to read from store"
         )))? {
             None => Err(crate::dot_rev::Error::MissingObject(object_id)),

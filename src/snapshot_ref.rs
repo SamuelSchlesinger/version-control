@@ -348,7 +348,7 @@ mod tests {
             
             // Create a snapshot pointing to the previous one
             let mut previous = BTreeSet::new();
-            previous.insert(snapshots.last().unwrap().clone());
+            previous.insert(*snapshots.last().unwrap());
             
             let snapshot = SnapShot {
                 directory: dir_id,

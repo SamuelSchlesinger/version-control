@@ -55,7 +55,7 @@ fn test_remote_push_pull_workflow() {
     let revtool_clone = revtool.to_string();
     let server_handle = thread::spawn(move || {
         Command::new(revtool_clone)
-            .args(&["serve", "--port", "8766"])
+            .args(["serve", "--port", "8766"])
             .current_dir(&repo1_path_clone)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -97,10 +97,8 @@ fn test_remote_push_pull_workflow() {
     // List files in repo2 to debug
     println!("Files in repo2 after pull:");
     if let Ok(entries) = std::fs::read_dir(&repo2_path) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                println!("  - {:?}", entry.path());
-            }
+        for entry in entries.flatten() {
+            println!("  - {:?}", entry.path());
         }
     }
     

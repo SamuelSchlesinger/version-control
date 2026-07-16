@@ -9,6 +9,9 @@ pub mod http_client;
 /// HTTP server implementation
 pub mod http_server;
 
+/// A fetched object: its id and its bytes, or `None` if the remote didn't have it.
+pub type FetchedObject = (ObjectId, Option<Vec<u8>>);
+
 /// Configuration for a remote repository
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteConfig {
@@ -136,7 +139,7 @@ pub trait RemoteRepository {
     fn get_object(&self, id: ObjectId) -> Result<Option<Vec<u8>>, Self::Error>;
     
     /// Get multiple objects by IDs
-    fn get_objects(&self, ids: &[ObjectId]) -> Result<Vec<(ObjectId, Option<Vec<u8>>)>, Self::Error>;
+    fn get_objects(&self, ids: &[ObjectId]) -> Result<Vec<FetchedObject>, Self::Error>;
     
     /// Push a snapshot to a branch
     fn push_snapshot(&self, branch: &str, snapshot_id: ObjectId, force: bool) -> Result<ObjectId, Self::Error>;
@@ -230,7 +233,7 @@ pub mod sync {
             if !remote.has_object(obj_id).map_err(|e| SyncError::RemoteError(e.to_string()))? {
                 let data = store.read(obj_id)
                     .map_err(|e| SyncError::LocalError(format!("Failed to read object: {:?}", e)))?
-                    .ok_or_else(|| SyncError::ObjectMissing(obj_id))?;
+                    .ok_or(SyncError::ObjectMissing(obj_id))?;
                 objects_to_upload.push((obj_id, data));
             }
         }

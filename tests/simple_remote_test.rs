@@ -42,7 +42,7 @@ fn test_simple_remote_workflow() {
     // Start server using spawn (not thread)
     println!("Starting server...");
     let mut server = Command::new(revtool)
-        .args(&["serve", "--port", "9999"])
+        .args(["serve", "--port", "9999"])
         .current_dir(&repo1_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

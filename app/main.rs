@@ -476,7 +476,7 @@ fn ensure_clean_or_forced(
 /// avoids false positives on prose like a row of `====` in a comment.
 fn content_has_conflict_markers(content: &[u8]) -> bool {
     content.split(|&b| b == b'\n').any(|line| {
-        [b'<', b'=', b'>', b'|'].iter().any(|&marker| {
+        b"<=>|".iter().any(|&marker| {
             line.iter().take_while(|&&b| b == marker).count() >= 7
         })
     })
@@ -743,7 +743,7 @@ where
                 if let Some(ours_id) = conflict.ours_id {
                     // Get the content
                     let content = store.read(ours_id).map_err(|_| AppError::MissingObject(ours_id))?
-                        .ok_or_else(|| AppError::MissingObject(ours_id))?;
+                        .ok_or(AppError::MissingObject(ours_id))?;
 
                     // Save and mark as resolved
                     let resolved_id = resolver.resolve(store, &content)?;
@@ -770,7 +770,7 @@ where
                 if let Some(theirs_id) = conflict.theirs_id {
                     // Get the content
                     let content = store.read(theirs_id).map_err(|_| AppError::MissingObject(theirs_id))?
-                        .ok_or_else(|| AppError::MissingObject(theirs_id))?;
+                        .ok_or(AppError::MissingObject(theirs_id))?;
 
                     // Save and mark as resolved
                     let resolved_id = resolver.resolve(store, &content)?;
@@ -1690,9 +1690,9 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
                 println!("Merge completed successfully: created snapshot {}",
                     snapshot_id.to_string().cyan());
-                return Ok(());
+                Ok(())
             } else {
-                return Err(AppError::Other("Unexpected error: Merge succeeded but no merged directory available".to_string()));
+                Err(AppError::Other("Unexpected error: Merge succeeded but no merged directory available".to_string()))
             }
         },
 

@@ -133,7 +133,7 @@ impl fmt::Display for SnapShotDiff {
         writeln!(f, "=============")?;
         writeln!(f, "From: {} - {}", self.source_id, self.source_message)?;
         writeln!(f, "To:   {} - {}", self.target_id, self.target_message)?;
-        writeln!(f, "")?;
+        writeln!(f)?;
 
         if !self.has_changes() {
             writeln!(f, "No changes detected between snapshots.")?;
@@ -143,7 +143,7 @@ impl fmt::Display for SnapShotDiff {
         let total = self.added_count() + self.deleted_count() + self.modified_count();
         writeln!(f, "Changes: {} files changed, {} added, {} deleted, {} modified", 
             total, self.added_count(), self.deleted_count(), self.modified_count())?;
-        writeln!(f, "")?;
+        writeln!(f)?;
         
         // Display the directory diff
         write!(f, "{}", self.directory_diff)?;

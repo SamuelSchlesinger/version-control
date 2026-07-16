@@ -172,7 +172,7 @@ impl DotRev {
         file.write_all("dev".as_bytes())?;
 
         // Create the branches directory
-        create_dir(&root.join("branches"))?;
+        create_dir(root.join("branches"))?;
 
         // Create the init commit on the dev branch
         let mut store = DirectoryObjectStore::new(root.join("store"))?;
@@ -239,7 +239,7 @@ impl DotRev {
     }
 
     pub fn branch(&self) -> Result<String, Error> {
-        let branch = read_to_string(&self.root.join("branch"))?;
+        let branch = read_to_string(self.root.join("branch"))?;
         // A `branch` file that fails validation means the repository state is
         // damaged, not that the user passed something bad, so it maps to a
         // corruption error rather than InvalidBranchName.
@@ -313,7 +313,7 @@ impl DotRev {
     }
 
     pub fn ignores(&self) -> Result<Ignores, Error> {
-        Ok(read_json(&self.root.join("ignores"))?)
+        read_json(&self.root.join("ignores"))
     }
 
     pub fn set_ignores(&self, ignores: &Ignores) -> Result<(), Error> {

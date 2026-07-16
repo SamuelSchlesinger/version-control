@@ -178,16 +178,14 @@ impl MergeResult {
             let mut current_path = vec![];
 
             // Navigate to the parent directory
-            for i in 0..path_parts.len() - 1 {
-                let part = path_parts[i];
+            let parent_parts = &path_parts[..path_parts.len() - 1];
+            for &part in parent_parts {
                 current_path.push(part);
 
                 // We need to handle getting the directory in a way that doesn't
                 // result in multiple mutable borrows
-                let dir_exists = match current_dir.root.get(part) {
-                    Some(DirectoryEntry::Directory(_)) => true,
-                    _ => false
-                };
+                let dir_exists =
+                    matches!(current_dir.root.get(part), Some(DirectoryEntry::Directory(_)));
 
                 if !dir_exists {
                     // Create missing directory
@@ -248,6 +246,7 @@ pub enum MergeStrategy {
 
 impl MergeStrategy {
     /// Parse a string into a merge strategy
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
             "normal" => Ok(MergeStrategy::Normal),

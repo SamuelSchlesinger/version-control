@@ -175,13 +175,13 @@ impl ObjectStore for DirectoryObjectStore {
                 // Cache the object for future reads
                 self.cache_object(id, v.clone());
 
-                return Ok(Some(v));
+                Ok(Some(v))
             }
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound {
-                    return Ok(None);
+                    Ok(None)
                 } else {
-                    return Err(err);
+                    Err(err)
                 }
             }
         }

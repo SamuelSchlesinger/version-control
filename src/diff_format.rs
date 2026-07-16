@@ -68,10 +68,10 @@ impl<'a> DiffFormatter<'a> {
         for path in &self.diff.deleted {
             paths.push((path.as_str(), DiffAction::Deleted));
         }
-        for (path, _) in &self.diff.added {
+        for path in self.diff.added.keys() {
             paths.push((path.as_str(), DiffAction::Added));
         }
-        for (path, _) in &self.diff.modified {
+        for path in self.diff.modified.keys() {
             paths.push((path.as_str(), DiffAction::Modified));
         }
         paths.sort_by(|a, b| a.0.cmp(b.0));
@@ -157,7 +157,7 @@ impl<'a> DiffFormatter<'a> {
                                     }
 
                                     // Process added files
-                                    for (file_name, _) in &nested_diff.added {
+                                    for file_name in nested_diff.added.keys() {
                                         if self.options.use_color {
                                             result.push_str(&format!("  │   {}{} {}{}\n",
                                                 Colors::GREEN, "A", file_name, Colors::RESET));
@@ -298,9 +298,9 @@ impl<'a> DiffFormatter<'a> {
         // For each change, include context lines around it
         for &pos in &change_positions {
             // Include context before
-            let start = if pos > context_lines { pos - context_lines } else { 0 };
-            for i in start..pos {
-                include_lines[i] = true;
+            let start = pos.saturating_sub(context_lines);
+            for slot in include_lines[start..pos].iter_mut() {
+                *slot = true;
             }
 
             // Include the change itself
@@ -308,8 +308,8 @@ impl<'a> DiffFormatter<'a> {
 
             // Include context after
             let end = std::cmp::min(pos + context_lines + 1, changes.len());
-            for i in pos+1..end {
-                include_lines[i] = true;
+            for slot in include_lines[pos + 1..end].iter_mut() {
+                *slot = true;
             }
         }
 
