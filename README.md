@@ -78,6 +78,14 @@ While Git offers more advanced features and widespread adoption, RevTool provide
 - Educational environments
 - Projects that benefit from interactive merge resolution
 
+**Performance:** RevTool's simpler object model makes whole-tree operations
+substantially faster — snapshotting a ~72 MB / 3,000-file tree is measured at
+about **6.7× faster than `git commit`** (it skips zlib compression and delta
+encoding). The tradeoff is that incremental commits are slower, because RevTool
+has no staging index and re-hashes the tree on each snapshot. See
+[BENCHMARKS.md](BENCHMARKS.md) for the full methodology, numbers, and honest
+tradeoffs.
+
 ## Installation
 
 ### From Source
@@ -181,6 +189,7 @@ Commands:
   merge     Merge changes from another branch into the current branch
   checkout  Switch to a branch
   branch    Create or list branches
+  tag       Create, list, or delete tags (immutable release markers)
   reset     Reset all files to the last snapshot on this branch
   log       Show commit logs
   remote    Manage remote repositories
@@ -259,6 +268,16 @@ revtool ignore "*.log"        # Add a pattern
 revtool ignore --remove "*.log"  # Remove a pattern
 revtool ignore -i             # Interactive pattern management
 ```
+
+#### Tagging Releases
+```bash
+revtool tag v1.0            # Tag the current snapshot as v1.0
+revtool tag                 # List all tags
+revtool diff v1.0           # Diff the working tree against a tagged snapshot
+revtool tag --delete v1.0   # Delete a tag
+```
+Tags are immutable named references to a snapshot, usable anywhere a snapshot
+reference is accepted.
 
 #### Resetting Files
 ```bash

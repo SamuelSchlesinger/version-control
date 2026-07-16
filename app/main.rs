@@ -98,6 +98,10 @@ impl std::fmt::Display for AppError {
                 DotRevError::RemoteExists(name) => {
                     write!(f, "A remote named '{name}' already exists. Use a different name or remove it first.")
                 }
+                DotRevError::TagExists(name) => {
+                    write!(f, "A tag named '{name}' already exists. Delete it first with 'revtool tag --delete {name}'.")
+                }
+                DotRevError::TagNotFound(name) => write!(f, "Tag '{name}' not found. List tags with 'revtool tag'."),
             },
             AppError::IoError(err) => {
                 match err.kind() {
@@ -303,6 +307,19 @@ enum Command {
     Branch {
         #[arg(help = "Name of the new branch")]
         name: Option<String>,
+    },
+
+    #[clap(
+        about = "Create, list, or delete tags",
+        long_about = "Tags are immutable named references to a snapshot, useful for marking releases. \
+                      Without arguments, lists all tags. With a name, tags the current snapshot.",
+        after_help = "Examples:\n  revtool tag                # List all tags\n  revtool tag v1.0           # Tag the current snapshot as 'v1.0'\n  revtool tag --delete v1.0  # Delete the 'v1.0' tag\n  revtool diff v1.0          # Diff against a tagged snapshot"
+    )]
+    Tag {
+        #[arg(help = "Name of the tag to create")]
+        name: Option<String>,
+        #[arg(long, help = "Delete the named tag instead of creating it")]
+        delete: bool,
     },
 
     #[clap(
@@ -1923,6 +1940,38 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                             println!("* {}", branch.green().bold()); // Current branch marked with asterisk
                         } else {
                             println!("  {}", branch);
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        },
+
+        Tag { name, delete } => {
+            let (dot_rev, _) = get_repository()?;
+            match (name, delete) {
+                (Some(tag), false) => {
+                    // Tag the current snapshot.
+                    let snapshot_id = dot_rev.current_snapshot_id()?;
+                    dot_rev.create_tag(&tag, snapshot_id)?;
+                    println!("Created tag '{}' at {}", tag.green().bold(), snapshot_id.to_string().cyan());
+                    Ok(())
+                }
+                (Some(tag), true) => {
+                    dot_rev.delete_tag(&tag)?;
+                    println!("Deleted tag '{}'", tag.red().bold());
+                    Ok(())
+                }
+                (None, true) => Err(AppError::Other(
+                    "no tag given to delete.\nUsage: revtool tag --delete <name>".to_string(),
+                )),
+                (None, false) => {
+                    let tags = dot_rev.list_tags()?;
+                    if tags.is_empty() {
+                        println!("No tags");
+                    } else {
+                        for tag in tags {
+                            println!("  {}", tag);
                         }
                     }
                     Ok(())

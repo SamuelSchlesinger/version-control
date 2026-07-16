@@ -514,18 +514,21 @@ impl Directory {
                     DirectoryEntry::Directory(Box::new(directory)),
                 );
             } else if file_type.is_file() {
-                let id = ObjectId::try_from(path.as_path()).map_err(Error::IO)?;
+                // Read and hash the file exactly once: insert() hashes the bytes
+                // and returns the id, so a separate ObjectId::try_from (which
+                // reopened and re-hashed the file) was pure duplicated work.
+                let mut v = Vec::new();
+                File::options()
+                    .read(true)
+                    .open(&path)
+                    .map_err(Error::IO)?
+                    .read_to_end(&mut v)
+                    .map_err(Error::IO)?;
+                let id = store.insert(&v).map_err(Error::Store)?;
                 root.insert(
                     dir_entry.file_name().into_string().unwrap(),
                     DirectoryEntry::File(id),
                 );
-                let mut v = Vec::new();
-                let mut obj_file = File::options()
-                    .read(true)
-                    .open(&path)
-                    .map_err(Error::IO)?;
-                obj_file.read_to_end(&mut v).map_err(Error::IO)?;
-                store.insert(&v).map_err(Error::Store)?;
             } else {
                 log::warn!(
                     "Skipping unsupported file type (not a regular file or directory): {:?}",

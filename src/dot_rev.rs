@@ -44,6 +44,10 @@ pub enum Error {
     },
     /// A remote with the given name already exists
     RemoteExists(String),
+    /// A tag with the given name already exists
+    TagExists(String),
+    /// The named tag does not exist
+    TagNotFound(String),
 }
 
 /// Maximum length of a branch name, in bytes.
@@ -139,6 +143,8 @@ impl std::fmt::Display for Error {
                  name without '/' or '..'"
             ),
             Error::RemoteExists(name) => write!(f, "A remote named '{name}' already exists"),
+            Error::TagExists(name) => write!(f, "A tag named '{name}' already exists"),
+            Error::TagNotFound(name) => write!(f, "Tag not found: {name}"),
         }
     }
 }
@@ -306,6 +312,67 @@ impl DotRev {
 
         branches.sort();
         Ok(branches)
+    }
+
+    /// The path of a tag ref, validated the same way as a branch name (a tag is
+    /// stored as a single file under `.rev/tags`).
+    fn tag_path(&self, tag: &str) -> Result<PathBuf, Error> {
+        validate_branch_name(tag)?;
+        Ok(self.root.join("tags").join(tag))
+    }
+
+    /// Creates a tag pointing at `object_id`. Tags are immutable: creating one
+    /// that already exists is an error.
+    pub fn create_tag(&self, tag: &str, object_id: ObjectId) -> Result<(), Error> {
+        let path = self.tag_path(tag)?;
+        if Path::try_exists(&path)? {
+            return Err(Error::TagExists(tag.to_string()));
+        }
+        // The tags directory is created lazily so older repositories work too.
+        let tags_dir = self.root.join("tags");
+        if !Path::try_exists(&tags_dir)? {
+            create_dir(&tags_dir)?;
+        }
+        write_json(&object_id, &path)
+    }
+
+    pub fn tag_exists(&self, tag: &str) -> Result<bool, Error> {
+        Ok(Path::try_exists(&self.tag_path(tag)?)?)
+    }
+
+    pub fn tag_snapshot_id(&self, tag: &str) -> Result<ObjectId, Error> {
+        let path = self.tag_path(tag)?;
+        if !Path::try_exists(&path)? {
+            return Err(Error::TagNotFound(tag.to_string()));
+        }
+        read_json(&path)
+    }
+
+    pub fn delete_tag(&self, tag: &str) -> Result<(), Error> {
+        let path = self.tag_path(tag)?;
+        if !Path::try_exists(&path)? {
+            return Err(Error::TagNotFound(tag.to_string()));
+        }
+        remove_file(&path)?;
+        Ok(())
+    }
+
+    pub fn list_tags(&self) -> Result<Vec<String>, Error> {
+        let tags_dir = self.root.join("tags");
+        if !Path::try_exists(&tags_dir)? {
+            return Ok(Vec::new());
+        }
+        let mut tags = Vec::new();
+        for entry in read_dir(&tags_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                if let Some(name) = entry.file_name().to_str() {
+                    tags.push(name.to_string());
+                }
+            }
+        }
+        tags.sort();
+        Ok(tags)
     }
 
     pub fn store(&self) -> Result<DirectoryObjectStore, Error> {
@@ -556,6 +623,38 @@ mod tests {
         // itself and brick every subsequent command.
         assert!(dot_rev.set_branch("").is_err());
         assert_eq!(dot_rev.branch().unwrap(), "dev");
+    }
+
+    #[test]
+    fn test_tags() {
+        let temp_dir = tempdir().unwrap();
+        let rev_path = temp_dir.path().join(".rev");
+        let dot_rev = DotRev::init(rev_path).unwrap();
+
+        let snap = dot_rev.current_snapshot_id().unwrap();
+
+        // No tags initially.
+        assert!(dot_rev.list_tags().unwrap().is_empty());
+        assert!(!dot_rev.tag_exists("v1.0").unwrap());
+
+        // Create, look up, and list.
+        dot_rev.create_tag("v1.0", snap).unwrap();
+        assert!(dot_rev.tag_exists("v1.0").unwrap());
+        assert_eq!(dot_rev.tag_snapshot_id("v1.0").unwrap(), snap);
+        assert_eq!(dot_rev.list_tags().unwrap(), vec!["v1.0".to_string()]);
+
+        // Tags are immutable: re-creating is an error.
+        assert!(matches!(dot_rev.create_tag("v1.0", snap), Err(Error::TagExists(_))));
+
+        // Unknown / traversal names are rejected or reported missing.
+        assert!(matches!(dot_rev.tag_snapshot_id("nope"), Err(Error::TagNotFound(_))));
+        assert!(dot_rev.create_tag("../evil", snap).is_err());
+        assert!(!temp_dir.path().join("evil").exists());
+
+        // Delete.
+        dot_rev.delete_tag("v1.0").unwrap();
+        assert!(!dot_rev.tag_exists("v1.0").unwrap());
+        assert!(matches!(dot_rev.delete_tag("v1.0"), Err(Error::TagNotFound(_))));
     }
 
     #[test]

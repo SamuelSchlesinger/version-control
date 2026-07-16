@@ -171,8 +171,17 @@ impl SnapshotRef {
                 Self::go_back_n(dot_rev, head_id, *depth)
             }
 
-            SnapshotRef::Branch(branch) => {
-                dot_rev.branch_snapshot_id(branch).map_err(Error::from)
+            SnapshotRef::Branch(name) => {
+                // A bare name is a branch if one exists, otherwise a tag. This
+                // lets tags be used anywhere a snapshot reference is accepted
+                // (e.g. `revtool diff v1.0`).
+                if dot_rev.branch_exists(name)? {
+                    dot_rev.branch_snapshot_id(name).map_err(Error::from)
+                } else if dot_rev.tag_exists(name)? {
+                    dot_rev.tag_snapshot_id(name).map_err(Error::from)
+                } else {
+                    dot_rev.branch_snapshot_id(name).map_err(Error::from)
+                }
             }
 
             SnapshotRef::RelativeToBranch { branch, depth } => {
