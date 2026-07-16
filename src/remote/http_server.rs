@@ -49,6 +49,14 @@ const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// amplify a small request into an unbounded response (memory-exhaustion DoS).
 const MAX_OBJECTS_PER_REQUEST: usize = 10_000;
 
+/// Soft cap on the total object bytes a single GetObjects response will gather
+/// into memory. The per-request *count* limit alone doesn't bound bytes (10,000
+/// large objects would still be gigabytes), so a response stops adding objects
+/// once this budget is crossed. At least one object is always returned so the
+/// client makes progress even on a single object larger than the budget; the
+/// client re-requests whatever ids a response omits.
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
 /// HTTP server for hosting a remote repository
 pub struct HttpRemoteServer {
     dot_rev: Arc<RwLock<DotRev>>,
@@ -224,6 +232,7 @@ async fn process_request(
             let dot_rev = server.dot_rev.read().await;
             let store = dot_rev.store()?;
             let mut objects = Vec::new();
+            let mut total_bytes = 0usize;
 
             // De-duplicate so a request listing the same id thousands of times
             // cannot amplify into a huge response.
@@ -232,8 +241,16 @@ async fn process_request(
                 if !seen.insert(id) {
                     continue;
                 }
-                let data = store.read(id)?.map(super::Blob);
-                objects.push((id, data));
+                let data = store.read(id)?;
+                let size = data.as_ref().map(|d| d.len()).unwrap_or(0);
+                // Stop once the byte budget is crossed, but always return at
+                // least one object so a single oversized object still transfers.
+                // The client re-requests any ids this response leaves out.
+                if !objects.is_empty() && total_bytes + size > MAX_RESPONSE_BYTES {
+                    break;
+                }
+                total_bytes += size;
+                objects.push((id, data.map(super::Blob)));
             }
 
             Ok(RemoteResponse::Objects { objects })

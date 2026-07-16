@@ -401,19 +401,36 @@ pub mod sync {
         S::Error: std::fmt::Debug,
     {
         const BATCH_SIZE: usize = 100;
-        
+
         for chunk in object_ids.chunks(BATCH_SIZE) {
-            let objects = remote.get_objects(chunk)
-                .map_err(|e| SyncError::RemoteError(e.to_string()))?;
-            
-            for (id, data) in objects {
-                if let Some(data) = data {
-                    store.insert_with_id(id, &data)
-                        .map_err(|e| SyncError::LocalError(format!("Failed to store object: {:?}", e)))?;
+            // The server caps a response by total bytes and may return fewer
+            // objects than requested, so loop until every id in this chunk has
+            // been accounted for. A response that returns nothing for a
+            // non-empty request means no progress is possible — fail rather than
+            // spin forever.
+            let mut pending: Vec<ObjectId> = chunk.to_vec();
+            while !pending.is_empty() {
+                let objects = remote.get_objects(&pending)
+                    .map_err(|e| SyncError::RemoteError(e.to_string()))?;
+                if objects.is_empty() {
+                    return Err(SyncError::RemoteError(format!(
+                        "server returned no objects for a request of {} id(s)",
+                        pending.len()
+                    )));
                 }
+
+                let mut returned = std::collections::BTreeSet::new();
+                for (id, data) in objects {
+                    returned.insert(id);
+                    if let Some(data) = data {
+                        store.insert_with_id(id, &data)
+                            .map_err(|e| SyncError::LocalError(format!("Failed to store object: {:?}", e)))?;
+                    }
+                }
+                pending.retain(|id| !returned.contains(id));
             }
         }
-        
+
         Ok(())
     }
     
