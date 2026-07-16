@@ -215,120 +215,137 @@ impl<'a> DiffFormatter<'a> {
         let mut result = String::new();
         result.push_str("  │\n");
 
-        // Filter changes to only show the specified number of context lines
-        let filtered_changes = if self.options.context_lines > 0 {
-            self.filter_context_lines(diff.changes.as_slice(), self.options.context_lines)
-        } else {
-            diff.changes.clone()
-        };
-
-        // Add a line number counter
-        let mut line_num_old = 1;
-        let mut line_num_new = 1;
-
-        for change in filtered_changes {
-            match &change {
+        // Assign real file line numbers over the *full* change list first, so
+        // the displayed numbers reflect positions in the file rather than in
+        // the (possibly context-filtered) output.
+        let mut old_no = 1usize;
+        let mut new_no = 1usize;
+        let mut rows: Vec<NumberedRow> = Vec::with_capacity(diff.changes.len());
+        for change in &diff.changes {
+            match change {
                 Change::Added(line) => {
-                    if self.options.use_color {
-                        result.push_str(&format!("  │ {:4} │      │ {}{}{}\n", 
-                            line_num_new, Colors::GREEN, line, Colors::RESET));
-                    } else {
-                        result.push_str(&format!("  │ {:4} │      │ +{}\n", line_num_new, line));
-                    }
-                    line_num_new += 1;
+                    rows.push(NumberedRow::Added { line: line.clone(), new_no });
+                    new_no += 1;
                 }
                 Change::Removed(line) => {
-                    if self.options.use_color {
-                        result.push_str(&format!("  │      │ {:4} │ {}{}{}\n", 
-                            line_num_old, Colors::RED, line, Colors::RESET));
-                    } else {
-                        result.push_str(&format!("  │      │ {:4} │ -{}\n", line_num_old, line));
-                    }
-                    line_num_old += 1;
+                    rows.push(NumberedRow::Removed { line: line.clone(), old_no });
+                    old_no += 1;
                 }
                 Change::Modified { old, new } => {
-                    if self.options.use_color {
-                        result.push_str(&format!("  │      │ {:4} │ {}{}{}\n", 
-                            line_num_old, Colors::RED, old, Colors::RESET));
-                        result.push_str(&format!("  │ {:4} │      │ {}{}{}\n", 
-                            line_num_new, Colors::GREEN, new, Colors::RESET));
-                    } else {
-                        result.push_str(&format!("  │      │ {:4} │ -{}\n", line_num_old, old));
-                        result.push_str(&format!("  │ {:4} │      │ +{}\n", line_num_new, new));
-                    }
-                    line_num_old += 1;
-                    line_num_new += 1;
+                    rows.push(NumberedRow::Modified {
+                        old: old.clone(),
+                        new: new.clone(),
+                        old_no,
+                        new_no,
+                    });
+                    old_no += 1;
+                    new_no += 1;
                 }
                 Change::Context(line) => {
-                    result.push_str(&format!("  │ {:4} │ {:4} │  {}\n", 
-                        line_num_new, line_num_old, line));
-                    line_num_old += 1;
-                    line_num_new += 1;
+                    rows.push(NumberedRow::Context { line: line.clone(), old_no, new_no });
+                    old_no += 1;
+                    new_no += 1;
                 }
             }
         }
-        
+
+        let display_rows = if self.options.context_lines > 0 {
+            filter_context_rows(rows, self.options.context_lines)
+        } else {
+            rows
+        };
+
+        for row in &display_rows {
+            match row {
+                NumberedRow::Added { line, new_no } => {
+                    if self.options.use_color {
+                        result.push_str(&format!("  │ {:4} │      │ {}{}{}\n",
+                            new_no, Colors::GREEN, line, Colors::RESET));
+                    } else {
+                        result.push_str(&format!("  │ {:4} │      │ +{}\n", new_no, line));
+                    }
+                }
+                NumberedRow::Removed { line, old_no } => {
+                    if self.options.use_color {
+                        result.push_str(&format!("  │      │ {:4} │ {}{}{}\n",
+                            old_no, Colors::RED, line, Colors::RESET));
+                    } else {
+                        result.push_str(&format!("  │      │ {:4} │ -{}\n", old_no, line));
+                    }
+                }
+                NumberedRow::Modified { old, new, old_no, new_no } => {
+                    if self.options.use_color {
+                        result.push_str(&format!("  │      │ {:4} │ {}{}{}\n",
+                            old_no, Colors::RED, old, Colors::RESET));
+                        result.push_str(&format!("  │ {:4} │      │ {}{}{}\n",
+                            new_no, Colors::GREEN, new, Colors::RESET));
+                    } else {
+                        result.push_str(&format!("  │      │ {:4} │ -{}\n", old_no, old));
+                        result.push_str(&format!("  │ {:4} │      │ +{}\n", new_no, new));
+                    }
+                }
+                NumberedRow::Context { line, old_no, new_no } => {
+                    result.push_str(&format!("  │ {:4} │ {:4} │  {}\n", new_no, old_no, line));
+                }
+                NumberedRow::Separator => {
+                    result.push_str("  │  ... │  ... │\n");
+                }
+            }
+        }
+
         result.push_str("  │\n");
         result
     }
+}
 
-    /// Filter context lines to only show relevant parts of the diff
-    fn filter_context_lines(&self, changes: &[Change], context_lines: usize) -> Vec<Change> {
-        // If no context filtering is needed, return the original changes
-        if context_lines == 0 || changes.len() <= 2 * context_lines {
-            return changes.to_vec();
-        }
+/// A diff row carrying the real file line numbers to display for it.
+enum NumberedRow {
+    Added { line: String, new_no: usize },
+    Removed { line: String, old_no: usize },
+    Modified { old: String, new: String, old_no: usize, new_no: usize },
+    Context { line: String, old_no: usize, new_no: usize },
+    /// A gap where unchanged lines were elided.
+    Separator,
+}
 
-        let mut result = Vec::new();
-
-        // Find all change positions (non-context lines)
-        let mut change_positions = Vec::new();
-        for (i, change) in changes.iter().enumerate() {
-            match change {
-                Change::Added(_) | Change::Removed(_) | Change::Modified { .. } => {
-                    change_positions.push(i);
-                },
-                _ => {}
-            }
-        }
-
-        // Track which lines we should include
-        let mut include_lines = vec![false; changes.len()];
-
-        // For each change, include context lines around it
-        for &pos in &change_positions {
-            // Include context before
-            let start = pos.saturating_sub(context_lines);
-            for slot in include_lines[start..pos].iter_mut() {
-                *slot = true;
-            }
-
-            // Include the change itself
-            include_lines[pos] = true;
-
-            // Include context after
-            let end = std::cmp::min(pos + context_lines + 1, changes.len());
-            for slot in include_lines[pos + 1..end].iter_mut() {
-                *slot = true;
-            }
-        }
-
-        // Add separator markers where needed
-        let mut separator_needed = false;
-        for i in 0..changes.len() {
-            if include_lines[i] {
-                if separator_needed {
-                    result.push(Change::Context("...".to_string()));
-                    separator_needed = false;
-                }
-                result.push(changes[i].clone());
-            } else if i > 0 && include_lines[i-1] {
-                separator_needed = true;
-            }
-        }
-
-        result
+impl NumberedRow {
+    fn is_change(&self) -> bool {
+        !matches!(self, NumberedRow::Context { .. } | NumberedRow::Separator)
     }
+}
+
+/// Keep every changed row plus `context` rows around each change, collapsing
+/// hidden gaps (including a leading one) into a single `...` separator.
+fn filter_context_rows(rows: Vec<NumberedRow>, context: usize) -> Vec<NumberedRow> {
+    if rows.len() <= 2 * context {
+        return rows;
+    }
+
+    let mut include = vec![false; rows.len()];
+    for (i, row) in rows.iter().enumerate() {
+        if row.is_change() {
+            let start = i.saturating_sub(context);
+            let end = std::cmp::min(i + context + 1, rows.len());
+            for slot in include[start..end].iter_mut() {
+                *slot = true;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut gap_before = false;
+    for (i, row) in rows.into_iter().enumerate() {
+        if include[i] {
+            if gap_before {
+                out.push(NumberedRow::Separator);
+                gap_before = false;
+            }
+            out.push(row);
+        } else {
+            gap_before = true;
+        }
+    }
+    out
 }
 
 impl<'a> fmt::Display for DiffFormatter<'a> {
