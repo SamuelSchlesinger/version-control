@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     env::current_dir,
     fs::{create_dir, create_dir_all, read_dir, read_to_string, remove_file, File},
     io::Write,
@@ -187,7 +186,7 @@ impl DotRev {
         let snapshot = SnapShot {
             directory,
             message: String::from("init"),
-            previous: BTreeSet::new(),
+            previous: Vec::new(),
         };
         let snapshot_id = store.insert_json(&snapshot)?;
         write_json(&snapshot_id, &root.join("branches").join("dev"))?;

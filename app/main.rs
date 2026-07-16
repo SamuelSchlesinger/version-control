@@ -1262,6 +1262,17 @@ Use 'revtool usage <command>' for detailed help on a specific command.
 
 fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
     use Command::*;
+    use std::io::IsTerminal;
+
+    // Interactive prompts (dialoguer) require a real terminal on stdin; without
+    // one they spin in an unbreakable redraw loop. Fail fast with a clear error
+    // instead of hanging when -i is used in a pipe, script, or CI.
+    if interactive && !std::io::stdin().is_terminal() {
+        return Err(AppError::Other(
+            "interactive mode (-i) needs a terminal for input; \
+             re-run without -i (e.g. pass -m for a message)".to_string(),
+        ));
+    }
 
     // Special cases that don't require an initialized repository
     match &cmd {
@@ -1738,15 +1749,12 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 // Save the merged directory
                 let dir_id = store.insert_json(&merged_dir)?;
 
-                // Create a merge snapshot
-                let mut parents = BTreeSet::new();
-                parents.insert(ours_id);
-                parents.insert(theirs_id);
-
+                // Create a merge snapshot with parents in mainline order:
+                // ours (the current branch) first, then theirs.
                 let snapshot = SnapShot {
                     message: merge_msg,
                     directory: dir_id,
-                    previous: parents,
+                    previous: vec![ours_id, theirs_id],
                 };
 
                 // Save the snapshot
@@ -2107,7 +2115,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 }
 
                 // Just take the first parent for now
-                snapshot_id = *snapshot.previous.iter().next().unwrap();
+                snapshot_id = *snapshot.previous.first().unwrap();
             }
             Ok(())
         }
@@ -2289,7 +2297,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let directory_id = store.insert_json(&directory)?;
             let snap = SnapShot {
                 directory: directory_id,
-                previous: vec![old_tip].into_iter().collect(),
+                previous: vec![old_tip],
                 message: commit_message,
             };
 

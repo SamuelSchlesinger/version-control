@@ -1,6 +1,5 @@
 use crate::object_id::ObjectId;
 use crate::snapshot::SnapShot;
-use std::collections::BTreeSet;
 
 #[test]
 fn test_snapshot_creation() {
@@ -8,7 +7,7 @@ fn test_snapshot_creation() {
     let snapshot = SnapShot {
         message: "Initial commit".to_string(),
         directory,
-        previous: BTreeSet::new(),
+        previous: Vec::new(),
     };
 
     assert_eq!(snapshot.message, "Initial commit");
@@ -21,8 +20,7 @@ fn test_snapshot_with_previous() {
     let directory = ObjectId::from(&b"1234567890abcdef1234567890abcdef12345678"[..]);
     let previous_id = ObjectId::from(&b"abcdef1234567890abcdef1234567890abcdef12"[..]);
 
-    let mut previous = BTreeSet::new();
-    previous.insert(previous_id);
+    let previous = vec![previous_id];
 
     let snapshot = SnapShot {
         message: "Second commit".to_string(),
@@ -42,9 +40,7 @@ fn test_snapshot_with_multiple_previous() {
     let previous_id1 = ObjectId::from(&b"abcdef1234567890abcdef1234567890abcdef12"[..]);
     let previous_id2 = ObjectId::from(&b"fedcba0987654321fedcba0987654321fedcba09"[..]);
 
-    let mut previous = BTreeSet::new();
-    previous.insert(previous_id1);
-    previous.insert(previous_id2);
+    let previous = vec![previous_id1, previous_id2];
 
     let snapshot = SnapShot {
         message: "Merge commit".to_string(),
@@ -66,19 +62,19 @@ fn test_snapshot_equality() {
     let snapshot1 = SnapShot {
         message: "Same commit".to_string(),
         directory,
-        previous: BTreeSet::new(),
+        previous: Vec::new(),
     };
 
     let snapshot2 = SnapShot {
         message: "Same commit".to_string(),
         directory,
-        previous: BTreeSet::new(),
+        previous: Vec::new(),
     };
 
     let snapshot3 = SnapShot {
         message: "Different commit".to_string(),
         directory,
-        previous: BTreeSet::new(),
+        previous: Vec::new(),
     };
 
     assert_eq!(snapshot1, snapshot2);
@@ -90,8 +86,7 @@ fn test_snapshot_clone() {
     let directory = ObjectId::from(&b"1234567890abcdef1234567890abcdef12345678"[..]);
     let previous_id = ObjectId::from(&b"abcdef1234567890abcdef1234567890abcdef12"[..]);
 
-    let mut previous = BTreeSet::new();
-    previous.insert(previous_id);
+    let previous = vec![previous_id];
 
     let snapshot = SnapShot {
         message: "Original commit".to_string(),

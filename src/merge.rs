@@ -212,15 +212,12 @@ impl MergeResult {
             Err(e) => return Err(Error::Other(format!("Failed to save directory: {}", e))),
         };
 
-        // Create a snapshot with multiple parents
-        let mut parents = BTreeSet::new();
-        parents.insert(self.ours_id);
-        parents.insert(self.theirs_id);
-
+        // Parents in mainline order: ours (the branch we're on) first, then
+        // theirs. Order is significant for log / HEAD~N.
         let snapshot = SnapShot {
             message,
             directory: dir_id,
-            previous: parents,
+            previous: vec![self.ours_id, self.theirs_id],
         };
 
         // Store and return the snapshot ID

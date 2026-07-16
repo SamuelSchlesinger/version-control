@@ -2,7 +2,7 @@ use crate::directory::{Directory, DirectoryEntry};
 use crate::object_store::ObjectStore;
 use crate::object_store::in_memory::InMemoryObjectStore;
 use crate::snapshot::SnapShot;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// This is an integration test that simulates basic version control operations
 /// It creates a directory structure, commits it to a repository, then makes changes
@@ -40,7 +40,7 @@ fn test_basic_version_control_flow() {
     let initial_snapshot = SnapShot {
         message: "Initial commit".to_string(),
         directory: root_dir_id,
-        previous: BTreeSet::new(),
+        previous: Vec::new(),
     };
 
     let snapshot_serialized = serde_json::to_vec(&initial_snapshot).unwrap();
@@ -80,8 +80,7 @@ fn test_basic_version_control_flow() {
     let new_root_dir_id = store.insert(&new_root_serialized).unwrap();
 
     // 3. Create a new snapshot with the previous one as parent
-    let mut previous = BTreeSet::new();
-    previous.insert(snapshot_id);
+    let previous = vec![snapshot_id];
 
     let second_snapshot = SnapShot {
         message: "Update file1.txt".to_string(),
@@ -137,7 +136,7 @@ fn test_branching() {
     let initial_snapshot = SnapShot {
         message: "Initial commit".to_string(),
         directory: root_dir_id,
-        previous: BTreeSet::new(),
+        previous: Vec::new(),
     };
 
     let snapshot_serialized = serde_json::to_vec(&initial_snapshot).unwrap();
@@ -158,8 +157,7 @@ fn test_branching() {
     let feature_a_serialized = serde_json::to_vec(&feature_a_dir).unwrap();
     let feature_a_dir_id = store.insert(&feature_a_serialized).unwrap();
 
-    let mut previous = BTreeSet::new();
-    previous.insert(snapshot_id);
+    let previous = vec![snapshot_id];
 
     let feature_a_snapshot = SnapShot {
         message: "Feature A changes".to_string(),
@@ -249,7 +247,7 @@ fn test_merging() {
     let initial_snapshot = SnapShot {
         message: "Initial commit".to_string(),
         directory: root_dir_id,
-        previous: BTreeSet::new(),
+        previous: Vec::new(),
     };
 
     let snapshot_serialized = serde_json::to_vec(&initial_snapshot).unwrap();
@@ -271,8 +269,7 @@ fn test_merging() {
     let feature_serialized = serde_json::to_vec(&feature_dir).unwrap();
     let feature_dir_id = store.insert(&feature_serialized).unwrap();
 
-    let mut previous = BTreeSet::new();
-    previous.insert(snapshot_id);
+    let previous = vec![snapshot_id];
 
     let feature_snapshot = SnapShot {
         message: "Feature branch changes".to_string(),
@@ -324,9 +321,7 @@ fn test_merging() {
     let merged_dir_id = store.insert(&merged_serialized).unwrap();
 
     // The merge snapshot has both feature and main as parents
-    let mut merge_previous = BTreeSet::new();
-    merge_previous.insert(feature_snapshot_id);
-    merge_previous.insert(main_snapshot_id);
+    let merge_previous = vec![feature_snapshot_id, main_snapshot_id];
 
     let merge_snapshot = SnapShot {
         message: "Merge feature into main".to_string(),

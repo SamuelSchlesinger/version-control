@@ -159,7 +159,7 @@ mod tests {
         directory::{Directory, DirectoryEntry},
         object_store::in_memory::InMemoryObjectStore,
     };
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_snapshot_diff_no_changes() {
@@ -183,7 +183,7 @@ mod tests {
         let snapshot = SnapShot {
             message: "Test snapshot".to_string(),
             directory: dir_id,
-            previous: BTreeSet::new(),
+            previous: Vec::new(),
         };
         
         // Serialize the snapshot
@@ -225,7 +225,7 @@ mod tests {
         let snapshot1 = SnapShot {
             message: "First snapshot".to_string(),
             directory: dir1_id,
-            previous: BTreeSet::new(),
+            previous: Vec::new(),
         };
         
         // Serialize the first snapshot
@@ -250,8 +250,7 @@ mod tests {
         let dir2_id = store.insert(&dir2_bytes).unwrap();
         
         // Create second snapshot
-        let mut previous = BTreeSet::new();
-        previous.insert(snapshot1_id);
+        let previous = vec![snapshot1_id];
         
         let snapshot2 = SnapShot {
             message: "Second snapshot".to_string(),

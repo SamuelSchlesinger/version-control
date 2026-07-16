@@ -99,7 +99,7 @@ impl ObjectIdRef {
                         }
                         
                         // Continue with the first parent
-                        current_id = *snapshot.previous.iter().next().unwrap();
+                        current_id = *snapshot.previous.first().unwrap();
                     }
                 }
                 
@@ -218,7 +218,7 @@ impl SnapshotRef {
             }
             
             // Just take the first parent (this is similar to how git handles ~N notation)
-            current_id = *snapshot.previous.iter().next().unwrap();
+            current_id = *snapshot.previous.first().unwrap();
         }
 
         Ok(current_id)
@@ -277,7 +277,7 @@ mod tests {
         dot_rev::DotRev,
         snapshot::SnapShot,
     };
-    use std::{collections::BTreeSet, str::FromStr};
+    use std::str::FromStr;
     use tempfile::TempDir;
 
     #[test]
@@ -356,8 +356,7 @@ mod tests {
             let dir_id = store.insert_json(&dir).unwrap();
             
             // Create a snapshot pointing to the previous one
-            let mut previous = BTreeSet::new();
-            previous.insert(*snapshots.last().unwrap());
+            let previous = vec![*snapshots.last().unwrap()];
             
             let snapshot = SnapShot {
                 directory: dir_id,

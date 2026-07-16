@@ -1,53 +1,24 @@
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
 
 use crate::object_id::ObjectId;
 
-/// Represents a snapshot (commit) in the version history.
+/// A snapshot (commit) in the version history.
 ///
-/// A `SnapShot` is a point-in-time capture of a repository's state, forming a node
-/// in the version history graph. Each snapshot contains:
-///
-/// - A commit message describing the changes
-/// - A reference to the directory structure (contents) at this point in time
-/// - References to parent snapshots (can be multiple in case of a merge)
-///
-/// The version history is structured as a directed acyclic graph (DAG), allowing
-/// for complex version histories including branches and merges.
-///
-/// # Storage
-///
-/// Snapshots are stored in the object store as serialized JSON, and are referenced
-/// by their `ObjectId`. Branch references simply store the `ObjectId` of their
-/// most recent snapshot.
-///
-/// # Example
-///
-/// Creating a new snapshot:
+/// Captures the repository at a point in time — a message, a reference to the
+/// directory tree, and its parent snapshots (more than one for a merge) — and
+/// forms a node in the directed acyclic history graph. Snapshots are stored in
+/// the object store as JSON, addressed by their `ObjectId`.
 ///
 /// ```
-/// # fn main() {
-/// # // Mock structs for doctest
-/// # #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-/// # struct ObjectId(u64);
-/// # impl ObjectId {
-/// #     fn from<T>(_: T) -> Self { ObjectId(0) }
-/// # }
-/// # struct SnapShot {
-/// #     message: String,
-/// #     directory: ObjectId,
-/// #     previous: std::collections::BTreeSet<ObjectId>
-/// # }
-/// use std::collections::BTreeSet;
+/// use lib::snapshot::SnapShot;
+/// use lib::object_id::ObjectId;
 ///
-/// // Create a snapshot with a message, directory reference and parent references
 /// let snapshot = SnapShot {
-///     message: String::from("Initial commit"),
-///     directory: ObjectId::from(&b"directory_id"[..]),
-///     previous: BTreeSet::from([ObjectId::from(&b"parent_snapshot_id"[..])])
+///     message: "Initial commit".to_string(),
+///     directory: ObjectId::from(&b"directory contents"[..]),
+///     previous: vec![], // the first commit has no parent
 /// };
-/// # }
+/// assert!(snapshot.previous.is_empty());
 /// ```
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct SnapShot {
@@ -58,12 +29,13 @@ pub struct SnapShot {
     /// This is an `ObjectId` pointing to a serialized `Directory` in the object store.
     pub directory: ObjectId,
 
-    /// References to parent snapshots.
+    /// References to parent snapshots, **in order**: the first element is the
+    /// mainline (first) parent — the branch that was checked out when this
+    /// snapshot was made. `log` and `HEAD~N` follow this first parent, so the
+    /// ordering is load-bearing and must not be replaced with a set (which would
+    /// order by hash and make "the first parent" meaningless).
     ///
-    /// For a normal commit, this will contain a single parent.
-    /// For a merge commit, this will contain multiple parents.
-    /// For the first commit in a repository, this will be empty.
-    ///
-    /// Each element is an `ObjectId` pointing to a serialized `SnapShot` in the object store.
-    pub previous: BTreeSet<ObjectId>,
+    /// Empty for the initial commit; one entry for an ordinary snapshot; two or
+    /// more for a merge (`[ours, theirs]`).
+    pub previous: Vec<ObjectId>,
 }
