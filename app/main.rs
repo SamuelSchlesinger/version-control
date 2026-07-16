@@ -389,8 +389,9 @@ enum Command {
 
     #[clap(
         about = "Pull changes from a remote repository",
-        long_about = "Download snapshots from a remote repository and update the local branch",
-        after_help = "Examples:\n  revtool pull origin                # Pull current branch from origin\n  revtool pull origin main           # Pull main branch from origin"
+        long_about = "Download snapshots from a remote repository and fast-forward the local branch. \
+                      Refuses to discard local commits or overwrite uncommitted changes.",
+        after_help = "Examples:\n  revtool pull origin dev            # Pull the dev branch from origin\n  revtool pull origin dev --force    # Discard local uncommitted changes while pulling"
     )]
     Pull {
         #[arg(help = "Remote repository name")]
@@ -398,6 +399,14 @@ enum Command {
 
         #[arg(help = "Branch to pull (defaults to current branch)")]
         branch: Option<String>,
+
+        #[arg(
+            short,
+            long,
+            default_value = "false",
+            help = "Discard uncommitted local changes instead of refusing to pull"
+        )]
+        force: bool,
     },
 
     #[clap(
@@ -2362,58 +2371,93 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             Ok(())
         }
         
-        Pull { remote, branch } => {
+        Pull { remote, branch, force } => {
             let (dot_rev, current_branch) = get_repository()?;
             let mut store = dot_rev.store()?;
-            
-            // Get the branch to pull
-            let branch_to_pull = branch.as_ref().unwrap_or(&current_branch);
-            
-            // Get remote configuration
+
+            let branch_to_pull = branch.as_ref().unwrap_or(&current_branch).clone();
+
             let remote_config = dot_rev.get_remote(&remote)?
                 .ok_or_else(|| AppError::Other(format!("Remote '{}' not found. Use 'revtool remote add' to configure it.", remote)))?;
-            
+
             // Create HTTP client, authenticating with REVTOOL_TOKEN if set.
             let token = std::env::var("REVTOOL_TOKEN").ok();
             let client = HttpRemoteClient::with_token(remote_config.url.clone(), token)
                 .map_err(|e| AppError::Other(format!("Failed to connect to remote: {}", e)))?;
-            
+
             println!("Pulling branch '{}' from remote '{}'...", branch_to_pull.cyan(), remote.cyan());
-            
-            // Pull the branch
-            match sync::pull_branch(&client, &mut store, branch_to_pull)
-                .map_err(|e| AppError::Other(format!("Pull failed: {}", e)))? {
-                Some(new_snapshot_id) => {
-                    // Check if this is a new branch
-                    let is_new_branch = !dot_rev.branch_exists(branch_to_pull)?;
-                    
-                    // Update the local branch pointer (this creates the branch if it doesn't exist)
-                    dot_rev.set_branch_snapshot_id(branch_to_pull, new_snapshot_id)?;
-                    
-                    // If we pulled the current branch, update the working directory
-                    if branch_to_pull == &current_branch {
-                        let snapshot: SnapShot = store.read_json(new_snapshot_id)?;
-                        let directory: Directory = store.read_json(snapshot.directory)?;
-                        
-                        let cwd = dot_rev.work_dir().to_path_buf();
-                        directory.write(&store, &cwd, false)
-                            .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
-                        
-                        println!("Updated working directory to match remote snapshot");
+
+            // Download the objects and learn the remote's tip. This does NOT move
+            // any local ref yet.
+            let remote_id = sync::pull_branch(&client, &mut store, &branch_to_pull)
+                .map_err(|e| AppError::Other(format!("Pull failed: {}", e)))?
+                .ok_or_else(|| AppError::Other(format!(
+                    "Branch '{branch_to_pull}' does not exist on remote '{remote}'"
+                )))?;
+
+            let branch_existed = dot_rev.branch_exists(&branch_to_pull)?;
+
+            // Refuse to move the local branch backward or sideways: only a
+            // fast-forward (the remote is a descendant of our tip) is allowed, so
+            // local commits can never be silently discarded.
+            if branch_existed {
+                let local_tip = dot_rev.branch_snapshot_id(&branch_to_pull)?;
+                if local_tip == remote_id {
+                    println!("{}", "Already up to date.".green());
+                    return Ok(());
+                }
+                match merge::find_common_ancestor(&store, local_tip, remote_id)? {
+                    Some(base) if base == local_tip => {} // fast-forward: remote is ahead
+                    Some(base) if base == remote_id => {
+                        println!("{}", "Already up to date (local branch is ahead of the remote).".green());
+                        return Ok(());
                     }
-                    
-                    if is_new_branch {
-                        println!("{}", format!("Created new branch '{}' from remote", branch_to_pull).green().bold());
+                    _ => {
+                        return Err(AppError::Other(format!(
+                            "Refusing to pull: local branch '{branch_to_pull}' has diverged from the \
+                             remote and pulling would discard your local commits. Push your work, or \
+                             reset the branch to the remote first."
+                        )));
                     }
-                    
-                    println!("{}", format!("Pull completed successfully! Branch '{}' updated to {}", 
-                        branch_to_pull, new_snapshot_id.to_string().cyan()).green().bold());
-                },
-                None => {
-                    println!("{}", format!("Branch '{}' not found on remote '{}'", branch_to_pull, remote).yellow());
                 }
             }
-            
+
+            let pulling_current = branch_to_pull == current_branch;
+
+            if pulling_current {
+                // Protect uncommitted work, then bring the working tree exactly in
+                // line with the pulled snapshot: remove files that were dropped
+                // upstream and lay down the new ones.
+                ensure_clean_or_forced(&dot_rev, &mut store, force, "pulling")?;
+
+                let old_tip = dot_rev.branch_snapshot_id(&current_branch)?;
+                let old_snap: SnapShot = store.read_json(old_tip)?;
+                let old_tree: Directory = store.read_json(old_snap.directory)?;
+                let new_snap: SnapShot = store.read_json(remote_id)?;
+                let new_tree: Directory = store.read_json(new_snap.directory)?;
+
+                let cwd = dot_rev.work_dir().to_path_buf();
+                remove_tracked_absent(&old_tree, &new_tree, &cwd)?;
+                new_tree.write(&store, &cwd, false)
+                    .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
+
+                dot_rev.set_branch_snapshot_id(&branch_to_pull, remote_id)?;
+                println!("{}", format!(
+                    "Fast-forwarded '{branch_to_pull}' to {} and updated the working tree.",
+                    remote_id.to_string().cyan()
+                ).green().bold());
+            } else {
+                // Pulling a branch we're not on: only update its ref. Don't touch
+                // the working tree, and say so plainly rather than claiming a
+                // working-directory update happened.
+                dot_rev.set_branch_snapshot_id(&branch_to_pull, remote_id)?;
+                let verb = if branch_existed { "Fast-forwarded" } else { "Created" };
+                println!("{}", format!(
+                    "{verb} branch '{branch_to_pull}' to {}. Run 'revtool checkout {branch_to_pull}' to check it out.",
+                    remote_id.to_string().cyan()
+                ).green().bold());
+            }
+
             Ok(())
         }
         
