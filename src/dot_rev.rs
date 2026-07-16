@@ -248,6 +248,7 @@ impl DotRev {
         Ok(self.root.join("branches").join(branch))
     }
 
+    /// The name of the currently checked-out branch.
     pub fn branch(&self) -> Result<String, Error> {
         let branch = read_to_string(self.root.join("branch"))?;
         // A `branch` file that fails validation means the repository state is
@@ -261,6 +262,7 @@ impl DotRev {
         Ok(branch)
     }
 
+    /// Sets the currently checked-out branch (does not touch the working tree).
     pub fn set_branch(&self, new_branch: &str) -> Result<(), Error> {
         validate_branch_name(new_branch)?;
         let mut file = File::options()
@@ -272,6 +274,8 @@ impl DotRev {
         Ok(())
     }
 
+    /// The snapshot a branch points at. Errors with `BranchNotFound` if it
+    /// doesn't exist.
     pub fn branch_snapshot_id(&self, branch: &str) -> Result<ObjectId, Error> {
         let branch_path = self.branch_path(branch)?;
         if !Path::try_exists(&branch_path)? {
@@ -280,15 +284,19 @@ impl DotRev {
         read_json(&branch_path)
     }
 
+    /// Points a branch at a snapshot, creating the branch ref if needed.
     pub fn set_branch_snapshot_id(&self, branch: &str, object_id: ObjectId) -> Result<(), Error> {
         write_json(&object_id, &self.branch_path(branch)?)
     }
 
+    /// The snapshot the current branch points at.
     pub fn current_snapshot_id(&self) -> Result<ObjectId, Error> {
         let branch = self.branch()?;
         self.branch_snapshot_id(&branch)
     }
 
+    /// Creates a branch at the current snapshot. Note: this is a **no-op if the
+    /// branch already exists** (the CLI pre-checks to report that as an error).
     pub fn create_branch(&self, new_branch: &str) -> Result<(), Error> {
         if !self.branch_exists(new_branch)? {
             let snapshot_id = self.current_snapshot_id()?;
