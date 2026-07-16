@@ -22,7 +22,12 @@ pub enum Change {
     Context(String),
 }
 
-/// A set of changes to a file, represented as a sequence of line-by-line changes
+/// A line-by-line diff of one file between two versions.
+///
+/// `changes` holds one entry per line of the *combined* diff, including every
+/// unchanged line as a `Change::Context`, so its length (and memory use) is
+/// proportional to the whole file, not just the changed region. The windowed,
+/// human-readable output is produced later by `diff_format::filter_context_rows`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentDiff {
     /// The sequence of changes
@@ -73,15 +78,24 @@ impl ContentDiff {
             None => return Err(Error::ObjectMissing(new_id)),
         };
 
-        // Convert bytes to strings for diffing
+        // A line-by-line diff is meaningless for binary content, and
+        // from_utf8_lossy would replace every invalid byte with U+FFFD and
+        // produce garbage. Detect binary by a NUL byte (as git does) and report
+        // the difference without trying to render it.
+        let is_binary = old_content.contains(&0) || new_content.contains(&0);
+        if is_binary {
+            return Ok(Some(ContentDiff {
+                changes: vec![Change::Context("(binary file differs)".to_string())],
+                old_id,
+                new_id,
+            }));
+        }
+
         let old_str = String::from_utf8_lossy(&old_content);
         let new_str = String::from_utf8_lossy(&new_content);
-
-        // Split into lines
         let old_lines: Vec<&str> = old_str.lines().collect();
         let new_lines: Vec<&str> = new_str.lines().collect();
 
-        // Generate diff using the Myers diff algorithm
         let changes = diff_lines(&old_lines, &new_lines);
 
         Ok(Some(ContentDiff {
@@ -128,8 +142,9 @@ impl fmt::Display for ContentDiff {
     }
 }
 
-/// Compute the diff between two sequences of lines.
-/// This implementation uses a simplified version of the Myers diff algorithm.
+/// Compute the diff between two sequences of lines using a longest-common-
+/// subsequence (LCS) dynamic program, then pair adjacent removed/added lines
+/// into single "modified" entries for display.
 fn diff_lines(old_lines: &[&str], new_lines: &[&str]) -> Vec<Change> {
     // For a simplified implementation, we'll use a basic Longest Common Subsequence approach
     let lcs = longest_common_subsequence(old_lines, new_lines);
@@ -187,8 +202,8 @@ fn diff_lines(old_lines: &[&str], new_lines: &[&str]) -> Vec<Change> {
         i += 1;
     }
     
-    // Add context lines if needed (typically 3 lines before and after changes)
-    // This is a simplification - a real implementation would handle this more elegantly
+    // Context-window filtering (showing only N lines around each change) is
+    // applied later, at render time, in diff_format::filter_context_rows.
     optimized_changes
 }
 
