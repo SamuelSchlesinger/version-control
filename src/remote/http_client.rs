@@ -7,6 +7,9 @@ use super::{RemoteRequest, RemoteResponse, RemoteRepository};
 pub struct HttpRemoteClient {
     client: Client,
     base_url: String,
+    /// Optional bearer token sent with every request, for servers that require
+    /// authentication.
+    token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -33,21 +36,28 @@ impl std::error::Error for HttpClientError {}
 impl HttpRemoteClient {
     /// Create a new HTTP client for a remote repository
     pub fn new(base_url: String) -> Result<Self, HttpClientError> {
+        Self::with_token(base_url, None)
+    }
+
+    /// Create a new HTTP client that authenticates with a bearer token.
+    pub fn with_token(base_url: String, token: Option<String>) -> Result<Self, HttpClientError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(HttpClientError::Network)?;
-        
-        Ok(HttpRemoteClient { client, base_url })
+
+        Ok(HttpRemoteClient { client, base_url, token })
     }
-    
+
     /// Send a request to the remote repository
     fn send_request(&self, request: &RemoteRequest) -> Result<RemoteResponse, HttpClientError> {
         let url = format!("{}/api", self.base_url);
-        
-        let response = self.client
-            .post(&url)
-            .json(request)
+
+        let mut builder = self.client.post(&url).json(request);
+        if let Some(token) = &self.token {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder
             .send()
             .map_err(HttpClientError::Network)?;
         

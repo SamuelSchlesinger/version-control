@@ -388,6 +388,12 @@ enum Command {
 
         #[arg(long, default_value = "127.0.0.1", help = "Address to bind to")]
         host: String,
+
+        #[arg(
+            long,
+            help = "Require this bearer token on every request (or set REVTOOL_TOKEN)"
+        )]
+        token: Option<String>,
     },
 }
 
@@ -2270,8 +2276,9 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let remote_config = dot_rev.get_remote(&remote)?
                 .ok_or_else(|| AppError::Other(format!("Remote '{}' not found. Use 'revtool remote add' to configure it.", remote)))?;
             
-            // Create HTTP client
-            let client = HttpRemoteClient::new(remote_config.url.clone())
+            // Create HTTP client, authenticating with REVTOOL_TOKEN if set.
+            let token = std::env::var("REVTOOL_TOKEN").ok();
+            let client = HttpRemoteClient::with_token(remote_config.url.clone(), token)
                 .map_err(|e| AppError::Other(format!("Failed to connect to remote: {}", e)))?;
             
             // Get the local snapshot to push
@@ -2298,8 +2305,9 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let remote_config = dot_rev.get_remote(&remote)?
                 .ok_or_else(|| AppError::Other(format!("Remote '{}' not found. Use 'revtool remote add' to configure it.", remote)))?;
             
-            // Create HTTP client
-            let client = HttpRemoteClient::new(remote_config.url.clone())
+            // Create HTTP client, authenticating with REVTOOL_TOKEN if set.
+            let token = std::env::var("REVTOOL_TOKEN").ok();
+            let client = HttpRemoteClient::with_token(remote_config.url.clone(), token)
                 .map_err(|e| AppError::Other(format!("Failed to connect to remote: {}", e)))?;
             
             println!("Pulling branch '{}' from remote '{}'...", branch_to_pull.cyan(), remote.cyan());
@@ -2341,32 +2349,40 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             Ok(())
         }
         
-        Serve { port, host } => {
+        Serve { port, host, token } => {
             let (dot_rev, _) = get_repository()?;
-            
+
+            // Token from --token, falling back to the REVTOOL_TOKEN env var so
+            // it need not appear in the process list.
+            let token = token.or_else(|| std::env::var("REVTOOL_TOKEN").ok());
+
             // Create the server
-            let server = HttpRemoteServer::new(dot_rev.root().clone())
+            let server = HttpRemoteServer::with_token(dot_rev.root().clone(), token.clone())
                 .map_err(|e| AppError::Other(format!("Failed to create server: {}", e)))?;
-            
+
             let addr = format!("{}:{}", host, port);
-            
+
             // Create a runtime for the async server
             let runtime = tokio::runtime::Runtime::new()
                 .map_err(|e| AppError::Other(format!("Failed to create runtime: {}", e)))?;
-            
-            // The server has no authentication: anyone who can reach the port
-            // can read every object and push to any branch. That is fine on
-            // loopback, but binding to a routable address exposes the repo to
-            // the whole network, so warn loudly.
+
+            // Without a token the server is unauthenticated: anyone who can
+            // reach the port can read every object and push to any branch. That
+            // is fine on loopback, but binding to a routable address exposes the
+            // repo to the whole network, so warn loudly.
             let is_loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
-            if !is_loopback {
-                eprintln!(
-                    "{} serving on {} with no authentication. Anyone who can reach \
-                     this address can read and overwrite this repository. Only do this \
-                     on a trusted network.",
-                    "WARNING:".yellow().bold(),
-                    addr
-                );
+            if token.is_none() {
+                if !is_loopback {
+                    eprintln!(
+                        "{} serving on {} with no authentication. Anyone who can reach \
+                         this address can read and overwrite this repository. Pass --token \
+                         (or set REVTOOL_TOKEN), or only serve on a trusted network.",
+                        "WARNING:".yellow().bold(),
+                        addr
+                    );
+                }
+            } else {
+                println!("Requiring a bearer token for all requests.");
             }
 
             println!("Starting repository server on {}...", addr.cyan().bold());

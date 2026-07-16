@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use axum::{
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::post,
     Router,
@@ -29,14 +29,25 @@ const MAX_OBJECTS_PER_REQUEST: usize = 10_000;
 /// HTTP server for hosting a remote repository
 pub struct HttpRemoteServer {
     dot_rev: Arc<RwLock<DotRev>>,
+    /// If set, every request must present `Authorization: Bearer <token>`.
+    token: Option<String>,
 }
 
 impl HttpRemoteServer {
     /// Create a new HTTP server for a repository
     pub fn new(repo_path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_token(repo_path, None)
+    }
+
+    /// Create a server that requires the given bearer token, if any.
+    pub fn with_token(
+        repo_path: PathBuf,
+        token: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let dot_rev = DotRev::existing(repo_path)?;
         Ok(HttpRemoteServer {
             dot_rev: Arc::new(RwLock::new(dot_rev)),
+            token,
         })
     }
     
@@ -61,8 +72,21 @@ impl HttpRemoteServer {
 /// Handle incoming requests
 async fn handle_request(
     State(server): State<Arc<HttpRemoteServer>>,
+    headers: HeaderMap,
     Json(request): Json<RemoteRequest>,
 ) -> impl IntoResponse {
+    // Enforce bearer-token auth if the server was started with a token.
+    if let Some(expected) = &server.token {
+        if !bearer_token_matches(&headers, expected) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(RemoteResponse::Error {
+                    message: "missing or invalid authentication token".to_string(),
+                }),
+            );
+        }
+    }
+
     match process_request(&server, request).await {
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(e) => {
@@ -72,6 +96,31 @@ async fn handle_request(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response))
         }
     }
+}
+
+/// Checks the `Authorization: Bearer <token>` header against the expected token
+/// in constant time (to avoid leaking the token via timing).
+fn bearer_token_matches(headers: &HeaderMap, expected: &str) -> bool {
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(token) => constant_time_eq(token.as_bytes(), expected.as_bytes()),
+        None => false,
+    }
+}
+
+/// Length-independent, data-independent byte comparison.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Process a remote request

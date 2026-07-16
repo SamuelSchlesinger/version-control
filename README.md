@@ -274,8 +274,18 @@ revtool remote add origin http://host:8080
 revtool push origin dev               # Upload the dev branch
 revtool pull origin dev               # Download the dev branch
 ```
-The server is unauthenticated; bind it to a trusted network only (it defaults
-to `127.0.0.1`).
+
+To require authentication, start the server with a token (via `--token` or the
+`REVTOOL_TOKEN` environment variable); clients then supply the same token in
+`REVTOOL_TOKEN`:
+
+```bash
+revtool serve --port 8080 --token "$SECRET"   # server rejects requests without it
+REVTOOL_TOKEN="$SECRET" revtool pull origin dev
+```
+
+Without a token the server is unauthenticated, so bind it to a trusted network
+only (it defaults to `127.0.0.1`).
 
 ## Common Workflows
 
