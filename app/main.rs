@@ -525,6 +525,21 @@ fn should_colorize(no_color_flag: bool) -> bool {
 /// still refreshed. This is the single entry point for turning the working tree
 /// into a [`Directory`], so snapshot, status, and the dirty-tree guard all share
 /// the same (safe) fast path.
+/// Translates a working-tree read error into an `AppError`. The too-deep case
+/// gets its own message: it is a structural limit, not a permissions problem,
+/// so the generic "check permissions" wording was actively misleading.
+fn map_worktree_error(
+    e: lib::directory::Error<lib::object_store::directory::DirectoryObjectStore>,
+) -> AppError {
+    match e {
+        lib::directory::Error::TooDeeplyNested { depth, limit } => AppError::Other(format!(
+            "a directory is nested too deeply to snapshot ({depth} levels; the maximum is {limit}).\n\
+             Flatten the offending directory, or exclude it with 'revtool ignore <path>'."
+        )),
+        other => AppError::FailedToReadDirectory(format!("{other}")),
+    }
+}
+
 fn build_working_tree(
     dot_rev: &DotRev,
     store: &mut lib::object_store::directory::DirectoryObjectStore,
@@ -534,7 +549,7 @@ fn build_working_tree(
     let root = dot_rev.work_dir().to_path_buf();
     let mut index = dot_rev.load_index();
     let directory = Directory::from_working_tree(&root, &ignores, store, &mut index, consult)
-        .map_err(|e| AppError::FailedToReadDirectory(format!("{}", e)))?;
+        .map_err(map_worktree_error)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -2394,13 +2409,11 @@ fn cmd_changes(content: bool, json: bool, context: usize, no_color: bool) -> App
     let (dot_rev, branch) = get_repository()?;
     let mut store = dot_rev.store()?;
     let old_tip = dot_rev.branch_snapshot_id(&branch)?;
-    let ignores = dot_rev.ignores()?;
 
-    let directory = Directory::new(
-        dot_rev.work_dir(),
-        &ignores,
-        &mut store
-    ).map_err(|e| AppError::FailedToReadDirectory(format!("{}", e)))?;
+    // Use the stat-cache-backed builder, same as `status`/`snap`, so all three
+    // commands answer "what changed?" consistently (and quickly on large trees)
+    // instead of `changes` alone re-hashing every file.
+    let directory = build_working_tree(&dot_rev, &mut store, true)?;
 
     let snapshot: SnapShot = store.read_json(old_tip)?;
     let old_directory: Directory = store.read_json(snapshot.directory)?;

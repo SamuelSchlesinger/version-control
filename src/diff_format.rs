@@ -2,9 +2,50 @@ use std::fmt;
 
 use crate::{
     content_diff::{Change, ContentDiff},
-    directory::{Diff, DiffEntry},
+    directory::{Diff, DiffEntry, DirectoryEntry},
     snapshot_diff::SnapShotDiff,
 };
+
+/// Renders a path for display, quoting and escaping it when it contains control
+/// characters or a double quote. A filename may legally contain a newline;
+/// printed raw it forges what looks like a second status/diff line (a file named
+/// `evil.txt\nD real.txt` renders as two entries). Quoting neutralizes that.
+fn escape_path(s: &str) -> String {
+    if s.chars().any(|c| c.is_control() || c == '"') {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+/// Flattens an added entry to the individual files it introduces, so an added
+/// directory is reported file-by-file (`A dir/a.txt`, `A dir/b.txt`) rather than
+/// collapsed to a single opaque `A dir` line. An empty directory yields itself.
+fn flatten_added_leaves(prefix: &str, entry: &DirectoryEntry, out: &mut Vec<String>) {
+    match entry {
+        DirectoryEntry::File(_) => out.push(prefix.to_string()),
+        DirectoryEntry::Directory(dir) if dir.root.is_empty() => out.push(prefix.to_string()),
+        DirectoryEntry::Directory(dir) => {
+            for (name, child) in &dir.root {
+                flatten_added_leaves(&format!("{prefix}/{name}"), child, out);
+            }
+        }
+    }
+}
 
 /// Color codes for terminal output
 pub struct Colors;
@@ -54,6 +95,17 @@ impl<'a> DiffFormatter<'a> {
         Self { diff, options }
     }
 
+    /// Wraps `text` in an ANSI color when color is enabled, otherwise returns it
+    /// unchanged. Collapses the pervasive `if use_color { .. } else { .. }`
+    /// duplication that this formatter used to repeat at every output site.
+    fn colorize(&self, color: &str, text: &str) -> String {
+        if self.options.use_color {
+            format!("{color}{text}{}", Colors::RESET)
+        } else {
+            text.to_string()
+        }
+    }
+
     /// Format the diff as a string
     pub fn format(&self) -> String {
         let mut result = String::new();
@@ -63,48 +115,38 @@ impl<'a> DiffFormatter<'a> {
             self.format_stats(&mut result);
         }
 
-        // Get sorted paths for consistent output
-        let mut paths = Vec::new();
+        // Get sorted paths for consistent output. Added directories are
+        // expanded to the individual files they introduce so nothing is hidden
+        // behind a single collapsed `A dir` line.
+        let mut paths: Vec<(String, DiffAction)> = Vec::new();
         for path in &self.diff.deleted {
-            paths.push((path.as_str(), DiffAction::Deleted));
+            paths.push((path.clone(), DiffAction::Deleted));
         }
-        for path in self.diff.added.keys() {
-            paths.push((path.as_str(), DiffAction::Added));
+        for (path, entry) in &self.diff.added {
+            let mut leaves = Vec::new();
+            flatten_added_leaves(path, entry, &mut leaves);
+            for leaf in leaves {
+                paths.push((leaf, DiffAction::Added));
+            }
         }
         for path in self.diff.modified.keys() {
-            paths.push((path.as_str(), DiffAction::Modified));
+            paths.push((path.clone(), DiffAction::Modified));
         }
-        paths.sort_by(|a, b| a.0.cmp(b.0));
+        paths.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Format each path
-        for (path, action) in paths {
+        for (path, action) in &paths {
+            let path = path.as_str();
             match action {
                 DiffAction::Deleted => {
-                    if self.options.use_color {
-                        result.push_str(&format!("{}{} {}{}\n", 
-                            Colors::RED, "D", path, Colors::RESET));
-                    } else {
-                        result.push_str(&format!("D {}\n", path));
-                    }
+                    result.push_str(&format!("{}\n", self.colorize(Colors::RED, &format!("D {}", escape_path(path)))));
                 }
                 DiffAction::Added => {
-                    if let Some(_entry) = self.diff.added.get(path) {
-                        if self.options.use_color {
-                            result.push_str(&format!("{}{} {}{}\n", 
-                                Colors::GREEN, "A", path, Colors::RESET));
-                        } else {
-                            result.push_str(&format!("A {}\n", path));
-                        }
-                    }
+                    result.push_str(&format!("{}\n", self.colorize(Colors::GREEN, &format!("A {}", escape_path(path)))));
                 }
                 DiffAction::Modified => {
                     if let Some(entry) = self.diff.modified.get(path) {
-                        if self.options.use_color {
-                            result.push_str(&format!("{}{} {}{}\n", 
-                                Colors::YELLOW, "M", path, Colors::RESET));
-                        } else {
-                            result.push_str(&format!("M {}\n", path));
-                        }
+                        result.push_str(&format!("{}\n", self.colorize(Colors::YELLOW, &format!("M {}", escape_path(path)))));
 
                         // Show content diff if enabled
                         if self.options.show_content {
@@ -123,12 +165,8 @@ impl<'a> DiffFormatter<'a> {
                                     for (file_name, entry) in &nested_diff.modified {
                                         let nested_path = format!("{}/{}", path, file_name);
 
-                                        if self.options.use_color {
-                                            result.push_str(&format!("  │   {}{} {}{}\n",
-                                                Colors::YELLOW, "M", file_name, Colors::RESET));
-                                        } else {
-                                            result.push_str(&format!("  │   M {}\n", file_name));
-                                        }
+                                        result.push_str(&format!("  │   {}\n",
+                                            self.colorize(Colors::YELLOW, &format!("M {}", escape_path(file_name)))));
 
                                         // Show content diff for this file if it has one
                                         match entry {
@@ -156,24 +194,20 @@ impl<'a> DiffFormatter<'a> {
                                         }
                                     }
 
-                                    // Process added files
-                                    for file_name in nested_diff.added.keys() {
-                                        if self.options.use_color {
-                                            result.push_str(&format!("  │   {}{} {}{}\n",
-                                                Colors::GREEN, "A", file_name, Colors::RESET));
-                                        } else {
-                                            result.push_str(&format!("  │   A {}\n", file_name));
+                                    // Process added files (expand added subdirectories to leaves)
+                                    for (file_name, entry) in &nested_diff.added {
+                                        let mut leaves = Vec::new();
+                                        flatten_added_leaves(file_name, entry, &mut leaves);
+                                        for leaf in leaves {
+                                            result.push_str(&format!("  │   {}\n",
+                                                self.colorize(Colors::GREEN, &format!("A {}", escape_path(&leaf)))));
                                         }
                                     }
 
                                     // Process deleted files
                                     for file_name in &nested_diff.deleted {
-                                        if self.options.use_color {
-                                            result.push_str(&format!("  │   {}{} {}{}\n",
-                                                Colors::RED, "D", file_name, Colors::RESET));
-                                        } else {
-                                            result.push_str(&format!("  │   D {}\n", file_name));
-                                        }
+                                        result.push_str(&format!("  │   {}\n",
+                                            self.colorize(Colors::RED, &format!("D {}", escape_path(file_name)))));
                                     }
 
                                     result.push_str("  │\n");
@@ -190,25 +224,29 @@ impl<'a> DiffFormatter<'a> {
     }
 
     fn format_stats(&self, result: &mut String) {
-        let total = self.diff.added.len() + self.diff.deleted.len() + self.diff.modified.len();
-        
-        if self.options.use_color {
-            result.push_str(&format!("{}Summary: {} file(s) changed, {} added, {} removed, {} modified{}\n\n",
-                Colors::BOLD,
-                total,
-                self.diff.added.len(),
-                self.diff.deleted.len(),
-                self.diff.modified.len(),
-                Colors::RESET
-            ));
-        } else {
-            result.push_str(&format!("Summary: {} file(s) changed, {} added, {} removed, {} modified\n\n",
-                total,
-                self.diff.added.len(),
-                self.diff.deleted.len(),
-                self.diff.modified.len()
-            ));
-        }
+        // Count the actual files an added directory introduces, not the single
+        // directory entry, so the summary doesn't undercount (adding a folder of
+        // 5 files reported "1 added").
+        let added: usize = self
+            .diff
+            .added
+            .iter()
+            .map(|(path, entry)| {
+                let mut leaves = Vec::new();
+                flatten_added_leaves(path, entry, &mut leaves);
+                leaves.len()
+            })
+            .sum();
+        let removed = self.diff.deleted.len();
+        let modified = self.diff.modified.len();
+        let total = added + removed + modified;
+        let files = if total == 1 { "file" } else { "files" };
+
+        let line = format!(
+            "Summary: {total} {files} changed, {added} added, {removed} removed, {modified} modified"
+        );
+        result.push_str(&self.colorize(Colors::BOLD, &line));
+        result.push_str("\n\n");
     }
 
     fn format_content_diff(&self, _path: &str, diff: &ContentDiff) -> String {
@@ -452,7 +490,7 @@ mod tests {
         let formatter = DiffFormatter::new(&diff, options);
         let output = formatter.format();
         
-        assert!(output.contains("Summary: 3 file(s) changed"));
+        assert!(output.contains("Summary: 3 files changed"));
         assert!(output.contains("A file1.txt"));
         assert!(output.contains("D file2.txt"));
         assert!(output.contains("M file3.txt"));
