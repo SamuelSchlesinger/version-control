@@ -37,6 +37,74 @@ pub enum Error {
     MergeInProgress,
     /// No merge is in progress
     NoMergeInProgress,
+    /// A branch name is not usable as a single filesystem component
+    InvalidBranchName {
+        name: String,
+        reason: &'static str,
+    },
+}
+
+/// Maximum length of a branch name, in bytes.
+///
+/// Branch names become file names under `.rev/branches`, so this stays well
+/// below the 255-byte limit common to ext4/APFS/NTFS.
+const MAX_BRANCH_NAME_LEN: usize = 200;
+
+/// Checks that `name` is safe to use as a single path component under
+/// `.rev/branches`.
+///
+/// Branch names reach this crate from the CLI and from remotes, and every
+/// branch operation resolves to `.rev/branches/<name>`. Without this check a
+/// name like `../../x` escapes the repository entirely, and an empty name
+/// resolves to the `branches` directory itself. Rejecting the name is the only
+/// thing standing between a remote and an arbitrary file write, so this is
+/// deliberately a strict allowlist rather than a sanitiser: nothing is
+/// rewritten or stripped, because silently accepting a *different* branch than
+/// the user typed is its own bug.
+pub fn validate_branch_name(name: &str) -> Result<(), Error> {
+    let reject = |reason: &'static str| {
+        Err(Error::InvalidBranchName {
+            name: name.to_string(),
+            reason,
+        })
+    };
+
+    if name.is_empty() {
+        return reject("it is empty");
+    }
+    if name.len() > MAX_BRANCH_NAME_LEN {
+        return reject("it is longer than 200 bytes");
+    }
+    if name == "." || name == ".." {
+        return reject("it refers to a directory rather than a branch");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return reject("it contains a path separator");
+    }
+    if name.contains('\0') {
+        return reject("it contains a null byte");
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return reject("it contains a control character");
+    }
+    // Leading '-' would be swallowed as a flag by any CLI that echoes the name
+    // back into a command line, and leading/trailing whitespace is invisible in
+    // `revtool branch` output.
+    if name.starts_with('-') {
+        return reject("it starts with '-'");
+    }
+    if name.trim() != name {
+        return reject("it has leading or trailing whitespace");
+    }
+
+    // Belt and braces: whatever the rules above allow must still be exactly one
+    // ordinary path component. This catches anything platform-specific the
+    // explicit checks miss (e.g. Windows drive-relative names like `C:x`).
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(c)), None) if c == name => Ok(()),
+        _ => reject("it is not a simple name"),
+    }
 }
 
 /// Current state of an in-progress merge
@@ -63,6 +131,11 @@ impl std::fmt::Display for Error {
             Error::CorruptRepository(msg) => write!(f, "Corrupt repository: {}", msg),
             Error::MergeInProgress => write!(f, "A merge is already in progress. Resolve conflicts and use 'revtool merge --continue' or use 'revtool merge --abort' to cancel"),
             Error::NoMergeInProgress => write!(f, "No merge is in progress"),
+            Error::InvalidBranchName { name, reason } => write!(
+                f,
+                "Invalid branch name {name:?}: {reason}. Branch names must be a single \
+                 name without '/' or '..'"
+            ),
         }
     }
 }
@@ -91,8 +164,9 @@ impl DotRev {
         let mut file = File::options()
             .create(true)
             .write(true)
-            .open(&root.join("branch"))?;
-        file.write("dev".as_bytes())?;
+            .truncate(true)
+            .open(root.join("branch"))?;
+        file.write_all("dev".as_bytes())?;
 
         // Create the branches directory
         create_dir(&root.join("branches"))?;
@@ -134,21 +208,41 @@ impl DotRev {
         }
     }
 
+    /// The only place a branch name is turned into a path.
+    ///
+    /// Every branch operation goes through here, so validation cannot be
+    /// bypassed by adding a new call site.
+    fn branch_path(&self, branch: &str) -> Result<PathBuf, Error> {
+        validate_branch_name(branch)?;
+        Ok(self.root.join("branches").join(branch))
+    }
+
     pub fn branch(&self) -> Result<String, Error> {
-        Ok(read_to_string(&self.root.join("branch"))?)
+        let branch = read_to_string(&self.root.join("branch"))?;
+        // A `branch` file that fails validation means the repository state is
+        // damaged, not that the user passed something bad, so it maps to a
+        // corruption error rather than InvalidBranchName.
+        validate_branch_name(&branch).map_err(|_| {
+            Error::CorruptRepository(format!(
+                "the current branch file contains an unusable branch name {branch:?}"
+            ))
+        })?;
+        Ok(branch)
     }
 
     pub fn set_branch(&self, new_branch: &str) -> Result<(), Error> {
+        validate_branch_name(new_branch)?;
         let mut file = File::options()
             .write(true)
+            .create(true)
             .truncate(true)
-            .open(&self.root.join("branch"))?;
-        file.write(new_branch.as_bytes())?;
+            .open(self.root.join("branch"))?;
+        file.write_all(new_branch.as_bytes())?;
         Ok(())
     }
 
     pub fn branch_snapshot_id(&self, branch: &str) -> Result<ObjectId, Error> {
-        let branch_path = self.root.join("branches").join(branch);
+        let branch_path = self.branch_path(branch)?;
         if !Path::try_exists(&branch_path)? {
             return Err(Error::BranchNotFound(branch.to_string()));
         }
@@ -156,7 +250,7 @@ impl DotRev {
     }
 
     pub fn set_branch_snapshot_id(&self, branch: &str, object_id: ObjectId) -> Result<(), Error> {
-        write_json(&object_id, &self.root.join("branches").join(&branch))
+        write_json(&object_id, &self.branch_path(branch)?)
     }
 
     pub fn current_snapshot_id(&self) -> Result<ObjectId, Error> {
@@ -165,15 +259,15 @@ impl DotRev {
     }
 
     pub fn create_branch(&self, new_branch: &str) -> Result<(), Error> {
-        if !self.branch_exists(&new_branch)? {
+        if !self.branch_exists(new_branch)? {
             let snapshot_id = self.current_snapshot_id()?;
-            return write_json(&snapshot_id, &self.root.join("branches").join(&new_branch));
+            return write_json(&snapshot_id, &self.branch_path(new_branch)?);
         }
         Ok(())
     }
 
     pub fn branch_exists(&self, branch: &str) -> Result<bool, Error> {
-        Ok(Path::try_exists(&self.root.join("branches").join(&branch))?)
+        Ok(Path::try_exists(&self.branch_path(branch)?)?)
     }
 
     pub fn list_branches(&self) -> Result<Vec<String>, Error> {
@@ -375,6 +469,72 @@ mod tests {
         let branches = dot_rev.list_branches().unwrap();
         assert!(branches.contains(&"dev".to_string()));
         assert!(branches.contains(&"test-branch".to_string()));
+    }
+
+    #[test]
+    fn test_valid_branch_names_are_accepted() {
+        for name in [
+            "dev",
+            "feature",
+            "feature-1",
+            "feature_1",
+            "release/2.0".replace('/', "-").as_str(),
+            "a",
+            "ünïcode",
+            "..dotted",
+            "dot.ted",
+        ] {
+            assert!(
+                validate_branch_name(name).is_ok(),
+                "expected {name:?} to be a valid branch name"
+            );
+        }
+    }
+
+    #[test]
+    fn test_branch_name_traversal_is_rejected() {
+        // Each of these previously resolved to a path outside .rev/branches.
+        for name in [
+            "",
+            ".",
+            "..",
+            "../evil",
+            "../../pwned",
+            "../branch",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "with\nnewline",
+            "trailing ",
+            " leading",
+            "-flag",
+        ] {
+            assert!(
+                validate_branch_name(name).is_err(),
+                "expected {name:?} to be rejected as a branch name"
+            );
+        }
+        assert!(validate_branch_name(&"x".repeat(201)).is_err());
+    }
+
+    #[test]
+    fn test_traversal_branch_cannot_escape_repository() {
+        let temp_dir = tempdir().unwrap();
+        let rev_path = temp_dir.path().join(".rev");
+        let dot_rev = DotRev::init(rev_path).unwrap();
+
+        // The regression this guards: `revtool branch ../../pwned` used to
+        // write a file into the working tree, outside .rev entirely.
+        assert!(dot_rev.create_branch("../../pwned").is_err());
+        assert!(!temp_dir.path().join("pwned").exists());
+
+        assert!(dot_rev.create_branch("../evil").is_err());
+        assert!(!temp_dir.path().join(".rev").join("evil").exists());
+
+        // And the empty name, which used to resolve to the branches directory
+        // itself and brick every subsequent command.
+        assert!(dot_rev.set_branch("").is_err());
+        assert_eq!(dot_rev.branch().unwrap(), "dev");
     }
 
     #[test]

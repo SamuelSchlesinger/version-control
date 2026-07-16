@@ -26,6 +26,30 @@ pub enum Error<Store: ObjectStore> {
     ObjectMissing(ObjectId),
     Store(Store::Error),
     IO(std::io::Error),
+    /// A snapshot contained an entry name that is not a safe path component.
+    UnsafeEntryName(String),
+}
+
+/// Checks that a snapshot entry name is a single, ordinary path component.
+///
+/// Entry names come out of deserialised snapshot JSON, which may have been
+/// fetched from an untrusted remote. [`Directory::write`] joins them onto the
+/// working-tree path, so a name like `../../.ssh/authorized_keys` would let a
+/// remote write anywhere the user can write. Nothing else validates these
+/// names, so this is the boundary.
+fn is_safe_entry_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return false;
+    }
+    // Must be exactly one normal component and nothing else.
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(c)), None) if c == name
+    )
 }
 
 impl<Store: ObjectStore> From<std::io::Error> for Error<Store> {
@@ -264,57 +288,87 @@ impl Directory {
         path: &Path,
         delete_absent: bool,
     ) -> Result<(), Error<Store>> {
-        if read_dir(path).is_ok() {
-            // First, write/update all files and directories in the snapshot
-            for (file_name, entry) in self.root.iter() {
-                match entry {
-                    DirectoryEntry::File(id) => {
-                        let v = store.read(*id).map_err(Error::Store)?;
-                        match v {
-                            Some(v) => {
-                                let mut f = File::options()
-                                    .create(true)
-                                    .write(true)
-                                    .truncate(true)
-                                    .open(path.join(file_name))?;
-                                f.write_all(&v)?;
-                            }
-                            None => return Err(Error::ObjectMissing(*id)),
+        // Previously this was `if read_dir(path).is_ok()`, which turned an
+        // unreadable or missing target directory into a silent success.
+        read_dir(path)?;
+
+        // Reject the whole write before touching the disk if any entry name is
+        // unsafe, so a malicious snapshot cannot half-apply.
+        self.check_entry_names_recursively()?;
+
+        // First, write/update all files and directories in the snapshot
+        for (file_name, entry) in self.root.iter() {
+            match entry {
+                DirectoryEntry::File(id) => {
+                    let v = store.read(*id).map_err(Error::Store)?;
+                    match v {
+                        Some(v) => {
+                            let mut f = File::options()
+                                .create(true)
+                                .write(true)
+                                .truncate(true)
+                                .open(path.join(file_name))?;
+                            f.write_all(&v)?;
                         }
+                        None => return Err(Error::ObjectMissing(*id)),
                     }
-                    DirectoryEntry::Directory(dir) => {
-                        let dir_path = PathBuf::from(path).join(file_name);
+                }
+                DirectoryEntry::Directory(dir) => {
+                    let dir_path = PathBuf::from(path).join(file_name);
 
-                        // Create the directory if it doesn't exist
-                        if !Path::try_exists(&dir_path)? {
-                            std::fs::create_dir(&dir_path)?;
-                        }
+                    // Create the directory if it doesn't exist
+                    if !Path::try_exists(&dir_path)? {
+                        std::fs::create_dir(&dir_path)?;
+                    }
 
-                        dir.write(store, dir_path.as_path(), delete_absent)?;
+                    dir.write(store, dir_path.as_path(), delete_absent)?;
+                }
+            }
+        }
+
+        // If delete_absent is true, remove files that aren't in the snapshot
+        if delete_absent {
+            for entry in read_dir(path)? {
+                let entry = entry?;
+                // A non-UTF-8 name cannot be in `self.root` (whose keys are
+                // Strings), so it is by definition absent from the snapshot.
+                // Previously `.into_string().unwrap()` panicked here instead.
+                let file_name = match entry.file_name().into_string() {
+                    Ok(name) => name,
+                    Err(raw) => {
+                        log::warn!(
+                            "skipping file with non-UTF-8 name during delete pass: {raw:?}"
+                        );
+                        continue;
+                    }
+                };
+
+                // Skip special directories like .rev, .git, etc.
+                if file_name == ".rev" || file_name == ".git" {
+                    continue;
+                }
+
+                if !self.root.contains_key(&file_name) {
+                    let entry_path = entry.path();
+                    if entry.file_type()?.is_dir() {
+                        std::fs::remove_dir_all(&entry_path)?;
+                    } else {
+                        std::fs::remove_file(&entry_path)?;
                     }
                 }
             }
+        }
+        Ok(())
+    }
 
-            // If delete_absent is true, remove files that aren't in the snapshot
-            if delete_absent {
-                for entry in read_dir(path)? {
-                    let entry = entry?;
-                    let file_name = entry.file_name().into_string().unwrap();
-
-                    // Skip special directories like .rev, .git, etc.
-                    if file_name == ".rev" || file_name == ".git" {
-                        continue;
-                    }
-
-                    if !self.root.contains_key(&file_name) {
-                        let entry_path = entry.path();
-                        if entry.file_type()?.is_dir() {
-                            std::fs::remove_dir_all(&entry_path)?;
-                        } else {
-                            std::fs::remove_file(&entry_path)?;
-                        }
-                    }
-                }
+    /// Validates every entry name in this tree before any of it is written.
+    fn check_entry_names_recursively<Store: ObjectStore>(&self) -> Result<(), Error<Store>> {
+        for (file_name, entry) in self.root.iter() {
+            if !is_safe_entry_name(file_name) {
+                return Err(Error::UnsafeEntryName(file_name.clone()));
+            }
+            if let DirectoryEntry::Directory(dir) = entry {
+                dir.check_entry_names_recursively::<Store>()?;
             }
         }
         Ok(())
@@ -737,4 +791,56 @@ fn test_ignores_add_pattern() {
 
     // Try to match the new pattern
     assert!(ignores.is_ignored(&PathBuf::from("document.docx")));
+}
+
+#[test]
+fn test_unsafe_entry_names_are_rejected() {
+    assert!(is_safe_entry_name("a.txt"));
+    assert!(is_safe_entry_name("dir"));
+    assert!(is_safe_entry_name("weird name with spaces"));
+    assert!(is_safe_entry_name("..dotfile"));
+
+    for bad in ["", ".", "..", "../evil", "a/b", "a\\b", "/abs", "\0nul"] {
+        assert!(!is_safe_entry_name(bad), "expected {bad:?} to be rejected");
+    }
+}
+
+#[test]
+fn test_malicious_snapshot_cannot_write_outside_target() {
+    use crate::object_store::in_memory::InMemoryObjectStore;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let target = tempdir.path().join("repo");
+    std::fs::create_dir(&target).unwrap();
+
+    let mut store = InMemoryObjectStore::default();
+    let id = store.insert(b"owned").unwrap();
+
+    // A snapshot as it might arrive from an untrusted remote.
+    let mut root = BTreeMap::new();
+    root.insert("../escaped.txt".to_string(), DirectoryEntry::File(id));
+    let evil = Directory { root };
+
+    let err = evil.write(&store, &target, false);
+    assert!(matches!(err, Err(Error::UnsafeEntryName(_))), "got {err:?}");
+    assert!(
+        !tempdir.path().join("escaped.txt").exists(),
+        "write escaped the target directory"
+    );
+
+    // And nested one level down.
+    let mut inner = BTreeMap::new();
+    inner.insert("../../escaped2.txt".to_string(), DirectoryEntry::File(id));
+    let mut outer = BTreeMap::new();
+    outer.insert(
+        "sub".to_string(),
+        DirectoryEntry::Directory(Box::new(Directory { root: inner })),
+    );
+    let evil2 = Directory { root: outer };
+
+    assert!(matches!(
+        evil2.write(&store, &target, false),
+        Err(Error::UnsafeEntryName(_))
+    ));
+    assert!(!tempdir.path().join("escaped2.txt").exists());
 }

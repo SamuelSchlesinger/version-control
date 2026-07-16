@@ -203,7 +203,9 @@ fn test_merge_with_conflict() {
     // Verify conflicts were detected
     assert!(!merge_result.success);
     assert_eq!(merge_result.conflicts.len(), 1);
-    assert!(merge_result.merged_directory.is_none());
+    // The merged tree is retained even on conflict (it holds every
+    // non-conflicting change; conflicted paths stay at their base version).
+    assert!(merge_result.merged_directory.is_some());
     
     // Check the conflict details
     let conflict = &merge_result.conflicts[0];
@@ -257,7 +259,9 @@ fn test_merge_add_delete_conflict() {
     // Verify conflicts were detected
     assert!(!merge_result.success);
     assert_eq!(merge_result.conflicts.len(), 1);
-    assert!(merge_result.merged_directory.is_none());
+    // The merged tree is retained even on conflict (it holds every
+    // non-conflicting change; conflicted paths stay at their base version).
+    assert!(merge_result.merged_directory.is_some());
     
     // Check the conflict details
     let conflict = &merge_result.conflicts[0];
@@ -303,7 +307,9 @@ fn test_merge_with_both_added_files() {
     // Verify conflicts were detected for the same-name file with different content
     assert!(!merge_result.success);
     assert_eq!(merge_result.conflicts.len(), 1);
-    assert!(merge_result.merged_directory.is_none());
+    // The merged tree is retained even on conflict (it holds every
+    // non-conflicting change; conflicted paths stay at their base version).
+    assert!(merge_result.merged_directory.is_some());
     
     // Check the conflict details
     let conflict = &merge_result.conflicts[0];

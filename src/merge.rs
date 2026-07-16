@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    content_diff::{Change, ContentDiff},
     directory::{Diff, Directory, DirectoryEntry},
     dot_rev::InsertJson,
     object_id::ObjectId,
@@ -322,8 +321,15 @@ impl ConflictResolver {
         })
     }
 
-    /// Formats content with conflict markers for manual resolution,
-    /// including base content for better context
+    /// Formats content with standard git-style diff3 conflict markers for
+    /// manual resolution.
+    ///
+    /// When all three versions are present (the common both-modified case) the
+    /// markers are produced by the same Myers/diff3 engine used for
+    /// auto-merging, so only the genuinely conflicting hunks are marked and the
+    /// output matches what git users expect. For add/add or modify/delete
+    /// conflicts, where one side has no content, we fall back to a simple
+    /// two-way marker block.
     fn create_marked_content(
         base: &Option<Vec<u8>>,
         ours: &Option<Vec<u8>>,
@@ -331,54 +337,35 @@ impl ConflictResolver {
         our_branch: &str,
         their_branch: &str,
     ) -> Vec<u8> {
+        if let (Some(base_c), Some(ours_c), Some(theirs_c)) = (base, ours, theirs) {
+            // Default MergeOptions uses ConflictStyle::Diff3 (shows the base).
+            // Ok means diffy found no textual conflict; either way the returned
+            // bytes are what the user should edit.
+            let marked = match diffy::MergeOptions::new().merge_bytes(base_c, ours_c, theirs_c) {
+                Ok(clean) => clean,
+                Err(conflicted) => conflicted,
+            };
+            return relabel_conflict_markers(&marked, our_branch, their_branch);
+        }
+
+        // Fallback: one side is absent (add/add or modify/delete). Emit a plain
+        // two-way block using the same marker vocabulary git uses.
         let mut result = Vec::new();
-
-        // Add a Git-style conflict marker header
-        result.extend_from_slice(format!("<<<<<<< HEAD (Current branch: {})\n", our_branch).as_bytes());
-
-        // Add our content if available
+        result.extend_from_slice(format!("<<<<<<< {our_branch} (ours)\n").as_bytes());
         if let Some(content) = ours {
             result.extend_from_slice(content);
             if !content.ends_with(b"\n") {
                 result.push(b'\n');
             }
         }
-
-        // Add separator
         result.extend_from_slice(b"=======\n");
-
-        // Add their content if available
         if let Some(content) = theirs {
             result.extend_from_slice(content);
             if !content.ends_with(b"\n") {
                 result.push(b'\n');
             }
         }
-
-        // Add closer with branch name
-        result.extend_from_slice(format!(">>>>>>> {} (Incoming changes)\n", their_branch).as_bytes());
-
-        // Add base version for reference (similar to Git's conflict style with diff3)
-        if let Some(content) = base {
-            result.extend_from_slice(b"||||||| BASE (common ancestor)\n");
-            result.extend_from_slice(content);
-            if !content.ends_with(b"\n") {
-                result.push(b'\n');
-            }
-        }
-
-        // Add a helpful comment at the end
-        result.extend_from_slice(b"\n# CONFLICT RESOLUTION INSTRUCTIONS\n");
-        result.extend_from_slice(b"# 1. Edit this file to resolve the conflict\n");
-        result.extend_from_slice(b"# 2. Remove ALL conflict marker lines including:\n");
-        result.extend_from_slice(b"#    - <<<<<<< HEAD\n");
-        result.extend_from_slice(b"#    - =======\n");
-        result.extend_from_slice(format!("#    - >>>>>>> {}\n", their_branch).as_bytes());
-        result.extend_from_slice(b"#    - ||||||| BASE\n");
-        result.extend_from_slice(b"#    - All lines starting with #\n");
-        result.extend_from_slice(b"# 3. Save the file\n");
-        result.extend_from_slice(b"# 4. Continue the merge with 'revtool merge --continue'\n");
-
+        result.extend_from_slice(format!(">>>>>>> {their_branch} (theirs)\n").as_bytes());
         result
     }
 
@@ -495,11 +482,16 @@ pub fn merge<Store: ObjectStore>(
         }
     }
 
+    // Always keep the merged tree, even when there are conflicts. It already
+    // contains every non-conflicting change from both sides, with conflicted
+    // paths left at their base version; create_snapshot then overlays the
+    // resolved versions on top. Discarding it here (the old behaviour) caused
+    // resolving one conflict to silently revert every other change in the merge.
     Ok(MergeResult {
         base_id,
         ours_id,
         theirs_id,
-        merged_directory: if !has_conflicts { Some(merged_dir) } else { None },
+        merged_directory: Some(merged_dir),
         conflicts,
         success: !has_conflicts,
     })
@@ -533,66 +525,96 @@ pub fn find_common_ancestor<Store: ObjectStore>(
         return Ok(Some(snapshot1_id));
     }
     
-    // Build maps of all ancestors for each snapshot with their "distance" from the original snapshot
-    let ancestors1 = find_all_ancestors_with_distance(store, snapshot1_id)?;
-    let ancestors2 = find_all_ancestors_with_distance(store, snapshot2_id)?;
-    
-    // Find common ancestors with their total distance from both snapshots
-    let mut common_ancestors: Vec<(ObjectId, usize)> = Vec::new();
-    for (ancestor, distance1) in &ancestors1 {
-        if let Some(distance2) = ancestors2.get(ancestor) {
-            common_ancestors.push((*ancestor, distance1 + distance2));
-        }
-    }
-    
-    // If no common ancestors found, return None
-    if common_ancestors.is_empty() {
+    // The merge base is a *lowest* common ancestor: a snapshot that is an
+    // ancestor of both tips and is not itself an ancestor of any other common
+    // ancestor. The previous code ranked common ancestors by summed hop
+    // distance, which can pick a strict ancestor of the true base and
+    // manufacture spurious conflicts.
+    let ancestors1 = ancestors_including_self(store, snapshot1_id)?;
+    let ancestors2 = ancestors_including_self(store, snapshot2_id)?;
+
+    let common: BTreeSet<ObjectId> =
+        ancestors1.intersection(&ancestors2).copied().collect();
+    if common.is_empty() {
+        // Unrelated histories.
         return Ok(None);
     }
-    
-    // Sort by total distance (smaller distance = more recent common ancestor)
-    common_ancestors.sort_by_key(|&(_, distance)| distance);
-    
-    // Return the most recent common ancestor (smallest total distance)
-    Ok(Some(common_ancestors[0].0))
-}
 
-/// Find all ancestors of a snapshot with their distance (number of commits) from the original snapshot
-fn find_all_ancestors_with_distance<Store: ObjectStore>(
-    store: &Store,
-    snapshot_id: ObjectId,
-) -> Result<BTreeMap<ObjectId, usize>, Error<Store>> {
-    let mut ancestors = BTreeMap::new();
-    // Queue of (snapshot_id, distance)
-    let mut queue = vec![(snapshot_id, 0)];
-    
-    while let Some((current_id, distance)) = queue.pop() {
-        if ancestors.contains_key(&current_id) {
-            continue;
-        }
-        
-        ancestors.insert(current_id, distance);
-        
-        // Get parents of this snapshot
-        let snapshot_bytes = match store.read(current_id).map_err(Error::Store)? {
-            Some(bytes) => bytes,
-            None => continue, // Skip if we can't read this snapshot
-        };
-        
-        let snapshot: SnapShot = match serde_json::from_slice(&snapshot_bytes) {
-            Ok(snap) => snap,
-            Err(_) => continue, // Skip if we can't parse this snapshot
-        };
-        
-        // Add parents to the queue with incremented distance
-        for parent_id in snapshot.previous {
-            if !ancestors.contains_key(&parent_id) {
-                queue.push((parent_id, distance + 1));
+    // Any common ancestor that is a *proper* ancestor of another common
+    // ancestor is not a lowest common ancestor. Whatever remains are the merge
+    // base candidates.
+    let mut superseded: BTreeSet<ObjectId> = BTreeSet::new();
+    for &c in &common {
+        for parent in proper_ancestors(store, c)? {
+            if common.contains(&parent) {
+                superseded.insert(parent);
             }
         }
     }
-    
-    Ok(ancestors)
+    let mut bases: Vec<ObjectId> =
+        common.iter().copied().filter(|c| !superseded.contains(c)).collect();
+
+    // With a single base (the common case) we are done. Criss-cross histories
+    // can leave several equally-valid bases; a true recursive merge would merge
+    // them, but for now we pick one deterministically — the one with the most
+    // ancestors (closest to the tips), breaking ties by id so the result never
+    // depends on hashing order.
+    bases.sort_by(|a, b| {
+        let da = ancestor_count(store, *a).unwrap_or(0);
+        let db = ancestor_count(store, *b).unwrap_or(0);
+        db.cmp(&da).then_with(|| a.cmp(b))
+    });
+
+    Ok(bases.into_iter().next())
+}
+
+/// All ancestors of `snapshot_id`, including the snapshot itself. A node is
+/// considered its own ancestor so that "one tip is an ancestor of the other"
+/// falls out of the common-ancestor computation naturally.
+fn ancestors_including_self<Store: ObjectStore>(
+    store: &Store,
+    snapshot_id: ObjectId,
+) -> Result<BTreeSet<ObjectId>, Error<Store>> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![snapshot_id];
+    while let Some(current_id) = stack.pop() {
+        if !seen.insert(current_id) {
+            continue;
+        }
+        let bytes = match store.read(current_id).map_err(Error::Store)? {
+            Some(bytes) => bytes,
+            None => continue,
+        };
+        let snapshot: SnapShot = match serde_json::from_slice(&bytes) {
+            Ok(snap) => snap,
+            Err(_) => continue,
+        };
+        for parent_id in snapshot.previous {
+            if !seen.contains(&parent_id) {
+                stack.push(parent_id);
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// Ancestors of `snapshot_id` excluding the snapshot itself.
+fn proper_ancestors<Store: ObjectStore>(
+    store: &Store,
+    snapshot_id: ObjectId,
+) -> Result<BTreeSet<ObjectId>, Error<Store>> {
+    let mut set = ancestors_including_self(store, snapshot_id)?;
+    set.remove(&snapshot_id);
+    Ok(set)
+}
+
+/// Number of proper ancestors of `snapshot_id`, used only as a deterministic
+/// tie-breaker between equally-valid merge bases.
+fn ancestor_count<Store: ObjectStore>(
+    store: &Store,
+    snapshot_id: ObjectId,
+) -> Result<usize, Error<Store>> {
+    Ok(proper_ancestors(store, snapshot_id)?.len())
 }
 
 /// Perform a three-way merge between directories
@@ -811,12 +833,23 @@ fn merge_diffs<Store: ObjectStore>(
                     let base_id = if let Some(DirectoryEntry::File(id)) = merged.root.get(path) {
                         *id
                     } else {
-                        // This shouldn't happen in theory, but handle it just in case
-                        // Create an empty content hash
-                        let empty_content = Vec::<u8>::new();
-                        return Err(Error::ObjectMissing(ObjectId::from(&empty_content[..])));
+                        // The base had a directory here that both sides replaced
+                        // with (different) files. That is a type change, not
+                        // something we can three-way merge, so record it as a
+                        // conflict rather than aborting the whole merge with a
+                        // fabricated "object missing" error.
+                        conflicts.push(MergeConflict {
+                            path: path_prefix.join(path),
+                            base_id: None,
+                            ours_id: Some(*ours_id),
+                            theirs_id: Some(*theirs_id),
+                            conflict_type: ConflictType::TypeChanged,
+                            resolved: false,
+                            resolution_id: None,
+                        });
+                        continue;
                     };
-                    
+
                     match auto_merge_files(store, base_id, *ours_id, *theirs_id)? {
                         Some(merged_id) => {
                             // Auto-merge successful
@@ -1003,189 +1036,107 @@ fn apply_diff(directory: &mut Directory, diff: &Diff) {
     }
 }
 
-/// Attempts to automatically merge two files
-/// Returns the ID of the merged file if successful, or None if conflicts were detected
+/// Attempts to automatically merge two files given their common base.
+///
+/// Returns `Some(id)` for a clean merge, or `None` if the two sides made
+/// conflicting changes and manual resolution is required. Delegates the
+/// line-level work to `diffy`, which uses Myers diffing and produces the same
+/// results git users expect. Because it operates on raw bytes, a clean merge
+/// preserves the file exactly: CRLF line endings, the presence or absence of a
+/// trailing newline, and non-UTF-8 (binary) content all survive unchanged.
 fn auto_merge_files<Store: ObjectStore>(
     store: &mut Store,
     base_id: ObjectId,
     ours_id: ObjectId,
     theirs_id: ObjectId,
 ) -> Result<Option<ObjectId>, Error<Store>> {
-    // Check if files are identical
+    // Resolve the trivial cases by object identity. These are exact for any
+    // content, binary included, and avoid loading bytes we do not need.
     if ours_id == theirs_id {
         return Ok(Some(ours_id));
     }
+    if base_id == ours_id {
+        // Only their side changed, so take theirs.
+        return Ok(Some(theirs_id));
+    }
+    if base_id == theirs_id {
+        // Only our side changed, so take ours.
+        return Ok(Some(ours_id));
+    }
 
-    // Generate content diffs
-    let ours_diff_result = ContentDiff::generate(store, base_id, ours_id);
-    let ours_diff = match ours_diff_result {
-        Ok(Some(diff)) => diff,
-        Ok(None) => return Ok(Some(ours_id)), // No changes from base to ours
-        Err(e) => return Err(Error::ContentDiff(e)),
-    };
-
-    let theirs_diff_result = ContentDiff::generate(store, base_id, theirs_id);
-    let theirs_diff = match theirs_diff_result {
-        Ok(Some(diff)) => diff,
-        Ok(None) => return Ok(Some(ours_id)), // No changes from base to theirs
-        Err(e) => return Err(Error::ContentDiff(e)),
-    };
-    
-    // Load file contents
-    let base_content = store.read(base_id).map_err(Error::Store)?
+    let base = store
+        .read(base_id)
+        .map_err(Error::Store)?
         .ok_or(Error::ObjectMissing(base_id))?;
-    let base_str = String::from_utf8_lossy(&base_content);
-    let base_lines: Vec<&str> = base_str.lines().collect();
-    
-    // Create line-based change maps
-    let ours_changes = create_line_change_map(&ours_diff);
-    let theirs_changes = create_line_change_map(&theirs_diff);
-    
-    // Check for overlapping changes (conflicts)
-    for (line_num, our_change) in &ours_changes {
-        if let Some(their_change) = theirs_changes.get(line_num) {
-            // Two added lines at the same position isn't a conflict
-            if let (Change::Added(_), Change::Added(_)) = (our_change, their_change) {
-                continue; // Not a conflict, handle during merge
-            }
-            
-            if our_change != their_change {
-                // Conflict: both changed the same line differently
-                return Ok(None);
-            }
+    let ours = store
+        .read(ours_id)
+        .map_err(Error::Store)?
+        .ok_or(Error::ObjectMissing(ours_id))?;
+    let theirs = store
+        .read(theirs_id)
+        .map_err(Error::Store)?
+        .ok_or(Error::ObjectMissing(theirs_id))?;
+
+    match diffy::merge_bytes(&base, &ours, &theirs) {
+        Ok(merged) => {
+            let merged_id = store.insert(&merged).map_err(Error::Store)?;
+            Ok(Some(merged_id))
         }
+        // Err carries the marker-annotated content; here we only need to know a
+        // conflict occurred. The marked content for the working tree is
+        // generated by ConflictResolver so branch names can be shown.
+        Err(_conflicted) => Ok(None),
     }
-    
-    // No conflicts, proceed with auto-merge
-    let mut merged_lines = Vec::new();
-    
-    // Create a combined set of line numbers to process in order
-    let mut all_line_nums: BTreeSet<usize> = BTreeSet::new();
-    for i in 0..base_lines.len() {
-        all_line_nums.insert(i);
-    }
-    for line_num in ours_changes.keys().chain(theirs_changes.keys()) {
-        all_line_nums.insert(*line_num);
-    }
-    
-    // Process lines in order
-    for i in all_line_nums {
-        let base_line = if i < base_lines.len() {
-            Some(base_lines[i].to_string())
-        } else {
-            None
-        };
-        
-        // Check if we have changes for this line
-        let our_change = ours_changes.get(&i);
-        let their_change = theirs_changes.get(&i);
-        
-        match (our_change, their_change) {
-            // Both branches added content at the same insertion point
-            (Some(Change::Added(our_line)), Some(Change::Added(their_line))) => {
-                // Add both lines in a reasonable order
-                merged_lines.push(our_line.clone());
-                merged_lines.push(their_line.clone());
-            },
-            
-            // Our branch added a line
-            (Some(Change::Added(line)), _) => {
-                merged_lines.push(line.clone());
-            },
-            
-            // Their branch added a line
-            (_, Some(Change::Added(line))) => {
-                merged_lines.push(line.clone());
-            },
-            
-            // Our branch removed a line
-            (Some(Change::Removed(_)), None) => {
-                // Skip this line
-            },
-            
-            // Their branch removed a line
-            (None, Some(Change::Removed(_))) => {
-                // Skip this line
-            },
-            
-            // Our branch modified a line
-            (Some(Change::Modified { new, .. }), None) => {
-                merged_lines.push(new.clone());
-            },
-            
-            // Their branch modified a line
-            (None, Some(Change::Modified { new, .. })) => {
-                merged_lines.push(new.clone());
-            },
-            
-            // Both branches made the same modification
-            (Some(Change::Modified { new, .. }), Some(Change::Modified { .. })) => {
-                // We already checked earlier that these are equal
-                merged_lines.push(new.clone());
-            },
-            
-            // Both branches removed the same line
-            (Some(Change::Removed(_)), Some(Change::Removed(_))) => {
-                // Skip this line
-            },
-            
-            // Context or unchanged line
-            (None, None) => {
-                if let Some(line) = base_line {
-                    merged_lines.push(line);
-                }
-            },
-            
-            // Other combinations are either already checked for conflicts
-            // or shouldn't occur in a valid diff
-            _ => {},
-        }
-    }
-    
-    // Write the merged content
-    let merged_content = merged_lines.join("\n").into_bytes();
-    let merged_id = store.insert(&merged_content).map_err(Error::Store)?;
-    
-    Ok(Some(merged_id))
 }
 
-/// Creates a map of line number to change for efficient merging
-fn create_line_change_map(diff: &ContentDiff) -> BTreeMap<usize, Change> {
-    let mut changes = BTreeMap::new();
-    let mut line_num = 0;
-    let mut added_lines = Vec::new(); // Track added lines separately with their insertion points
-    
-    // First pass: track regular changes and collect added lines
-    for change in &diff.changes {
-        match change {
-            Change::Added(line) => {
-                // Store added lines with their insertion point for later processing
-                added_lines.push((line_num, line.clone()));
-                // Don't increment line_num for added lines
-            },
-            Change::Removed(line) => {
-                changes.insert(line_num, Change::Removed(line.clone()));
-                line_num += 1;
-            },
-            Change::Modified { old, new } => {
-                changes.insert(line_num, Change::Modified { 
-                    old: old.clone(), 
-                    new: new.clone() 
-                });
-                line_num += 1;
-            },
-            Change::Context(_) => {
-                line_num += 1;
-            },
+/// Rewrites diffy's default conflict-marker labels to show branch names.
+///
+/// diffy emits `<<<<<<< ours`, `||||||| original`, `=======`, and
+/// `>>>>>>> theirs`. We keep the standard marker glyphs (so any git-aware
+/// editor or `merge --continue` recognises them) but relabel the endpoints with
+/// the actual branch names, matching revtool's older, friendlier output.
+fn relabel_conflict_markers(content: &[u8], our_branch: &str, their_branch: &str) -> Vec<u8> {
+    let ours_label = format!("<<<<<<< {our_branch} (ours)\n").into_bytes();
+    let base_label = b"||||||| base (common ancestor)\n".to_vec();
+    let theirs_label = format!(">>>>>>> {their_branch} (theirs)\n").into_bytes();
+
+    let mut out = Vec::with_capacity(content.len());
+    for line in split_lines_keeping_ends(content) {
+        if line_is_marker(line, b'<') {
+            out.extend_from_slice(&ours_label);
+        } else if line_is_marker(line, b'|') {
+            out.extend_from_slice(&base_label);
+        } else if line_is_marker(line, b'>') {
+            out.extend_from_slice(&theirs_label);
+        } else {
+            out.extend_from_slice(line);
         }
     }
-    
-    // Second pass: process added lines with correct insertion points
-    for (insertion_point, added_line) in added_lines {
-        changes.insert(insertion_point, Change::Added(added_line));
+    out
+}
+
+/// True if `line` is a conflict marker line for glyph `marker` — a run of at
+/// least seven `marker` bytes optionally followed by a space and label.
+fn line_is_marker(line: &[u8], marker: u8) -> bool {
+    let run = line.iter().take_while(|&&b| b == marker).count();
+    run >= 7 && line.get(run).is_none_or(|&b| b == b' ' || b == b'\n' || b == b'\r')
+}
+
+/// Splits bytes into lines, keeping each line's terminator attached so the
+/// pieces concatenate back into the original bytes exactly.
+fn split_lines_keeping_ends(content: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (i, &b) in content.iter().enumerate() {
+        if b == b'\n' {
+            lines.push(&content[start..=i]);
+            start = i + 1;
+        }
     }
-    
-    changes
+    if start < content.len() {
+        lines.push(&content[start..]);
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -1321,9 +1272,9 @@ mod tests {
         let mut store = InMemoryObjectStore::new();
 
         // Create file contents
-        let base_content = b"This is the base content";
-        let ours_content = b"This is our modified content";
-        let theirs_content = b"This is their modified content";
+        let base_content = b"This is the base content\n";
+        let ours_content = b"This is our modified content\n";
+        let theirs_content = b"This is their modified content\n";
 
         // Store file contents
         let base_id = store.insert(base_content).unwrap();
@@ -1347,12 +1298,24 @@ mod tests {
         // Check conflict markers in the marked content
         let marked_content = String::from_utf8_lossy(&resolver.marked_content);
 
-        // Assert Git-style markers are present
-        assert!(marked_content.contains("<<<<<<< HEAD (Current branch: main)"));
-        assert!(marked_content.contains("======="));
-        assert!(marked_content.contains(">>>>>>> feature (Incoming changes)"));
-        assert!(marked_content.contains("||||||| BASE (common ancestor)"));
-        assert!(marked_content.contains("# CONFLICT RESOLUTION INSTRUCTIONS"));
+        // Assert standard git-style diff3 markers are present, relabelled with
+        // the branch names.
+        assert!(marked_content.contains("<<<<<<< main (ours)"), "{marked_content}");
+        assert!(marked_content.contains("======="), "{marked_content}");
+        assert!(marked_content.contains(">>>>>>> feature (theirs)"), "{marked_content}");
+        assert!(marked_content.contains("||||||| base (common ancestor)"), "{marked_content}");
+
+        // Markers must appear in valid diff3 order: ours, then base, then
+        // separator, then theirs. The old code emitted the base section after
+        // the closing >>>>>>> marker, which no diff3 tool can parse.
+        let ours_pos = marked_content.find("<<<<<<<").unwrap();
+        let base_pos = marked_content.find("|||||||").unwrap();
+        let sep_pos = marked_content.find("\n=======").unwrap();
+        let theirs_pos = marked_content.find(">>>>>>>").unwrap();
+        assert!(
+            ours_pos < base_pos && base_pos < sep_pos && sep_pos < theirs_pos,
+            "markers out of order: {marked_content}"
+        );
 
         // Check that all content versions are included
         assert!(marked_content.contains("This is the base content"));
@@ -1526,7 +1489,42 @@ mod tests {
         let ancestor = find_common_ancestor(&store, j_id, e_id).unwrap();
         assert_eq!(ancestor, Some(d_id), "The MRCA of J and E should be D (via I)");
     }
-    
+
+    #[test]
+    fn test_merge_base_prefers_ancestry_over_hop_distance() {
+        // Regression: the old summed-distance heuristic returned a strict
+        // ancestor of the true merge base here, producing spurious conflicts.
+        //
+        //   Q ── P ── L1 ── L2 ── L3 ──┐
+        //   │    │                     ├── O   (merge of L3 and S)
+        //   │    └── T                 │
+        //   └── S ─────────────────────┘
+        //
+        // The lowest common ancestor of O and T is P, not Q: P is an ancestor
+        // of both, and Q is only a common ancestor because it is P's parent.
+        let mut store = InMemoryObjectStore::new();
+
+        let q = create_test_snapshot(&mut store, vec![], vec![("f", b"Q")]);
+        let p = create_test_snapshot(&mut store, vec![q], vec![("f", b"P")]);
+        let l1 = create_test_snapshot(&mut store, vec![p], vec![("f", b"L1")]);
+        let l2 = create_test_snapshot(&mut store, vec![l1], vec![("f", b"L2")]);
+        let l3 = create_test_snapshot(&mut store, vec![l2], vec![("f", b"L3")]);
+        let s = create_test_snapshot(&mut store, vec![q], vec![("f", b"S")]);
+        let o = create_test_snapshot(&mut store, vec![l3, s], vec![("f", b"O")]);
+        let t = create_test_snapshot(&mut store, vec![p], vec![("f", b"T")]);
+
+        let base = find_common_ancestor(&store, o, t).unwrap();
+        assert_eq!(base, Some(p), "merge base of O and T must be P, not Q");
+    }
+
+    #[test]
+    fn test_merge_base_unrelated_histories_is_none() {
+        let mut store = InMemoryObjectStore::new();
+        let a = create_test_snapshot(&mut store, vec![], vec![("f", b"a")]);
+        let b = create_test_snapshot(&mut store, vec![], vec![("g", b"b")]);
+        assert_eq!(find_common_ancestor(&store, a, b).unwrap(), None);
+    }
+
     #[test]
     fn test_auto_merge_no_conflict() {
         let mut store = InMemoryObjectStore::new();
@@ -1552,8 +1550,9 @@ mod tests {
         let merged_content = store.read(merged_id).unwrap().unwrap();
         let merged_str = String::from_utf8_lossy(&merged_content);
         
-        // The merge should contain both changes
-        assert_eq!(merged_str, "Line 1\nOur Line 2\nLine 3\nTheir Line 4");
+        // The merge should contain both changes, and preserve the trailing
+        // newline exactly (the old line-merger stripped it).
+        assert_eq!(merged_str, "Line 1\nOur Line 2\nLine 3\nTheir Line 4\n");
     }
     
     #[test]
@@ -1578,46 +1577,79 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_merge_with_added_lines() {
+    fn test_auto_merge_conflicting_added_lines() {
         let mut store = InMemoryObjectStore::new();
 
         // Base version
         let base_content = b"Line 1\nLine 2\nLine 3\nLine 4\n";
         let base_id = store.insert(base_content).unwrap();
 
-        // Our version (added a line at the end)
+        // Both sides append a *different* line at the same position.
         let ours_content = b"Line 1\nLine 2\nLine 3\nLine 4\nOur Added Line\n";
         let ours_id = store.insert(ours_content).unwrap();
-
-        // Their version (added a different line at the end)
         let theirs_content = b"Line 1\nLine 2\nLine 3\nLine 4\nTheir Added Line\n";
         let theirs_id = store.insert(theirs_content).unwrap();
 
-        // Auto-merge should succeed
+        // Two different insertions at the same point is a conflict, exactly as
+        // git reports it. (The old bespoke merger silently concatenated both.)
         let result = auto_merge_files(&mut store, base_id, ours_id, theirs_id).unwrap();
-        assert!(result.is_some());
+        assert!(result.is_none());
+    }
 
-        // Check the merged content
-        let merged_id = result.unwrap();
+    #[test]
+    fn test_auto_merge_independent_added_lines() {
+        let mut store = InMemoryObjectStore::new();
+
+        // Base version.
+        let base_content = b"Line 1\nLine 2\nLine 3\nLine 4\n";
+        let base_id = store.insert(base_content).unwrap();
+
+        // Our side inserts near the top; their side appends at the bottom.
+        // These do not overlap, so they merge cleanly.
+        let ours_content = b"Line 1\nOur Added Line\nLine 2\nLine 3\nLine 4\n";
+        let ours_id = store.insert(ours_content).unwrap();
+        let theirs_content = b"Line 1\nLine 2\nLine 3\nLine 4\nTheir Added Line\n";
+        let theirs_id = store.insert(theirs_content).unwrap();
+
+        let result = auto_merge_files(&mut store, base_id, ours_id, theirs_id).unwrap();
+        let merged_id = result.expect("independent inserts should auto-merge");
         let merged_content = store.read(merged_id).unwrap().unwrap();
-        let merged_str = String::from_utf8_lossy(&merged_content);
 
-        // The merge should include both added lines
-        assert!(merged_str.contains("Our Added Line"));
-        assert!(merged_str.contains("Their Added Line"));
+        assert_eq!(
+            merged_content,
+            b"Line 1\nOur Added Line\nLine 2\nLine 3\nLine 4\nTheir Added Line\n"
+        );
+    }
 
-        // The original lines should remain in order
-        let merged_lines: Vec<&str> = merged_str.lines().collect();
-        assert_eq!(merged_lines.len(), 6); // Base lines + 2 added lines
-        assert_eq!(merged_lines[0], "Line 1");
-        assert_eq!(merged_lines[1], "Line 2");
-        assert_eq!(merged_lines[2], "Line 3");
-        assert_eq!(merged_lines[3], "Line 4");
-        
-        // The next two lines should be our added lines in some order
-        let has_our_line = merged_lines[4] == "Our Added Line" || merged_lines[5] == "Our Added Line";
-        let has_their_line = merged_lines[4] == "Their Added Line" || merged_lines[5] == "Their Added Line";
-        assert!(has_our_line && has_their_line);
+    #[test]
+    fn test_auto_merge_preserves_crlf_and_no_final_newline() {
+        let mut store = InMemoryObjectStore::new();
+
+        // CRLF line endings, and deliberately no newline after the last line.
+        let base_id = store.insert(b"a\r\nb\r\nc").unwrap();
+        let ours_id = store.insert(b"A\r\nb\r\nc").unwrap(); // change first line
+        let theirs_id = store.insert(b"a\r\nb\r\nC").unwrap(); // change last line
+
+        let merged_id = auto_merge_files(&mut store, base_id, ours_id, theirs_id)
+            .unwrap()
+            .expect("non-overlapping edits should merge");
+        let merged = store.read(merged_id).unwrap().unwrap();
+
+        // CRLF endings intact, still no trailing newline: byte-exact.
+        assert_eq!(merged, b"A\r\nb\r\nC");
+    }
+
+    #[test]
+    fn test_auto_merge_one_sided_change_takes_that_side() {
+        let mut store = InMemoryObjectStore::new();
+        let base_id = store.insert(b"x\ny\nz\n").unwrap();
+        let ours_id = base_id; // we did not touch it
+        let theirs_id = store.insert(b"x\nY\nz\n").unwrap();
+
+        let merged_id = auto_merge_files(&mut store, base_id, ours_id, theirs_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged_id, theirs_id);
     }
     
     #[test]

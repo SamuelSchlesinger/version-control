@@ -3,6 +3,7 @@ use std::{
     env::current_dir,
     fmt::Debug,
     io::stdout,
+    path::PathBuf,
     process::exit
 };
 
@@ -89,6 +90,11 @@ impl std::fmt::Display for AppError {
                 DotRevError::CorruptRepository(msg) => write!(f, "Corrupt repository: {}. Consider reinitializing or restoring from backup.", msg),
                 DotRevError::MergeInProgress => write!(f, "A merge is already in progress. Resolve conflicts and use 'revtool merge --continue' or use 'revtool merge --abort' to cancel"),
                 DotRevError::NoMergeInProgress => write!(f, "No merge is in progress"),
+                DotRevError::InvalidBranchName { name, reason } => write!(
+                    f,
+                    "Invalid branch name '{name}': {reason}.\n\
+                     Branch names must be a single name with no '/', no '..', and no leading '-'."
+                ),
             },
             AppError::IoError(err) => {
                 match err.kind() {
@@ -270,6 +276,20 @@ enum Command {
     Checkout {
         #[arg(help = "Branch to checkout")]
         branch: Option<String>,
+        #[arg(
+            short = 'b',
+            long,
+            default_value = "false",
+            help = "Create the branch if it does not exist, then switch to it"
+        )]
+        create: bool,
+        #[arg(
+            short,
+            long,
+            default_value = "false",
+            help = "Discard uncommitted changes instead of refusing to switch"
+        )]
+        force: bool,
     },
 
     #[clap(
@@ -284,17 +304,25 @@ enum Command {
 
     #[clap(
         about = "Reset all files to the last snapshot on this branch",
-        long_about = "Resets the working directory to match the latest snapshot on the current branch",
-        after_help = "Examples:\n  revtool reset              # Reset but keep untracked files\n  revtool reset --delete-absent  # Reset and delete untracked files"
+        long_about = "Resets the working directory to match the latest snapshot on the current branch. \
+                      This discards uncommitted changes to tracked files, so it requires --force.",
+        after_help = "Examples:\n  revtool reset --force              # Restore tracked files, keep untracked files\n  revtool reset --force --delete-absent  # Also delete untracked files"
     )]
     Reset {
         #[arg(
             short,
             long,
             default_value = "false",
-            help = "Whether to delete files absent from the snapshot"
+            help = "Whether to delete files absent from the snapshot (including untracked files)"
         )]
         delete_absent: bool,
+        #[arg(
+            short,
+            long,
+            default_value = "false",
+            help = "Required: confirm discarding uncommitted changes"
+        )]
+        force: bool,
     },
 
     #[clap(
@@ -383,6 +411,83 @@ fn get_repository() -> AppResult<(DotRev, String)> {
     let dot_rev = DotRev::here()?;
     let branch = dot_rev.branch()?;
     Ok((dot_rev, branch))
+}
+
+/// Returns the paths that differ between the working tree and the current
+/// branch's snapshot: files added, modified, or deleted but not yet snapped.
+///
+/// This is the "dirty set" used to protect uncommitted work before an operation
+/// that would overwrite it (checkout, reset). An empty result means the working
+/// tree matches the snapshot and is safe to replace.
+fn uncommitted_changes(
+    dot_rev: &DotRev,
+    store: &mut lib::object_store::directory::DirectoryObjectStore,
+) -> AppResult<Vec<PathBuf>> {
+    let ignores = dot_rev.ignores()?;
+    let cwd = current_dir()?;
+    let working = Directory::new(cwd.as_path(), &ignores, store)
+        .map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
+
+    let tip = dot_rev.current_snapshot_id()?;
+    let snapshot: SnapShot = store.read_json(tip)?;
+    let committed: Directory = store.read_json(snapshot.directory)?;
+
+    let diff = committed.diff(&working);
+    let mut paths: Vec<PathBuf> = Vec::new();
+    paths.extend(diff.added.keys().map(PathBuf::from));
+    paths.extend(diff.deleted.iter().map(PathBuf::from));
+    paths.extend(diff.modified.keys().map(PathBuf::from));
+    paths.sort();
+    Ok(paths)
+}
+
+/// Refuses the operation if the working tree has uncommitted changes, unless
+/// `force` is set. Prints the offending paths and how to proceed.
+fn ensure_clean_or_forced(
+    dot_rev: &DotRev,
+    store: &mut lib::object_store::directory::DirectoryObjectStore,
+    force: bool,
+    action: &str,
+) -> AppResult<()> {
+    if force {
+        return Ok(());
+    }
+    let dirty = uncommitted_changes(dot_rev, store)?;
+    if dirty.is_empty() {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "You have uncommitted changes that {action} would overwrite:\n"
+    );
+    for path in &dirty {
+        msg.push_str(&format!("  {}\n", path.display()));
+    }
+    msg.push_str(
+        "\nSnapshot them with 'revtool snap -m <message>' first, or re-run with --force to discard them",
+    );
+    Err(AppError::Other(msg))
+}
+
+/// Removes working-tree files that were tracked on `current` but are absent
+/// from `target`, so switching branches does not leave the old branch's files
+/// polluting the new branch. Untracked files (in neither snapshot) are left
+/// alone; this only touches paths the old snapshot tracked.
+fn remove_tracked_absent(
+    current: &Directory,
+    target: &Directory,
+    root: &std::path::Path,
+) -> AppResult<()> {
+    let target_paths: BTreeSet<PathBuf> =
+        target.files().into_iter().map(|(p, _)| p).collect();
+    for (path, _) in current.files() {
+        if !target_paths.contains(&path) {
+            let full = root.join(&path);
+            if full.exists() {
+                std::fs::remove_file(&full).map_err(AppError::IoError)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 
@@ -1549,9 +1654,29 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
             Ok(())
         },
-        Reset { delete_absent } => {
+        Reset { delete_absent, force } => {
             let (dot_rev, branch) = get_repository()?;
             let mut store = dot_rev.store()?;
+
+            // Reset discards uncommitted changes to tracked files, and with
+            // --delete-absent it also deletes untracked files. Both are
+            // irreversible, so require --force rather than doing it silently.
+            if !force {
+                let dirty = uncommitted_changes(&dot_rev, &mut store)?;
+                let deletes_untracked = delete_absent;
+                if !dirty.is_empty() || deletes_untracked {
+                    let mut msg = String::from("'reset' discards uncommitted work:\n");
+                    for path in &dirty {
+                        msg.push_str(&format!("  modified/absent: {}\n", path.display()));
+                    }
+                    if deletes_untracked {
+                        msg.push_str("  --delete-absent will also remove every untracked file\n");
+                    }
+                    msg.push_str("\nRe-run with --force to confirm");
+                    return Err(AppError::Other(msg));
+                }
+            }
+
             let snapshot_id = dot_rev.branch_snapshot_id(&branch)?;
             let snapshot: SnapShot = store.read_json(snapshot_id)?;
             let directory: Directory = store.read_json(snapshot.directory)?;
@@ -1745,7 +1870,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             }
             Ok(())
         }
-        Checkout { branch } => {
+        Checkout { branch, create, force } => {
             let (dot_rev, current_branch) = get_repository()?;
             let mut store = dot_rev.store()?;
 
@@ -1769,36 +1894,56 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 return Ok(());
             }
 
-            // Create the branch if it doesn't exist
+            // If the branch doesn't exist, only create it on explicit intent
+            // (`-b`, or a confirmation in interactive mode). A bare typo used to
+            // silently create a phantom branch; now it errors and points at how
+            // to create one on purpose.
             if !dot_rev.branch_exists(&branch_to_checkout)? {
-                if interactive {
-                    let theme = ColorfulTheme::default();
-                    if !Confirm::with_theme(&theme)
-                        .with_prompt(format!("Branch '{}' doesn't exist. Create it?", branch_to_checkout))
-                        .default(true)
-                        .interact()
-                        .unwrap_or(false) {
-                        println!("Branch creation aborted.");
-                        return Ok(());
-                    }
+                let should_create = create
+                    || (interactive
+                        && Confirm::with_theme(&ColorfulTheme::default())
+                            .with_prompt(format!(
+                                "Branch '{}' doesn't exist. Create it?",
+                                branch_to_checkout
+                            ))
+                            .default(true)
+                            .interact()
+                            .unwrap_or(false));
+                if should_create {
+                    println!("Creating new branch '{}'", branch_to_checkout.green().bold());
+                    dot_rev.create_branch(&branch_to_checkout)?;
+                } else if interactive {
+                    println!("Branch creation aborted.");
+                    return Ok(());
+                } else {
+                    return Err(AppError::Other(format!(
+                        "Branch '{0}' does not exist. Use 'revtool checkout -b {0}' to create it, \
+                         or 'revtool branch {0}' first",
+                        branch_to_checkout
+                    )));
                 }
-
-                println!("Creating new branch '{}'", branch_to_checkout.green().bold());
-                dot_rev.create_branch(&branch_to_checkout)?;
             }
 
-            // Switch to the branch
-            dot_rev.set_branch(&branch_to_checkout)?;
+            // Protect uncommitted work: switching overwrites tracked files.
+            ensure_clean_or_forced(&dot_rev, &mut store, force, "switching branches")?;
 
-            // Reset to the snapshot on this branch
+            // Capture the branch we're leaving so we can remove files that exist
+            // only on it, then lay down the target branch's files.
+            let current_snapshot_id = dot_rev.branch_snapshot_id(&current_branch)?;
+            let current_snap: SnapShot = store.read_json(current_snapshot_id)?;
+            let current_tree: Directory = store.read_json(current_snap.directory)?;
+
             let snapshot_id = dot_rev.branch_snapshot_id(&branch_to_checkout)?;
             let snapshot: SnapShot = store.read_json(snapshot_id)?;
-            let directory: Directory = store.read_json(snapshot.directory)?;
+            let target_tree: Directory = store.read_json(snapshot.directory)?;
 
-            // Restore files from snapshot (without deleting files not in snapshot)
             let cwd = current_dir()?;
-            directory.write(&store, &cwd, false)
+            remove_tracked_absent(&current_tree, &target_tree, &cwd)?;
+            target_tree.write(&store, &cwd, false)
                 .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
+
+            // Only move the branch pointer once the working tree is in place.
+            dot_rev.set_branch(&branch_to_checkout)?;
 
             println!("Switched to branch '{}' (snapshot: {})",
                 branch_to_checkout.green().bold(),

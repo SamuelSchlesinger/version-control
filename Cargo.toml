@@ -24,6 +24,7 @@ reqwest = { version = "0.11", features = ["json", "blocking"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 tower = "0.4"
+diffy = "0.5.0"
 
 [lib]
 name = "lib"
