@@ -471,6 +471,36 @@ fn ensure_clean_or_forced(
     Err(AppError::Other(msg))
 }
 
+/// True if any line of `content` is a conflict marker, i.e. begins with a run
+/// of seven or more of `<`, `=`, `>`, or `|`. Anchoring to the start of a line
+/// avoids false positives on prose like a row of `====` in a comment.
+fn content_has_conflict_markers(content: &[u8]) -> bool {
+    content.split(|&b| b == b'\n').any(|line| {
+        [b'<', b'=', b'>', b'|'].iter().any(|&marker| {
+            line.iter().take_while(|&&b| b == marker).count() >= 7
+        })
+    })
+}
+
+/// Rewrites the working tree to match a snapshot's directory. Used after a
+/// merge finalizes so that conflict-marker files left on disk are replaced with
+/// the resolved content that was actually committed. Without this, the working
+/// tree and the snapshot disagree and a following `snap` would re-commit the
+/// markers.
+fn refresh_worktree_to_snapshot(
+    dot_rev: &DotRev,
+    store: &mut lib::object_store::directory::DirectoryObjectStore,
+    snapshot_id: ObjectId,
+) -> AppResult<()> {
+    let snapshot: SnapShot = store.read_json(snapshot_id)?;
+    let directory: Directory = store.read_json(snapshot.directory)?;
+    let cwd = dot_rev.work_dir().to_path_buf();
+    directory
+        .write(&*store, &cwd, false)
+        .map_err(|e| AppError::FailedToRestoreFiles(format!("{:?}", e)))?;
+    Ok(())
+}
+
 /// Masks the password in a `scheme://user:pass@host` URL so it is not printed
 /// to the terminal. Remotes are stored with whatever credentials the user
 /// embedded in the URL; displaying them verbatim leaks secrets to anyone
@@ -1220,10 +1250,14 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                 directory.write(&store, &cwd, false)
                     .map_err(|e| AppError::FailedToResetFiles(format!("{:?}", e)))?;
 
+                // Restore the branch pointer too, so the tip and the working
+                // tree agree again even if a snapshot was taken mid-merge.
+                dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+
                 // Clear the merge state
                 dot_rev.clear_merge_state()?;
 
-                println!("Merge aborted. Files have been reset to their state before the merge.");
+                println!("Merge aborted. Files and branch reset to their state before the merge.");
                 return Ok(());
             }
 
@@ -1273,6 +1307,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
                         // Update the branch pointer
                         dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+                        refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
 
                         // Clear the merge state
                         dot_rev.clear_merge_state()?;
@@ -1343,6 +1378,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
                             // Update the branch pointer
                             dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+                            refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
 
                             // Clear the merge state
                             dot_rev.clear_merge_state()?;
@@ -1356,7 +1392,59 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
                             return Err(AppError::MergeConflicts(merge_state.merge_result.conflicts.clone()));
                         }
                     } else {
-                        return Err(AppError::MergeConflicts(merge_state.merge_result.conflicts.clone()));
+                        // Non-interactive continue with no strategy: pick up the
+                        // resolutions the user made by editing the working-tree
+                        // files, the standard git-style workflow.
+                        let work_dir = dot_rev.work_dir().to_path_buf();
+                        let mut still_conflicted: Vec<PathBuf> = Vec::new();
+
+                        let unresolved: Vec<_> = merge_state
+                            .merge_result
+                            .conflicts
+                            .iter()
+                            .filter(|c| !c.resolved)
+                            .map(|c| c.path.clone())
+                            .collect();
+
+                        for path in unresolved {
+                            let full = work_dir.join(&path);
+                            let content = match std::fs::read(&full) {
+                                Ok(c) => c,
+                                Err(_) => {
+                                    still_conflicted.push(path);
+                                    continue;
+                                }
+                            };
+                            if content_has_conflict_markers(&content) {
+                                still_conflicted.push(path);
+                                continue;
+                            }
+                            let resolved_id = store.insert(&content)
+                                .map_err(|e| AppError::Other(format!("Failed to store resolved file: {:?}", e)))?;
+                            for c in merge_state.merge_result.conflicts.iter_mut() {
+                                if c.path == path {
+                                    c.resolved = true;
+                                    c.resolution_id = Some(resolved_id);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if !still_conflicted.is_empty() {
+                            // No need to persist progress: the working-tree edits
+                            // themselves are the progress, and the next
+                            // --continue re-reads them.
+                            let mut msg = String::from(
+                                "Some files still contain conflict markers:\n",
+                            );
+                            for path in &still_conflicted {
+                                msg.push_str(&format!("  {}\n", path.display()));
+                            }
+                            msg.push_str("Edit them to remove the markers, then run 'revtool merge --continue'");
+                            return Err(AppError::Other(msg));
+                        }
+                        // All conflicts resolved from the working tree; fall
+                        // through to finalization below.
                     }
                 }
 
@@ -1372,6 +1460,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
                 // Update the branch pointer
                 dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+                refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
 
                 // Clear the merge state
                 dot_rev.clear_merge_state()?;
@@ -1479,6 +1568,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
                     // Update the branch pointer
                     dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+                    refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
 
                     // Clear the merge state
                     dot_rev.clear_merge_state()?;
@@ -1548,6 +1638,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
                         // Update the branch pointer
                         dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
+                        refresh_worktree_to_snapshot(&dot_rev, &mut store, snapshot_id)?;
 
                         // Clear the merge state
                         dot_rev.clear_merge_state()?;
@@ -1839,11 +1930,25 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             };
 
             println!("On branch {}", branch.green().bold());
+
+            let merge_in_progress = dot_rev.is_merge_in_progress()?;
+            if merge_in_progress {
+                println!("\n{}", "You are in the middle of a merge.".yellow().bold());
+                println!(
+                    "  Resolve conflicts, then run \"{}\", or \"{}\" to cancel.",
+                    "revtool merge --continue".cyan(),
+                    "revtool merge --abort".cyan()
+                );
+            }
+
             if diff.added.is_empty() && diff.deleted.is_empty() && diff.modified.is_empty() {
                 println!("{}", "Working tree clean, nothing to snapshot".green());
             } else {
                 println!("\n{}", "Changes not yet snapped:".yellow().bold());
-                println!("  (use \"{}\" to create a new snapshot)\n", "revtool snap -m <message>".cyan());
+                // Don't advise snapshotting mid-merge; that would commit markers.
+                if !merge_in_progress {
+                    println!("  (use \"{}\" to create a new snapshot)\n", "revtool snap -m <message>".cyan());
+                }
 
                 // Import the required types locally
                 use lib::diff_format;
@@ -2021,6 +2126,17 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
         Snap { message } => {
             let (dot_rev, branch) = get_repository()?;
             let mut store = dot_rev.store()?;
+
+            // Refuse to snapshot in the middle of a merge: the working tree
+            // still has conflict markers, and committing them corrupts history.
+            if dot_rev.is_merge_in_progress()? {
+                return Err(AppError::Other(
+                    "a merge is in progress. Resolve the conflicts and run \
+                     'revtool merge --continue', or 'revtool merge --abort' to cancel"
+                        .to_string(),
+                ));
+            }
+
             let old_tip = dot_rev.branch_snapshot_id(&branch)?;
             let ignores = dot_rev.ignores()?;
 
