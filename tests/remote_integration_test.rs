@@ -126,3 +126,87 @@ fn test_remote_config() {
     let missing = dot_rev.get_remote("origin").expect("Failed to get remote");
     assert!(missing.is_none());
 }
+/// The server enforces bearer-token auth: without the token a pull fails and
+/// writes nothing; with it, the pull works.
+#[test]
+fn test_token_auth_enforced() {
+    let temp = TempDir::new().unwrap();
+    let server_repo = temp.path().join("server");
+    let client_repo = temp.path().join("client");
+    std::fs::create_dir(&server_repo).unwrap();
+    std::fs::create_dir(&client_repo).unwrap();
+    let revtool = env!("CARGO_BIN_EXE_revtool");
+
+    let run = |args: &[&str], cwd: &std::path::Path| {
+        Command::new(revtool).args(args).current_dir(cwd).output().unwrap()
+    };
+    let run_tok = |args: &[&str], cwd: &std::path::Path, tok: &str| {
+        Command::new(revtool).args(args).current_dir(cwd).env("REVTOOL_TOKEN", tok).output().unwrap()
+    };
+
+    run(&["init"], &server_repo);
+    std::fs::write(server_repo.join("secret.txt"), "top secret").unwrap();
+    run(&["snap", "-m", "c1"], &server_repo);
+
+    let port = common::free_port();
+    let _server = common::start_server_opt(revtool, &server_repo, port, Some("s3cr3t"));
+    let url = format!("http://127.0.0.1:{port}");
+
+    run(&["init"], &client_repo);
+    run(&["remote", "add", "origin", &url], &client_repo);
+
+    // No token: pull must fail and write nothing.
+    assert!(!run(&["pull", "origin", "dev"], &client_repo).status.success());
+    assert!(!client_repo.join("secret.txt").exists(), "leaked data without a token");
+
+    // Wrong token: same.
+    assert!(!run_tok(&["pull", "origin", "dev"], &client_repo, "nope").status.success());
+    assert!(!client_repo.join("secret.txt").exists());
+
+    // Correct token: works.
+    let ok = run_tok(&["pull", "origin", "dev"], &client_repo, "s3cr3t");
+    assert!(ok.status.success(), "authed pull failed: {}", String::from_utf8_lossy(&ok.stderr));
+    assert_eq!(std::fs::read_to_string(client_repo.join("secret.txt")).unwrap(), "top secret");
+}
+
+/// A divergent (non-fast-forward) push is rejected without --force and accepted
+/// with it.
+#[test]
+fn test_non_fast_forward_push_rejected() {
+    let temp = TempDir::new().unwrap();
+    let server = temp.path().join("server");
+    let a = temp.path().join("a");
+    let b = temp.path().join("b");
+    for p in [&server, &a, &b] {
+        std::fs::create_dir(p).unwrap();
+    }
+    let revtool = env!("CARGO_BIN_EXE_revtool");
+    let run = |args: &[&str], cwd: &std::path::Path| {
+        Command::new(revtool).args(args).current_dir(cwd).output().unwrap()
+    };
+
+    run(&["init"], &server);
+    std::fs::write(server.join("f.txt"), "base").unwrap();
+    run(&["snap", "-m", "base"], &server);
+    let port = common::free_port();
+    let _srv = common::start_server(revtool, &server, port);
+    let url = format!("http://127.0.0.1:{port}");
+
+    for c in [&a, &b] {
+        run(&["init"], c);
+        run(&["remote", "add", "origin", &url], c);
+        run(&["pull", "origin", "dev"], c);
+    }
+
+    std::fs::write(a.join("a.txt"), "a").unwrap();
+    run(&["snap", "-m", "a"], &a);
+    assert!(run(&["push", "origin", "dev"], &a).status.success());
+
+    // b is now stale; its divergent push must be refused.
+    std::fs::write(b.join("b.txt"), "b").unwrap();
+    run(&["snap", "-m", "b"], &b);
+    assert!(!run(&["push", "origin", "dev"], &b).status.success(), "non-ff push accepted");
+
+    // --force overrides.
+    assert!(run(&["push", "origin", "dev", "--force"], &b).status.success());
+}

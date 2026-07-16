@@ -35,8 +35,18 @@ impl Drop for ServerGuard {
 /// Starts `revtool serve` on `port` in `repo` and waits until it is accepting
 /// connections. Panics if the server does not come up within a few seconds.
 pub fn start_server(revtool: &str, repo: &Path, port: u16) -> ServerGuard {
+    start_server_opt(revtool, repo, port, None)
+}
+
+/// Like [`start_server`], but optionally requires a bearer token.
+pub fn start_server_opt(revtool: &str, repo: &Path, port: u16, token: Option<&str>) -> ServerGuard {
+    let mut args = vec!["serve".to_string(), "--port".to_string(), port.to_string()];
+    if let Some(t) = token {
+        args.push("--token".to_string());
+        args.push(t.to_string());
+    }
     let child = Command::new(revtool)
-        .args(["serve", "--port", &port.to_string()])
+        .args(&args)
         .current_dir(repo)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

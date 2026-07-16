@@ -1,6 +1,25 @@
 use crate::object_id::ObjectId;
-use crate::object_store::ObjectStore;
 use crate::object_store::in_memory::InMemoryObjectStore;
+use crate::object_store::{InsertWithIdError, ObjectStore};
+
+#[test]
+fn test_insert_with_id_verifies_hash() {
+    let mut store = InMemoryObjectStore::new();
+    let data = b"authentic content";
+    let real_id = ObjectId::from(&data[..]);
+
+    // Correct id: stored.
+    assert!(store.insert_with_id(real_id, data).is_ok());
+    assert!(store.has(real_id).unwrap());
+
+    // A lying id (the hash of different bytes) is rejected as a mismatch, and
+    // nothing is stored under it. This is the server's receive-side integrity
+    // check against a malicious or corrupt upload.
+    let wrong_id = ObjectId::from(&b"something else"[..]);
+    let err = store.insert_with_id(wrong_id, data);
+    assert!(matches!(err, Err(InsertWithIdError::HashMismatch { .. })), "got {err:?}");
+    assert!(!store.has(wrong_id).unwrap(), "stored under the wrong id");
+}
 
 #[test]
 fn test_object_store_insert_and_read() {
