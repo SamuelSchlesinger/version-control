@@ -103,6 +103,8 @@ impl HttpRemoteServer {
     pub async fn run(self, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
         let app = self.router();
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        // A foreground `serve` command: print the listening address to stdout so
+        // the user sees it without needing to configure logging.
         println!("Remote repository server listening on {}", addr);
         axum::serve(listener, app).await?;
         Ok(())

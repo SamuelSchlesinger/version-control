@@ -39,7 +39,7 @@ pub struct DirectoryObjectStore {
 impl DirectoryObjectStore {
     pub fn new(root: PathBuf) -> Result<Self, std::io::Error> {
         if !Path::try_exists(&root)? {
-            log::info!("creating directory store root: {:?}", root);
+            log::debug!("creating directory store root: {:?}", root);
             create_dir(&root)?;
         }
         Ok(Self {
@@ -137,7 +137,7 @@ impl ObjectStore for DirectoryObjectStore {
     type Error = std::io::Error;
 
     fn has(&self, id: ObjectId) -> Result<bool, Self::Error> {
-        log::info!("checking whether {id} is contained in {:?}", self.root);
+        log::debug!("checking whether {id} is contained in {:?}", self.root);
 
         // Check if the object is in the cache first
         if self.get_cached_object(id).is_some() {
@@ -153,16 +153,16 @@ impl ObjectStore for DirectoryObjectStore {
     }
 
     fn read(&self, id: ObjectId) -> Result<Option<Vec<u8>>, Self::Error> {
-        log::info!("reading {id} from {:?}", self.root);
+        log::debug!("reading {id} from {:?}", self.root);
 
         // Try to get from cache first
         if let Some(data) = self.get_cached_object(id) {
-            log::info!("cache hit for {id}");
+            log::debug!("cache hit for {id}");
             return Ok(Some(data));
         }
 
         // Otherwise read from disk
-        log::info!("cache miss for {id}, reading from disk");
+        log::debug!("cache miss for {id}, reading from disk");
         let s: String = format!("{id}");
         let subdir: &str = &s[0..2];
         let filename: &str = &s[2..];
@@ -206,11 +206,11 @@ impl ObjectStore for DirectoryObjectStore {
 
     fn insert(&mut self, object: &[u8]) -> Result<ObjectId, Self::Error> {
         let id: ObjectId = object.into();
-        log::info!("inserting {id} into {:?}", self.root);
+        log::debug!("inserting {id} into {:?}", self.root);
 
         // Check if already in cache
         if self.get_cached_object(id).is_some() {
-            log::info!("{id} already exists in cache");
+            log::debug!("{id} already exists in cache");
             return Ok(id);
         }
 
@@ -221,7 +221,7 @@ impl ObjectStore for DirectoryObjectStore {
         let subdir_path = self.root.join(subdir);
         let path = subdir_path.join(filename);
         if Path::try_exists(&path)? {
-            log::info!("{path:?} already exists on disk");
+            log::debug!("{path:?} already exists on disk");
 
             // The object is already stored; content addressing guarantees the
             // bytes are identical, so there is nothing to write. We deliberately

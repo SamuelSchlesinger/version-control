@@ -304,9 +304,13 @@ To require authentication, start the server with a token (via `--token` or the
 `REVTOOL_TOKEN`:
 
 ```bash
-revtool serve --port 8080 --token "$SECRET"   # server rejects requests without it
-REVTOOL_TOKEN="$SECRET" revtool pull origin dev
+REVTOOL_TOKEN="$SECRET" revtool serve --port 8080   # server rejects requests without it
+REVTOOL_TOKEN="$SECRET" revtool pull origin dev      # client presents the token
 ```
+
+Prefer the `REVTOOL_TOKEN` environment variable over the `--token` flag: a value
+passed on the command line is visible to other users via the process list
+(`ps`), while the environment variable is not.
 
 Without a token the server is unauthenticated, so bind it to a trusted network
 only (it defaults to `127.0.0.1`).

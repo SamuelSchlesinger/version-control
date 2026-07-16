@@ -53,14 +53,8 @@ pub struct SnapShotDiff {
 }
 
 impl SnapShotDiff {
-    /// Generate a diff between two snapshots
-    /// 
-    /// # Arguments
-    /// 
-    /// * `store` - The object store to use
-    /// * `source_id` - The ID of the source (older) snapshot
-    /// * `target_id` - The ID of the target (newer) snapshot
-    /// * `with_content_diffs` - Whether to include content diffs
+    /// Generates a diff from the `source_id` (older) snapshot to the `target_id`
+    /// (newer) one, optionally including per-file content diffs.
     pub fn generate<Store: ObjectStore>(
         store: &Store,
         source_id: ObjectId,

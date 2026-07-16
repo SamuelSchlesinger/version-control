@@ -116,16 +116,6 @@ impl Diff {
         }
         false
     }
-
-    /// This approach doesn't work well for production because we can't mutate the nested Directory
-    /// objects without cloning them. Instead, generate content diffs at creation time in
-    /// the Directory::diff_with_content method
-    #[deprecated]
-    pub fn with_content_diffs<Store: ObjectStore>(&mut self, _store: &Store) -> &mut Self {
-        // This approach won't work properly - directory diffs need to be created with content
-        // at generation time
-        self
-    }
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]

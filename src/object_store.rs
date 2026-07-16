@@ -41,57 +41,20 @@ pub trait ObjectStore {
     /// The error type returned by operations on this store.
     type Error;
 
-    /// Checks whether the given `ObjectId` is present in the store.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The `ObjectId` to check
-    ///
-    /// # Returns
-    ///
-    /// * `Result<bool, Self::Error>` - `true` if the object exists, `false` otherwise
+    /// Returns whether an object with this id is present in the store.
     fn has(&self, id: ObjectId) -> Result<bool, Self::Error>;
 
-    /// Retrieves an object from the store by its `ObjectId`.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The `ObjectId` of the object to retrieve
-    ///
-    /// # Returns
-    ///
-    /// * `Result<Option<Vec<u8>>, Self::Error>` - The object's data if found, `None` if not present
+    /// Retrieves an object by its id, or `None` if it is not present.
     fn read(&self, id: ObjectId) -> Result<Option<Vec<u8>>, Self::Error>;
 
-    /// Inserts an object into the store.
-    ///
-    /// This method calculates the `ObjectId` (hash) of the object and stores the object
-    /// under that identifier. If an object with the same content already exists, it will
-    /// not be stored again, but the same `ObjectId` will be returned.
-    ///
-    /// # Arguments
-    ///
-    /// * `object` - The binary data to store
-    ///
-    /// # Returns
-    ///
-    /// * `Result<ObjectId, Self::Error>` - The `ObjectId` of the stored object
+    /// Stores an object and returns its content-hash id. Content that is already
+    /// present is deduplicated: the same id is returned without storing again.
     fn insert(&mut self, object: &[u8]) -> Result<ObjectId, Self::Error>;
 
-    /// Inserts an object into the store with a pre-computed `ObjectId`.
-    ///
-    /// This method is useful when syncing objects from a remote store where
-    /// the ID has already been computed. The implementation should verify
-    /// that the provided ID matches the content hash.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - The pre-computed `ObjectId` for the object
-    /// * `object` - The binary data to store
-    ///
-    /// # Returns
-    ///
-    /// * `Result<(), Self::Error>` - Ok if stored successfully
+    /// Stores an object whose id was computed elsewhere (e.g. received from a
+    /// remote). The default implementation verifies the bytes hash to the
+    /// claimed `id` *before* storing, so a lying id is rejected rather than
+    /// corrupting the store.
     fn insert_with_id(
         &mut self,
         id: ObjectId,

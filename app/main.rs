@@ -377,8 +377,10 @@ enum Command {
 
     #[clap(
         about = "Push changes to a remote repository",
-        long_about = "Upload local snapshots and update the remote branch reference",
-        after_help = "Examples:\n  revtool push origin                # Push current branch to origin\n  revtool push origin dev           # Push the dev branch to origin\n  revtool push origin dev --force   # Force push (overwrite remote)"
+        long_about = "Upload local snapshots and update the remote branch reference. \
+                      If the remote requires authentication, set the REVTOOL_TOKEN \
+                      environment variable to the bearer token.",
+        after_help = "Examples:\n  revtool push origin                # Push current branch to origin\n  revtool push origin dev           # Push the dev branch to origin\n  revtool push origin dev --force   # Force push (overwrite remote)\n  REVTOOL_TOKEN=secret revtool push origin dev  # Push to a token-protected remote"
     )]
     Push {
         #[arg(help = "Remote repository name")]
@@ -394,8 +396,10 @@ enum Command {
     #[clap(
         about = "Pull changes from a remote repository",
         long_about = "Download snapshots from a remote repository and fast-forward the local branch. \
-                      Refuses to discard local commits or overwrite uncommitted changes.",
-        after_help = "Examples:\n  revtool pull origin dev            # Pull the dev branch from origin\n  revtool pull origin dev --force    # Discard local uncommitted changes while pulling"
+                      Refuses to discard local commits or overwrite uncommitted changes. \
+                      If the remote requires authentication, set the REVTOOL_TOKEN \
+                      environment variable to the bearer token.",
+        after_help = "Examples:\n  revtool pull origin dev            # Pull the dev branch from origin\n  revtool pull origin dev --force    # Discard local uncommitted changes while pulling\n  REVTOOL_TOKEN=secret revtool pull origin dev  # Pull from a token-protected remote"
     )]
     Pull {
         #[arg(help = "Remote repository name")]

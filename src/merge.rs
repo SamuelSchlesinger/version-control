@@ -473,7 +473,9 @@ pub fn merge<Store: ObjectStore>(
 
             // Write the conflict markers to the file
             if let Err(e) = std::fs::write(file_path, &resolver.marked_content) {
-                println!("Warning: Failed to write conflict markers to {}: {}", file_path.display(), e);
+                // This is a library function; log rather than printing to stdout
+                // so an embedding application controls where the message goes.
+                log::warn!("Failed to write conflict markers to {}: {}", file_path.display(), e);
             }
         }
     }
