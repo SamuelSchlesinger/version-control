@@ -1930,6 +1930,627 @@ fn cmd_checkout(branch: Option<String>, create: bool, force: bool, interactive: 
     Ok(())
 }
 
+/// Handler for `revtool usage`.
+fn cmd_usage(command: Option<String>) -> AppResult<()> {
+    match command {
+        Some(cmd) => {
+            match get_command_help(&cmd) {
+                Some(help_text) => println!("{}", help_text),
+                None => println!("No detailed help found for '{}'. Try 'revtool usage' for general help.", cmd),
+            }
+        },
+        None => println!("{}", show_general_help()),
+    }
+    Ok(())
+}
+
+/// Handler for `revtool ignore`.
+fn cmd_ignore(pattern: Option<String>, remove: bool, interactive: bool) -> AppResult<()> {
+    let (dot_rev, _branch) = get_repository()?;
+    let mut ignores = dot_rev.ignores()?;
+
+    // Use interactive mode if flag is set and no explicit arguments are provided
+    if interactive && pattern.is_none() && !remove {
+        return interactive_ignore_management(&dot_rev, ignores);
+    }
+
+    match (pattern, remove) {
+        // Just list the current ignore patterns
+        (None, false) => {
+            println!("{}", "Current ignore patterns:".green().bold());
+            for pattern in &ignores.patterns {
+                println!("  {}", pattern);
+            }
+        },
+        // Add a new pattern
+        (Some(pattern), false) => {
+            // Check if the pattern already exists
+            if ignores.patterns.contains(&pattern) {
+                println!("Pattern '{}' is already in the ignore list", pattern.yellow());
+            } else {
+                ignores.add_pattern(pattern.clone());
+                dot_rev.set_ignores(&ignores)?;
+                println!("Added '{}' to ignore patterns", pattern.green());
+            }
+        },
+        // Remove a pattern
+        (Some(pattern), true) => {
+            if let Some(pos) = ignores.patterns.iter().position(|p| p == &pattern) {
+                ignores.patterns.remove(pos);
+                // Rebuild glob set
+                let new_ignores = Ignores::new(ignores.patterns);
+                dot_rev.set_ignores(&new_ignores)?;
+                println!("Removed '{}' from ignore patterns", pattern.red());
+            } else {
+                println!("Pattern '{}' not found in ignore list", pattern.yellow());
+            }
+        },
+        // No pattern provided for remove
+        (None, true) => {
+            if interactive {
+                // In interactive mode, show a list of patterns to remove
+                if ignores.patterns.is_empty() {
+                    println!("{}", "No patterns to remove".yellow());
+                    return Ok(());
+                }
+
+                let theme = ColorfulTheme::default();
+                let options: Vec<&String> = ignores.patterns.iter().collect();
+                let selection = Select::with_theme(&theme)
+                    .with_prompt("Select pattern to remove")
+                    .default(0)
+                    .items(&options)
+                    .interact()
+                    .map_err(|_| AppError::Other("Failed to get user input".to_string()))?;
+
+                let pattern = ignores.patterns.remove(selection);
+                let new_ignores = Ignores::new(ignores.patterns);
+                dot_rev.set_ignores(&new_ignores)?;
+                println!("Removed '{}' from ignore patterns", pattern.red());
+            } else {
+                return Err(AppError::Other(
+                    "no pattern given to remove.\nUsage: revtool ignore --remove <pattern>"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handler for `revtool reset`.
+fn cmd_reset(delete_absent: bool, force: bool) -> AppResult<()> {
+    let (dot_rev, branch) = get_repository()?;
+    let mut store = dot_rev.store()?;
+
+    // A reset in the middle of a merge would wipe the conflict markers
+    // while leaving the merge "in progress", so a later --continue would
+    // commit a bogus resolution that silently drops one side. Require the
+    // merge to be finished or aborted first.
+    if dot_rev.is_merge_in_progress()? {
+        return Err(AppError::Other(
+            "a merge is in progress; run 'revtool merge --continue' or \
+             'revtool merge --abort' before resetting".to_string(),
+        ));
+    }
+
+    // Reset discards uncommitted changes to tracked files, and with
+    // --delete-absent it also deletes untracked files. Both are
+    // irreversible, so require --force rather than doing it silently.
+    if !force {
+        let dirty = uncommitted_changes(&dot_rev, &mut store)?;
+        let deletes_untracked = delete_absent;
+        if !dirty.is_empty() || deletes_untracked {
+            let mut msg = String::from("'reset' discards uncommitted work:\n");
+            for path in &dirty {
+                msg.push_str(&format!("  modified/absent: {}\n", path.display()));
+            }
+            if deletes_untracked {
+                msg.push_str("  --delete-absent will also remove every untracked file\n");
+            }
+            msg.push_str("\nRe-run with --force to confirm");
+            return Err(AppError::Other(msg));
+        }
+    }
+
+    let snapshot_id = dot_rev.branch_snapshot_id(&branch)?;
+    let snapshot: SnapShot = store.read_json(snapshot_id)?;
+    let directory: Directory = store.read_json(snapshot.directory)?;
+
+    // Restore files from snapshot
+    let cwd = dot_rev.work_dir().to_path_buf();
+    directory.write(&store, &cwd, delete_absent)
+        .map_err(|e| AppError::FailedToResetFiles(format!("{}", e)))?;
+
+    println!("Reset to the last snapshot on branch '{}' ({})",
+        branch.green().bold(),
+        snapshot_id.to_string().cyan());
+    Ok(())
+}
+
+/// Handler for `revtool diff`.
+fn cmd_diff(first_ref: Option<String>, second_ref: Option<String>, content: bool, context: usize, no_color: bool) -> AppResult<()> {
+    let (dot_rev, current_branch) = get_repository()?;
+    let store = dot_rev.store()?;
+
+    // Parse snapshot references
+    use std::str::FromStr;
+    use lib::snapshot_ref::SnapshotRef;
+
+    // Handle the various possible combinations of first_ref and second_ref
+    let (source_ref, target_ref) = match (first_ref, second_ref) {
+        (Some(first), Some(second)) => {
+            // Both refs provided: first is source, second is target
+            let source = SnapshotRef::from_str(&first)
+                .map_err(|e| AppError::Other(format!("Invalid first snapshot reference: {}", e)))?;
+            let target = SnapshotRef::from_str(&second)
+                .map_err(|e| AppError::Other(format!("Invalid second snapshot reference: {}", e)))?;
+            (source, target)
+        },
+        (Some(first), None) => {
+            // Only first ref provided: current branch is source, first is target
+            let source = SnapshotRef::Branch(current_branch);
+            let target = SnapshotRef::from_str(&first)
+                .map_err(|e| AppError::Other(format!("Invalid snapshot reference: {}", e)))?;
+            (source, target)
+        },
+        (None, Some(second)) => {
+            // Only second ref provided: second is source, current branch is target
+            let source = SnapshotRef::from_str(&second)
+                .map_err(|e| AppError::Other(format!("Invalid snapshot reference: {}", e)))?;
+            let target = SnapshotRef::Branch(current_branch);
+            (source, target)
+        },
+        (None, None) => {
+            // No refs provided - show help info about the new syntax
+            println!("Diff command requires at least one snapshot reference.");
+            println!("Example usage:");
+            println!("  revtool diff branch_name           # Compare current branch with branch_name");
+            println!("  revtool diff HEAD~1                # Compare current branch with its parent");
+            println!("  revtool diff abc123                # Compare current branch with snapshot abc123");
+            println!("  revtool diff branch1 branch2       # Compare branch1 with branch2");
+            println!("  revtool diff HEAD~1 feature        # Compare parent of HEAD with feature branch");
+            println!("\nUse 'revtool usage diff' for more examples.");
+            return Ok(());
+        }
+    };
+
+    // Resolve snapshot references to actual snapshot IDs
+    let source_id = source_ref.resolve(&dot_rev)
+        .map_err(|e| AppError::Other(format!("Failed to resolve source reference: {}", e)))?;
+    let target_id = target_ref.resolve(&dot_rev)
+        .map_err(|e| AppError::Other(format!("Failed to resolve target reference: {}", e)))?;
+
+    // Generate snapshot diff
+    let snapshot_diff = lib::snapshot_diff::SnapShotDiff::generate(
+        &store,
+        source_id,
+        target_id,
+        content
+    ).map_err(|e| AppError::Other(format!("Failed to generate diff: {:?}", e)))?;
+
+    // Import the required types
+    use lib::diff_format;
+
+    // Create format options based on user preferences
+    let format_options = diff_format::FormatOptions {
+        use_color: should_colorize(no_color),
+        show_content: content,
+        context_lines: context,
+        show_stats: true,
+    };
+
+    // Format the diff with colors
+    let formatter = diff_format::SnapShotDiffFormatter::new(&snapshot_diff, format_options);
+
+    println!("{}", formatter);
+
+    Ok(())
+}
+
+/// Handler for `revtool branch`.
+fn cmd_branch(name: Option<String>) -> AppResult<()> {
+    let (dot_rev, current_branch) = get_repository()?;
+
+    match name {
+        Some(branch_name) => {
+            // Don't claim success for a branch that already exists
+            // (create_branch is a silent no-op in that case).
+            if dot_rev.branch_exists(&branch_name)? {
+                return Err(AppError::Other(format!(
+                    "A branch named '{branch_name}' already exists"
+                )));
+            }
+            dot_rev.create_branch(&branch_name)?;
+            println!("Created branch '{}'", branch_name.green().bold());
+            Ok(())
+        },
+        None => {
+            // List branches and show current
+            let branches = dot_rev.list_branches()?;
+
+            for branch in branches {
+                if branch == current_branch {
+                    println!("* {}", branch.green().bold()); // Current branch marked with asterisk
+                } else {
+                    println!("  {}", branch);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Handler for `revtool tag`.
+fn cmd_tag(name: Option<String>, delete: bool) -> AppResult<()> {
+    let (dot_rev, _) = get_repository()?;
+    match (name, delete) {
+        (Some(tag), false) => {
+            // Tag the current snapshot.
+            let snapshot_id = dot_rev.current_snapshot_id()?;
+            dot_rev.create_tag(&tag, snapshot_id)?;
+            println!("Created tag '{}' at {}", tag.green().bold(), snapshot_id.to_string().cyan());
+            Ok(())
+        }
+        (Some(tag), true) => {
+            dot_rev.delete_tag(&tag)?;
+            println!("Deleted tag '{}'", tag.red().bold());
+            Ok(())
+        }
+        (None, true) => Err(AppError::Other(
+            "no tag given to delete.\nUsage: revtool tag --delete <name>".to_string(),
+        )),
+        (None, false) => {
+            let tags = dot_rev.list_tags()?;
+            if tags.is_empty() {
+                println!("No tags");
+            } else {
+                for tag in tags {
+                    println!("  {}", tag);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Handler for `revtool status`.
+fn cmd_status(content: bool, context: usize, no_color: bool) -> AppResult<()> {
+    let (dot_rev, branch) = get_repository()?;
+    let mut store = dot_rev.store()?;
+    let old_tip: ObjectId = dot_rev.branch_snapshot_id(&branch)?;
+
+    // Calculate directory diff with or without content depending on options
+    let directory = build_working_tree(&dot_rev, &mut store, true)?;
+    let snapshot: SnapShot = store.read_json(old_tip)?;
+    let old_directory: Directory = store.read_json(snapshot.directory)?;
+
+    let diff = if content {
+        old_directory.diff_with_content(&directory, true, &store)
+    } else {
+        old_directory.diff(&directory)
+    };
+
+    println!("On branch {}", branch.green().bold());
+
+    let merge_in_progress = dot_rev.is_merge_in_progress()?;
+    if merge_in_progress {
+        println!("\n{}", "You are in the middle of a merge.".yellow().bold());
+        println!(
+            "  Resolve conflicts, then run \"{}\", or \"{}\" to cancel.",
+            "revtool merge --continue".cyan(),
+            "revtool merge --abort".cyan()
+        );
+    }
+
+    if diff.added.is_empty() && diff.deleted.is_empty() && diff.modified.is_empty() {
+        println!("{}", "Working tree clean, nothing to snapshot".green());
+    } else {
+        println!("\n{}", "Changes not yet snapped:".yellow().bold());
+        // Don't advise snapshotting mid-merge; that would commit markers.
+        if !merge_in_progress {
+            println!("  (use \"{}\" to create a new snapshot)\n", "revtool snap -m <message>".cyan());
+        }
+
+        // Import the required types locally
+        use lib::diff_format;
+
+        // Use our formatter for consistent display
+        let format_options = diff_format::FormatOptions {
+            use_color: should_colorize(no_color),
+            show_content: content,
+            context_lines: context,
+            show_stats: true,
+        };
+
+        let formatter = diff_format::DiffFormatter::new(&diff, format_options);
+        println!("{}", formatter);
+    }
+    Ok(())
+}
+
+/// Handler for `revtool log`.
+fn cmd_log(limit: usize) -> AppResult<()> {
+    // Repository existence check is now done at the beginning of the function
+    let (dot_rev, branch) = get_repository()?;
+    let mut store = dot_rev.store()?;
+    let mut snapshot_id = dot_rev.branch_snapshot_id(&branch)?;
+
+    println!("Commit history for branch '{}':", branch.green().bold());
+    println!("{}", "--------------------------------".cyan());
+
+    let mut count = 0;
+    loop {
+        if count >= limit {
+            break;
+        }
+
+        let snapshot: SnapShot = store.read_json(snapshot_id)?;
+        println!("{}: {}", "Snapshot".yellow().bold(), snapshot_id.to_string().cyan());
+        println!("{}: {}", "Message".yellow().bold(), snapshot.message);
+        println!("{}", "--------------------------------".cyan());
+
+        count += 1;
+
+        // Move to previous commit
+        if snapshot.previous.is_empty() {
+            break;
+        }
+
+        // Just take the first parent for now
+        snapshot_id = *snapshot.previous.first().unwrap();
+    }
+    Ok(())
+}
+
+/// Handler for `revtool changes`.
+fn cmd_changes(content: bool, json: bool, context: usize, no_color: bool) -> AppResult<()> {
+    let (dot_rev, branch) = get_repository()?;
+    let mut store = dot_rev.store()?;
+    let old_tip = dot_rev.branch_snapshot_id(&branch)?;
+    let ignores = dot_rev.ignores()?;
+
+    let directory = Directory::new(
+        dot_rev.work_dir(),
+        &ignores,
+        &mut store
+    ).map_err(|e| AppError::FailedToReadDirectory(format!("{}", e)))?;
+
+    let snapshot: SnapShot = store.read_json(old_tip)?;
+    let old_directory: Directory = store.read_json(snapshot.directory)?;
+
+    // Generate diff with or without content
+    let diff = if content {
+        old_directory.diff_with_content(&directory, true, &store)
+    } else {
+        old_directory.diff(&directory)
+    };
+
+    if json {
+        // Output as JSON
+        serde_json::to_writer_pretty(stdout(), &diff)
+            .map_err(|e| AppError::FailedToOutputChanges(format!("{}", e)))?;
+    } else {
+        // Import the required types locally
+        use lib::diff_format;
+
+        // Use our formatter for consistent display
+        let format_options = diff_format::FormatOptions {
+            use_color: should_colorize(no_color),
+            show_content: content,
+            context_lines: context,
+            show_stats: true,
+        };
+
+        let formatter = diff_format::DiffFormatter::new(&diff, format_options);
+        println!("{}", formatter);
+    }
+
+    Ok(())
+}
+
+/// Handler for `revtool snap`.
+fn cmd_snap(message: Option<String>, rehash: bool, interactive: bool) -> AppResult<()> {
+    let (dot_rev, branch) = get_repository()?;
+    let mut store = dot_rev.store()?;
+
+    // Refuse to snapshot in the middle of a merge: the working tree
+    // still has conflict markers, and committing them corrupts history.
+    if dot_rev.is_merge_in_progress()? {
+        return Err(AppError::Other(
+            "a merge is in progress. Resolve the conflicts and run \
+             'revtool merge --continue', or 'revtool merge --abort' to cancel"
+                .to_string(),
+        ));
+    }
+
+    let old_tip = dot_rev.branch_snapshot_id(&branch)?;
+
+    // Build the working tree, using the stat cache unless --rehash.
+    let directory = build_working_tree(&dot_rev, &mut store, !rehash)?;
+
+    // Check if there are any changes
+    let snapshot: SnapShot = store.read_json(old_tip)?;
+    let old_directory: Directory = store.read_json(snapshot.directory)?;
+    let diff = old_directory.diff(&directory);
+
+    if diff.added.is_empty() && diff.deleted.is_empty() && diff.modified.is_empty() {
+        return Err(AppError::NoChangesToSnapshot);
+    }
+
+    // Get the commit message - either from the command line or interactively
+    let commit_message = if let Some(msg) = message {
+        msg
+    } else if interactive {
+        match interactive_snapshot_message(&diff)? {
+            Some(msg) => msg,
+            None => return Ok(()) // User aborted
+        }
+    } else {
+        return Err(AppError::Other("No message provided for snapshot. Use -m or --message option, or use interactive mode with -i".to_string()));
+    };
+
+    // Store the new directory and create a snapshot
+    let directory_id = store.insert_json(&directory)?;
+    let snap = SnapShot {
+        directory: directory_id,
+        previous: vec![old_tip],
+        message: commit_message,
+    };
+
+    // Store the snapshot and update the branch
+    let snap_id = store.insert_json(&snap)?;
+    dot_rev.set_branch_snapshot_id(&branch, snap_id)?;
+
+    println!("Created snapshot {} on branch '{}'",
+        snap_id.to_string().cyan(),
+        branch.green().bold());
+    Ok(())
+}
+
+/// Handler for `revtool init`.
+fn cmd_init() -> AppResult<()> {
+    let cwd = current_dir()?;
+    let rev_path = cwd.join(".rev");
+
+    // Don't silently claim success (or nest a repo) when one already
+    // exists here or in a parent directory.
+    if rev_path.exists() {
+        return Err(AppError::Other(format!(
+            "A repository already exists at {}",
+            rev_path.display()
+        )));
+    }
+    if let Ok(existing) = DotRev::here() {
+        return Err(AppError::Other(format!(
+            "Already inside a repository rooted at {}. \
+             Initialising here would nest a second repository",
+            existing.work_dir().display()
+        )));
+    }
+
+    DotRev::init(rev_path)?;
+    println!("{}", "Initialized empty revision control repository in .rev/".green().bold());
+    Ok(())
+}
+
+/// Handler for `revtool remote`.
+fn cmd_remote(cmd: Option<RemoteCommand>) -> AppResult<()> {
+    let (dot_rev, _) = get_repository()?;
+
+    match cmd {
+        Some(RemoteCommand::Add { name, url }) => {
+            let remote = RemoteConfig { name: name.clone(), url: url.clone() };
+            dot_rev.add_remote(remote)?;
+            println!("Added remote '{}' with URL: {}", name.green().bold(), redact_url_credentials(&url));
+            Ok(())
+        },
+        Some(RemoteCommand::Remove { name }) => {
+            // Don't report success for a remote that was never there.
+            if dot_rev.get_remote(&name)?.is_none() {
+                return Err(AppError::Other(format!("No remote named '{name}'")));
+            }
+            dot_rev.remove_remote(&name)?;
+            println!("Removed remote '{}'", name.red().bold());
+            Ok(())
+        },
+        None => {
+            // List remotes
+            let remotes = dot_rev.remotes()?;
+            if remotes.is_empty() {
+                println!("No remotes configured");
+            } else {
+                println!("{}", "Configured remotes:".green().bold());
+                for remote in remotes {
+                    println!("  {} -> {}", remote.name.cyan(), redact_url_credentials(&remote.url));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Handler for `revtool push`.
+fn cmd_push(remote: String, branch: Option<String>, force: bool) -> AppResult<()> {
+    let (dot_rev, current_branch) = get_repository()?;
+    let mut store = dot_rev.store()?;
+
+    // Get the branch to push
+    let branch_to_push = branch.as_ref().unwrap_or(&current_branch);
+
+    // Get remote configuration
+    let remote_config = dot_rev.get_remote(&remote)?
+        .ok_or_else(|| AppError::Other(format!("Remote '{}' not found. Use 'revtool remote add' to configure it.", remote)))?;
+
+    // Create HTTP client, authenticating with REVTOOL_TOKEN if set.
+    let token = std::env::var("REVTOOL_TOKEN").ok();
+    let client = HttpRemoteClient::with_token(remote_config.url.clone(), token)
+        .map_err(|e| AppError::Other(format!("Failed to connect to remote: {}", e)))?;
+
+    // Get the local snapshot to push
+    let local_snapshot_id = dot_rev.branch_snapshot_id(branch_to_push)?;
+
+    println!("Pushing branch '{}' to remote '{}'...", branch_to_push.cyan(), remote.cyan());
+
+    // Push the branch
+    sync::push_branch(&client, &mut store, branch_to_push, local_snapshot_id, force)
+        .map_err(|e| AppError::Other(format!("Push failed: {}", e)))?;
+
+    println!("{}", "Push completed successfully!".green().bold());
+    Ok(())
+}
+
+/// Handler for `revtool serve`.
+fn cmd_serve(port: u16, host: String, token: Option<String>) -> AppResult<()> {
+    let (dot_rev, _) = get_repository()?;
+
+    // Token from --token, falling back to the REVTOOL_TOKEN env var so
+    // it need not appear in the process list.
+    let token = token.or_else(|| std::env::var("REVTOOL_TOKEN").ok());
+
+    // Create the server
+    let server = HttpRemoteServer::with_token(dot_rev.root().clone(), token.clone())
+        .map_err(|e| AppError::Other(format!("Failed to create server: {}", e)))?;
+
+    let addr = format!("{}:{}", host, port);
+
+    // Create a runtime for the async server
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| AppError::Other(format!("Failed to create runtime: {}", e)))?;
+
+    // Without a token the server is unauthenticated: anyone who can
+    // reach the port can read every object and push to any branch. That
+    // is fine on loopback, but binding to a routable address exposes the
+    // repo to the whole network, so warn loudly.
+    let is_loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
+    if token.is_none() {
+        if !is_loopback {
+            eprintln!(
+                "{} serving on {} with no authentication. Anyone who can reach \
+                 this address can read and overwrite this repository. Pass --token \
+                 (or set REVTOOL_TOKEN), or only serve on a trusted network.",
+                "WARNING:".yellow().bold(),
+                addr
+            );
+        }
+    } else {
+        println!("Requiring a bearer token for all requests.");
+    }
+
+    println!("Starting repository server on {}...", addr.cyan().bold());
+    println!("Other users can add this as a remote with:");
+    println!("  revtool remote add origin http://{}", addr);
+
+    // Block on the server
+    runtime.block_on(async {
+        server.run(&addr).await
+            .map_err(|e| AppError::Other(format!("Server error: {}", e)))
+    })?;
+
+    Ok(())
+}
+
 fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
     use Command::*;
     use std::io::IsTerminal;
@@ -1960,613 +2581,34 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
     }
 
     match cmd {
-        Usage { command } => {
-            match command {
-                Some(cmd) => {
-                    match get_command_help(&cmd) {
-                        Some(help_text) => println!("{}", help_text),
-                        None => println!("No detailed help found for '{}'. Try 'revtool usage' for general help.", cmd),
-                    }
-                },
-                None => println!("{}", show_general_help()),
-            }
-            Ok(())
-        },
+        Usage { command } => cmd_usage(command),
 
         Merge { branch, message, abort, r#continue, strategy, editor } => {
             cmd_merge(branch, message, abort, r#continue, strategy, editor, interactive)
         },
 
-        Ignore { pattern, remove } => {
-            let (dot_rev, _branch) = get_repository()?;
-            let mut ignores = dot_rev.ignores()?;
+        Ignore { pattern, remove } => cmd_ignore(pattern, remove, interactive),
+        Reset { delete_absent, force } => cmd_reset(delete_absent, force),
+        Diff { first_ref, second_ref, content, context, no_color } => cmd_diff(first_ref, second_ref, content, context, no_color),
+        Branch { name } => cmd_branch(name),
 
-            // Use interactive mode if flag is set and no explicit arguments are provided
-            if interactive && pattern.is_none() && !remove {
-                return interactive_ignore_management(&dot_rev, ignores);
-            }
+        Tag { name, delete } => cmd_tag(name, delete),
 
-            match (pattern, remove) {
-                // Just list the current ignore patterns
-                (None, false) => {
-                    println!("{}", "Current ignore patterns:".green().bold());
-                    for pattern in &ignores.patterns {
-                        println!("  {}", pattern);
-                    }
-                },
-                // Add a new pattern
-                (Some(pattern), false) => {
-                    // Check if the pattern already exists
-                    if ignores.patterns.contains(&pattern) {
-                        println!("Pattern '{}' is already in the ignore list", pattern.yellow());
-                    } else {
-                        ignores.add_pattern(pattern.clone());
-                        dot_rev.set_ignores(&ignores)?;
-                        println!("Added '{}' to ignore patterns", pattern.green());
-                    }
-                },
-                // Remove a pattern
-                (Some(pattern), true) => {
-                    if let Some(pos) = ignores.patterns.iter().position(|p| p == &pattern) {
-                        ignores.patterns.remove(pos);
-                        // Rebuild glob set
-                        let new_ignores = Ignores::new(ignores.patterns);
-                        dot_rev.set_ignores(&new_ignores)?;
-                        println!("Removed '{}' from ignore patterns", pattern.red());
-                    } else {
-                        println!("Pattern '{}' not found in ignore list", pattern.yellow());
-                    }
-                },
-                // No pattern provided for remove
-                (None, true) => {
-                    if interactive {
-                        // In interactive mode, show a list of patterns to remove
-                        if ignores.patterns.is_empty() {
-                            println!("{}", "No patterns to remove".yellow());
-                            return Ok(());
-                        }
+        Status { content, context, no_color } => cmd_status(content, context, no_color),
 
-                        let theme = ColorfulTheme::default();
-                        let options: Vec<&String> = ignores.patterns.iter().collect();
-                        let selection = Select::with_theme(&theme)
-                            .with_prompt("Select pattern to remove")
-                            .default(0)
-                            .items(&options)
-                            .interact()
-                            .map_err(|_| AppError::Other("Failed to get user input".to_string()))?;
-
-                        let pattern = ignores.patterns.remove(selection);
-                        let new_ignores = Ignores::new(ignores.patterns);
-                        dot_rev.set_ignores(&new_ignores)?;
-                        println!("Removed '{}' from ignore patterns", pattern.red());
-                    } else {
-                        return Err(AppError::Other(
-                            "no pattern given to remove.\nUsage: revtool ignore --remove <pattern>"
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
-
-            Ok(())
-        },
-        Reset { delete_absent, force } => {
-            let (dot_rev, branch) = get_repository()?;
-            let mut store = dot_rev.store()?;
-
-            // A reset in the middle of a merge would wipe the conflict markers
-            // while leaving the merge "in progress", so a later --continue would
-            // commit a bogus resolution that silently drops one side. Require the
-            // merge to be finished or aborted first.
-            if dot_rev.is_merge_in_progress()? {
-                return Err(AppError::Other(
-                    "a merge is in progress; run 'revtool merge --continue' or \
-                     'revtool merge --abort' before resetting".to_string(),
-                ));
-            }
-
-            // Reset discards uncommitted changes to tracked files, and with
-            // --delete-absent it also deletes untracked files. Both are
-            // irreversible, so require --force rather than doing it silently.
-            if !force {
-                let dirty = uncommitted_changes(&dot_rev, &mut store)?;
-                let deletes_untracked = delete_absent;
-                if !dirty.is_empty() || deletes_untracked {
-                    let mut msg = String::from("'reset' discards uncommitted work:\n");
-                    for path in &dirty {
-                        msg.push_str(&format!("  modified/absent: {}\n", path.display()));
-                    }
-                    if deletes_untracked {
-                        msg.push_str("  --delete-absent will also remove every untracked file\n");
-                    }
-                    msg.push_str("\nRe-run with --force to confirm");
-                    return Err(AppError::Other(msg));
-                }
-            }
-
-            let snapshot_id = dot_rev.branch_snapshot_id(&branch)?;
-            let snapshot: SnapShot = store.read_json(snapshot_id)?;
-            let directory: Directory = store.read_json(snapshot.directory)?;
-
-            // Restore files from snapshot
-            let cwd = dot_rev.work_dir().to_path_buf();
-            directory.write(&store, &cwd, delete_absent)
-                .map_err(|e| AppError::FailedToResetFiles(format!("{}", e)))?;
-
-            println!("Reset to the last snapshot on branch '{}' ({})",
-                branch.green().bold(),
-                snapshot_id.to_string().cyan());
-            Ok(())
-        }
-        Diff { first_ref, second_ref, content, context, no_color } => {
-            let (dot_rev, current_branch) = get_repository()?;
-            let store = dot_rev.store()?;
-
-            // Parse snapshot references
-            use std::str::FromStr;
-            use lib::snapshot_ref::SnapshotRef;
-
-            // Handle the various possible combinations of first_ref and second_ref
-            let (source_ref, target_ref) = match (first_ref, second_ref) {
-                (Some(first), Some(second)) => {
-                    // Both refs provided: first is source, second is target
-                    let source = SnapshotRef::from_str(&first)
-                        .map_err(|e| AppError::Other(format!("Invalid first snapshot reference: {}", e)))?;
-                    let target = SnapshotRef::from_str(&second)
-                        .map_err(|e| AppError::Other(format!("Invalid second snapshot reference: {}", e)))?;
-                    (source, target)
-                },
-                (Some(first), None) => {
-                    // Only first ref provided: current branch is source, first is target
-                    let source = SnapshotRef::Branch(current_branch);
-                    let target = SnapshotRef::from_str(&first)
-                        .map_err(|e| AppError::Other(format!("Invalid snapshot reference: {}", e)))?;
-                    (source, target)
-                },
-                (None, Some(second)) => {
-                    // Only second ref provided: second is source, current branch is target
-                    let source = SnapshotRef::from_str(&second)
-                        .map_err(|e| AppError::Other(format!("Invalid snapshot reference: {}", e)))?;
-                    let target = SnapshotRef::Branch(current_branch);
-                    (source, target)
-                },
-                (None, None) => {
-                    // No refs provided - show help info about the new syntax
-                    println!("Diff command requires at least one snapshot reference.");
-                    println!("Example usage:");
-                    println!("  revtool diff branch_name           # Compare current branch with branch_name");
-                    println!("  revtool diff HEAD~1                # Compare current branch with its parent");
-                    println!("  revtool diff abc123                # Compare current branch with snapshot abc123");
-                    println!("  revtool diff branch1 branch2       # Compare branch1 with branch2");
-                    println!("  revtool diff HEAD~1 feature        # Compare parent of HEAD with feature branch");
-                    println!("\nUse 'revtool usage diff' for more examples.");
-                    return Ok(());
-                }
-            };
-
-            // Resolve snapshot references to actual snapshot IDs
-            let source_id = source_ref.resolve(&dot_rev)
-                .map_err(|e| AppError::Other(format!("Failed to resolve source reference: {}", e)))?;
-            let target_id = target_ref.resolve(&dot_rev)
-                .map_err(|e| AppError::Other(format!("Failed to resolve target reference: {}", e)))?;
-
-            // Generate snapshot diff
-            let snapshot_diff = lib::snapshot_diff::SnapShotDiff::generate(
-                &store,
-                source_id,
-                target_id,
-                content
-            ).map_err(|e| AppError::Other(format!("Failed to generate diff: {:?}", e)))?;
-
-            // Import the required types
-            use lib::diff_format;
-
-            // Create format options based on user preferences
-            let format_options = diff_format::FormatOptions {
-                use_color: should_colorize(no_color),
-                show_content: content,
-                context_lines: context,
-                show_stats: true,
-            };
-
-            // Format the diff with colors
-            let formatter = diff_format::SnapShotDiffFormatter::new(&snapshot_diff, format_options);
-
-            println!("{}", formatter);
-
-            Ok(())
-        }
-        Branch { name } => {
-            let (dot_rev, current_branch) = get_repository()?;
-
-            match name {
-                Some(branch_name) => {
-                    // Don't claim success for a branch that already exists
-                    // (create_branch is a silent no-op in that case).
-                    if dot_rev.branch_exists(&branch_name)? {
-                        return Err(AppError::Other(format!(
-                            "A branch named '{branch_name}' already exists"
-                        )));
-                    }
-                    dot_rev.create_branch(&branch_name)?;
-                    println!("Created branch '{}'", branch_name.green().bold());
-                    Ok(())
-                },
-                None => {
-                    // List branches and show current
-                    let branches = dot_rev.list_branches()?;
-
-                    for branch in branches {
-                        if branch == current_branch {
-                            println!("* {}", branch.green().bold()); // Current branch marked with asterisk
-                        } else {
-                            println!("  {}", branch);
-                        }
-                    }
-                    Ok(())
-                }
-            }
-        },
-
-        Tag { name, delete } => {
-            let (dot_rev, _) = get_repository()?;
-            match (name, delete) {
-                (Some(tag), false) => {
-                    // Tag the current snapshot.
-                    let snapshot_id = dot_rev.current_snapshot_id()?;
-                    dot_rev.create_tag(&tag, snapshot_id)?;
-                    println!("Created tag '{}' at {}", tag.green().bold(), snapshot_id.to_string().cyan());
-                    Ok(())
-                }
-                (Some(tag), true) => {
-                    dot_rev.delete_tag(&tag)?;
-                    println!("Deleted tag '{}'", tag.red().bold());
-                    Ok(())
-                }
-                (None, true) => Err(AppError::Other(
-                    "no tag given to delete.\nUsage: revtool tag --delete <name>".to_string(),
-                )),
-                (None, false) => {
-                    let tags = dot_rev.list_tags()?;
-                    if tags.is_empty() {
-                        println!("No tags");
-                    } else {
-                        for tag in tags {
-                            println!("  {}", tag);
-                        }
-                    }
-                    Ok(())
-                }
-            }
-        },
-
-        Status { content, context, no_color } => {
-            let (dot_rev, branch) = get_repository()?;
-            let mut store = dot_rev.store()?;
-            let old_tip: ObjectId = dot_rev.branch_snapshot_id(&branch)?;
-
-            // Calculate directory diff with or without content depending on options
-            let directory = build_working_tree(&dot_rev, &mut store, true)?;
-            let snapshot: SnapShot = store.read_json(old_tip)?;
-            let old_directory: Directory = store.read_json(snapshot.directory)?;
-
-            let diff = if content {
-                old_directory.diff_with_content(&directory, true, &store)
-            } else {
-                old_directory.diff(&directory)
-            };
-
-            println!("On branch {}", branch.green().bold());
-
-            let merge_in_progress = dot_rev.is_merge_in_progress()?;
-            if merge_in_progress {
-                println!("\n{}", "You are in the middle of a merge.".yellow().bold());
-                println!(
-                    "  Resolve conflicts, then run \"{}\", or \"{}\" to cancel.",
-                    "revtool merge --continue".cyan(),
-                    "revtool merge --abort".cyan()
-                );
-            }
-
-            if diff.added.is_empty() && diff.deleted.is_empty() && diff.modified.is_empty() {
-                println!("{}", "Working tree clean, nothing to snapshot".green());
-            } else {
-                println!("\n{}", "Changes not yet snapped:".yellow().bold());
-                // Don't advise snapshotting mid-merge; that would commit markers.
-                if !merge_in_progress {
-                    println!("  (use \"{}\" to create a new snapshot)\n", "revtool snap -m <message>".cyan());
-                }
-
-                // Import the required types locally
-                use lib::diff_format;
-
-                // Use our formatter for consistent display
-                let format_options = diff_format::FormatOptions {
-                    use_color: should_colorize(no_color),
-                    show_content: content,
-                    context_lines: context,
-                    show_stats: true,
-                };
-
-                let formatter = diff_format::DiffFormatter::new(&diff, format_options);
-                println!("{}", formatter);
-            }
-            Ok(())
-        },
-
-        Log { limit } => {
-            // Repository existence check is now done at the beginning of the function
-            let (dot_rev, branch) = get_repository()?;
-            let mut store = dot_rev.store()?;
-            let mut snapshot_id = dot_rev.branch_snapshot_id(&branch)?;
-
-            println!("Commit history for branch '{}':", branch.green().bold());
-            println!("{}", "--------------------------------".cyan());
-
-            let mut count = 0;
-            loop {
-                if count >= limit {
-                    break;
-                }
-
-                let snapshot: SnapShot = store.read_json(snapshot_id)?;
-                println!("{}: {}", "Snapshot".yellow().bold(), snapshot_id.to_string().cyan());
-                println!("{}: {}", "Message".yellow().bold(), snapshot.message);
-                println!("{}", "--------------------------------".cyan());
-
-                count += 1;
-
-                // Move to previous commit
-                if snapshot.previous.is_empty() {
-                    break;
-                }
-
-                // Just take the first parent for now
-                snapshot_id = *snapshot.previous.first().unwrap();
-            }
-            Ok(())
-        }
+        Log { limit } => cmd_log(limit),
         Checkout { branch, create, force } => cmd_checkout(branch, create, force, interactive),
-        Changes { content, json, context, no_color } => {
-            let (dot_rev, branch) = get_repository()?;
-            let mut store = dot_rev.store()?;
-            let old_tip = dot_rev.branch_snapshot_id(&branch)?;
-            let ignores = dot_rev.ignores()?;
-
-            let directory = Directory::new(
-                dot_rev.work_dir(),
-                &ignores,
-                &mut store
-            ).map_err(|e| AppError::FailedToReadDirectory(format!("{}", e)))?;
-
-            let snapshot: SnapShot = store.read_json(old_tip)?;
-            let old_directory: Directory = store.read_json(snapshot.directory)?;
-
-            // Generate diff with or without content
-            let diff = if content {
-                old_directory.diff_with_content(&directory, true, &store)
-            } else {
-                old_directory.diff(&directory)
-            };
-
-            if json {
-                // Output as JSON
-                serde_json::to_writer_pretty(stdout(), &diff)
-                    .map_err(|e| AppError::FailedToOutputChanges(format!("{}", e)))?;
-            } else {
-                // Import the required types locally
-                use lib::diff_format;
-
-                // Use our formatter for consistent display
-                let format_options = diff_format::FormatOptions {
-                    use_color: should_colorize(no_color),
-                    show_content: content,
-                    context_lines: context,
-                    show_stats: true,
-                };
-
-                let formatter = diff_format::DiffFormatter::new(&diff, format_options);
-                println!("{}", formatter);
-            }
-
-            Ok(())
-        }
-        Snap { message, rehash } => {
-            let (dot_rev, branch) = get_repository()?;
-            let mut store = dot_rev.store()?;
-
-            // Refuse to snapshot in the middle of a merge: the working tree
-            // still has conflict markers, and committing them corrupts history.
-            if dot_rev.is_merge_in_progress()? {
-                return Err(AppError::Other(
-                    "a merge is in progress. Resolve the conflicts and run \
-                     'revtool merge --continue', or 'revtool merge --abort' to cancel"
-                        .to_string(),
-                ));
-            }
-
-            let old_tip = dot_rev.branch_snapshot_id(&branch)?;
-
-            // Build the working tree, using the stat cache unless --rehash.
-            let directory = build_working_tree(&dot_rev, &mut store, !rehash)?;
-
-            // Check if there are any changes
-            let snapshot: SnapShot = store.read_json(old_tip)?;
-            let old_directory: Directory = store.read_json(snapshot.directory)?;
-            let diff = old_directory.diff(&directory);
-
-            if diff.added.is_empty() && diff.deleted.is_empty() && diff.modified.is_empty() {
-                return Err(AppError::NoChangesToSnapshot);
-            }
-
-            // Get the commit message - either from the command line or interactively
-            let commit_message = if let Some(msg) = message {
-                msg
-            } else if interactive {
-                match interactive_snapshot_message(&diff)? {
-                    Some(msg) => msg,
-                    None => return Ok(()) // User aborted
-                }
-            } else {
-                return Err(AppError::Other("No message provided for snapshot. Use -m or --message option, or use interactive mode with -i".to_string()));
-            };
-
-            // Store the new directory and create a snapshot
-            let directory_id = store.insert_json(&directory)?;
-            let snap = SnapShot {
-                directory: directory_id,
-                previous: vec![old_tip],
-                message: commit_message,
-            };
-
-            // Store the snapshot and update the branch
-            let snap_id = store.insert_json(&snap)?;
-            dot_rev.set_branch_snapshot_id(&branch, snap_id)?;
-
-            println!("Created snapshot {} on branch '{}'",
-                snap_id.to_string().cyan(),
-                branch.green().bold());
-            Ok(())
-        }
-        Init => {
-            let cwd = current_dir()?;
-            let rev_path = cwd.join(".rev");
-
-            // Don't silently claim success (or nest a repo) when one already
-            // exists here or in a parent directory.
-            if rev_path.exists() {
-                return Err(AppError::Other(format!(
-                    "A repository already exists at {}",
-                    rev_path.display()
-                )));
-            }
-            if let Ok(existing) = DotRev::here() {
-                return Err(AppError::Other(format!(
-                    "Already inside a repository rooted at {}. \
-                     Initialising here would nest a second repository",
-                    existing.work_dir().display()
-                )));
-            }
-
-            DotRev::init(rev_path)?;
-            println!("{}", "Initialized empty revision control repository in .rev/".green().bold());
-            Ok(())
-        }
+        Changes { content, json, context, no_color } => cmd_changes(content, json, context, no_color),
+        Snap { message, rehash } => cmd_snap(message, rehash, interactive),
+        Init => cmd_init(),
         
-        Remote { cmd } => {
-            let (dot_rev, _) = get_repository()?;
-            
-            match cmd {
-                Some(RemoteCommand::Add { name, url }) => {
-                    let remote = RemoteConfig { name: name.clone(), url: url.clone() };
-                    dot_rev.add_remote(remote)?;
-                    println!("Added remote '{}' with URL: {}", name.green().bold(), redact_url_credentials(&url));
-                    Ok(())
-                },
-                Some(RemoteCommand::Remove { name }) => {
-                    // Don't report success for a remote that was never there.
-                    if dot_rev.get_remote(&name)?.is_none() {
-                        return Err(AppError::Other(format!("No remote named '{name}'")));
-                    }
-                    dot_rev.remove_remote(&name)?;
-                    println!("Removed remote '{}'", name.red().bold());
-                    Ok(())
-                },
-                None => {
-                    // List remotes
-                    let remotes = dot_rev.remotes()?;
-                    if remotes.is_empty() {
-                        println!("No remotes configured");
-                    } else {
-                        println!("{}", "Configured remotes:".green().bold());
-                        for remote in remotes {
-                            println!("  {} -> {}", remote.name.cyan(), redact_url_credentials(&remote.url));
-                        }
-                    }
-                    Ok(())
-                }
-            }
-        }
+        Remote { cmd } => cmd_remote(cmd),
         
-        Push { remote, branch, force } => {
-            let (dot_rev, current_branch) = get_repository()?;
-            let mut store = dot_rev.store()?;
-            
-            // Get the branch to push
-            let branch_to_push = branch.as_ref().unwrap_or(&current_branch);
-            
-            // Get remote configuration
-            let remote_config = dot_rev.get_remote(&remote)?
-                .ok_or_else(|| AppError::Other(format!("Remote '{}' not found. Use 'revtool remote add' to configure it.", remote)))?;
-            
-            // Create HTTP client, authenticating with REVTOOL_TOKEN if set.
-            let token = std::env::var("REVTOOL_TOKEN").ok();
-            let client = HttpRemoteClient::with_token(remote_config.url.clone(), token)
-                .map_err(|e| AppError::Other(format!("Failed to connect to remote: {}", e)))?;
-            
-            // Get the local snapshot to push
-            let local_snapshot_id = dot_rev.branch_snapshot_id(branch_to_push)?;
-            
-            println!("Pushing branch '{}' to remote '{}'...", branch_to_push.cyan(), remote.cyan());
-            
-            // Push the branch
-            sync::push_branch(&client, &mut store, branch_to_push, local_snapshot_id, force)
-                .map_err(|e| AppError::Other(format!("Push failed: {}", e)))?;
-            
-            println!("{}", "Push completed successfully!".green().bold());
-            Ok(())
-        }
+        Push { remote, branch, force } => cmd_push(remote, branch, force),
         
         Pull { remote, branch, force } => cmd_pull(remote, branch, force),
         
-        Serve { port, host, token } => {
-            let (dot_rev, _) = get_repository()?;
-
-            // Token from --token, falling back to the REVTOOL_TOKEN env var so
-            // it need not appear in the process list.
-            let token = token.or_else(|| std::env::var("REVTOOL_TOKEN").ok());
-
-            // Create the server
-            let server = HttpRemoteServer::with_token(dot_rev.root().clone(), token.clone())
-                .map_err(|e| AppError::Other(format!("Failed to create server: {}", e)))?;
-
-            let addr = format!("{}:{}", host, port);
-
-            // Create a runtime for the async server
-            let runtime = tokio::runtime::Runtime::new()
-                .map_err(|e| AppError::Other(format!("Failed to create runtime: {}", e)))?;
-
-            // Without a token the server is unauthenticated: anyone who can
-            // reach the port can read every object and push to any branch. That
-            // is fine on loopback, but binding to a routable address exposes the
-            // repo to the whole network, so warn loudly.
-            let is_loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
-            if token.is_none() {
-                if !is_loopback {
-                    eprintln!(
-                        "{} serving on {} with no authentication. Anyone who can reach \
-                         this address can read and overwrite this repository. Pass --token \
-                         (or set REVTOOL_TOKEN), or only serve on a trusted network.",
-                        "WARNING:".yellow().bold(),
-                        addr
-                    );
-                }
-            } else {
-                println!("Requiring a bearer token for all requests.");
-            }
-
-            println!("Starting repository server on {}...", addr.cyan().bold());
-            println!("Other users can add this as a remote with:");
-            println!("  revtool remote add origin http://{}", addr);
-            
-            // Block on the server
-            runtime.block_on(async {
-                server.run(&addr).await
-                    .map_err(|e| AppError::Other(format!("Server error: {}", e)))
-            })?;
-            
-            Ok(())
-        }
+        Serve { port, host, token } => cmd_serve(port, host, token),
     }
 }
 
