@@ -80,11 +80,14 @@ While Git offers more advanced features and widespread adoption, RevTool provide
 
 **Performance:** RevTool's simpler object model makes whole-tree operations
 substantially faster — snapshotting a ~72 MB / 3,000-file tree is measured at
-about **6.7× faster than `git commit`** (it skips zlib compression and delta
-encoding). The tradeoff is that incremental commits are slower, because RevTool
-has no staging index and re-hashes the tree on each snapshot. See
-[BENCHMARKS.md](BENCHMARKS.md) for the full methodology, numbers, and honest
-tradeoffs.
+about **6.6× faster than `git commit`** (it skips zlib compression and delta
+encoding). A working-tree stat index (like git's) keeps incremental snapshots
+fast too — re-snapshotting after a one-file change is competitive with, and in
+our measurement slightly faster than, `git add && git commit`. The index is
+made safe against silently missing an in-place edit by keying on ctime (which
+the OS bumps on any change and cannot be forged backward), with `snap --rehash`
+as an escape hatch. See [BENCHMARKS.md](BENCHMARKS.md) for the full methodology,
+numbers, and the safety design.
 
 ## Installation
 

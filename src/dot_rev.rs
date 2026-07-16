@@ -379,6 +379,17 @@ impl DotRev {
         Ok(DirectoryObjectStore::new(self.root.join("store").clone())?)
     }
 
+    /// Loads the working-tree stat index, or an empty one if it is missing or
+    /// unreadable. A bad index must never fail an operation — the worst it can
+    /// do is force everything to be re-hashed, which is always correct.
+    pub fn load_index(&self) -> crate::snapshot_index::SnapshotIndex {
+        read_json(&self.root.join("index")).unwrap_or_default()
+    }
+
+    pub fn save_index(&self, index: &crate::snapshot_index::SnapshotIndex) -> Result<(), Error> {
+        write_json(index, &self.root.join("index"))
+    }
+
     pub fn ignores(&self) -> Result<Ignores, Error> {
         read_json(&self.root.join("ignores"))
     }
@@ -477,18 +488,25 @@ impl InsertJson for DirectoryObjectStore {
 }
 
 fn read_json<A: for<'de> Deserialize<'de>>(path: &Path) -> Result<A, Error> {
-    let file = File::options().read(true).open(path)?;
-    Ok(serde_json::from_reader(file)?)
+    // Read the whole file into memory and parse from the slice. serde_json's
+    // from_reader issues a read() per token against the raw File; on a large
+    // metadata file (e.g. the stat index) that is hundreds of thousands of
+    // syscalls. from_slice over one buffered read is dramatically faster.
+    let bytes = std::fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn write_json<A: Serialize>(thing: &A, path: &Path) -> Result<(), Error> {
-    let file = File::options()
+    // Serialize into memory then write once, for the same reason: to_writer
+    // against a raw File would make a syscall per token.
+    let bytes = serde_json::to_vec_pretty(thing)?;
+    let mut file = File::options()
         .write(true)
         .create(true)
         .truncate(true)
         .open(path)?;
-
-    Ok(serde_json::to_writer_pretty(file, thing)?)
+    file.write_all(&bytes)?;
+    Ok(())
 }
 
 #[cfg(test)]

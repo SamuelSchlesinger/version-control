@@ -248,6 +248,12 @@ enum Command {
     Snap {
         #[arg(short, long, help = "Message to leave with this snapshot")]
         message: Option<String>,
+        #[arg(
+            long,
+            default_value = "false",
+            help = "Re-read and re-hash every file, bypassing the stat cache"
+        )]
+        rehash: bool,
     },
 
     #[clap(
@@ -439,6 +445,30 @@ fn get_repository() -> AppResult<(DotRev, String)> {
     Ok((dot_rev, branch))
 }
 
+/// Builds the working-tree directory, using the stat index to skip re-hashing
+/// unchanged files, and persists the refreshed index. When `consult` is false
+/// (the `--rehash` path) every file is re-read and re-hashed, but the index is
+/// still refreshed. This is the single entry point for turning the working tree
+/// into a [`Directory`], so snapshot, status, and the dirty-tree guard all share
+/// the same (safe) fast path.
+fn build_working_tree(
+    dot_rev: &DotRev,
+    store: &mut lib::object_store::directory::DirectoryObjectStore,
+    consult: bool,
+) -> AppResult<Directory> {
+    let ignores = dot_rev.ignores()?;
+    let root = dot_rev.work_dir().to_path_buf();
+    let mut index = dot_rev.load_index();
+    let directory = Directory::from_working_tree(&root, &ignores, store, &mut index, consult)
+        .map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    index.mark_written(now.as_secs() as i64, now.subsec_nanos() as i64);
+    dot_rev.save_index(&index)?;
+    Ok(directory)
+}
+
 /// Returns the paths that differ between the working tree and the current
 /// branch's snapshot: files added, modified, or deleted but not yet snapped.
 ///
@@ -449,10 +479,7 @@ fn uncommitted_changes(
     dot_rev: &DotRev,
     store: &mut lib::object_store::directory::DirectoryObjectStore,
 ) -> AppResult<Vec<PathBuf>> {
-    let ignores = dot_rev.ignores()?;
-    let cwd = dot_rev.work_dir().to_path_buf();
-    let working = Directory::new(cwd.as_path(), &ignores, store)
-        .map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
+    let working = build_working_tree(dot_rev, store, true)?;
 
     let tip = dot_rev.current_snapshot_id()?;
     let snapshot: SnapShot = store.read_json(tip)?;
@@ -1983,12 +2010,9 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             let (dot_rev, branch) = get_repository()?;
             let mut store = dot_rev.store()?;
             let old_tip: ObjectId = dot_rev.branch_snapshot_id(&branch)?;
-            let ignores: Ignores = dot_rev.ignores()?;
-            let cwd = dot_rev.work_dir().to_path_buf();
 
             // Calculate directory diff with or without content depending on options
-            let directory = Directory::new(cwd.as_path(), &ignores, &mut store)
-                .map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
+            let directory = build_working_tree(&dot_rev, &mut store, true)?;
             let snapshot: SnapShot = store.read_json(old_tip)?;
             let old_directory: Directory = store.read_json(snapshot.directory)?;
 
@@ -2192,7 +2216,7 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
 
             Ok(())
         }
-        Snap { message } => {
+        Snap { message, rehash } => {
             let (dot_rev, branch) = get_repository()?;
             let mut store = dot_rev.store()?;
 
@@ -2207,14 +2231,9 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
             }
 
             let old_tip = dot_rev.branch_snapshot_id(&branch)?;
-            let ignores = dot_rev.ignores()?;
 
-            // Create a snapshot of the current directory
-            let directory = Directory::new(
-                dot_rev.work_dir(),
-                &ignores,
-                &mut store
-            ).map_err(|e| AppError::FailedToReadDirectory(format!("{:?}", e)))?;
+            // Build the working tree, using the stat cache unless --rehash.
+            let directory = build_working_tree(&dot_rev, &mut store, !rehash)?;
 
             // Check if there are any changes
             let snapshot: SnapShot = store.read_json(old_tip)?;

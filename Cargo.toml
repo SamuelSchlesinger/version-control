@@ -33,3 +33,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "revtool"
 path = "app/main.rs"
+
+[dev-dependencies]
+filetime = "0.2.29"

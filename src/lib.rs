@@ -66,6 +66,9 @@ pub mod snapshot_ref;
 /// versions of the same files.
 pub mod merge;
 
+/// A working-tree stat cache so snapshots skip re-hashing unchanged files.
+pub mod snapshot_index;
+
 /// Provides functionality for syncing with remote repositories over HTTP,
 /// including push/pull operations and object transfer.
 pub mod remote;

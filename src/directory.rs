@@ -538,6 +538,92 @@ impl Directory {
         }
         Ok(Directory { root })
     }
+
+    /// Builds the tree from the working directory using a [`SnapshotIndex`] so
+    /// unchanged files are not re-read or re-hashed.
+    ///
+    /// `root` is the working-tree root (used to compute the index keys). When
+    /// `consult` is false the index is not read from (every file is hashed), but
+    /// fresh fingerprints are still recorded — this is the `--rehash` path.
+    pub fn from_working_tree<Store: ObjectStore>(
+        root: &Path,
+        ignores: &Ignores,
+        store: &mut Store,
+        index: &mut crate::snapshot_index::SnapshotIndex,
+        consult: bool,
+    ) -> Result<Self, Error<Store>> {
+        Self::build_indexed(root, root, ignores, store, index, consult)
+    }
+
+    fn build_indexed<Store: ObjectStore>(
+        root: &Path,
+        dir: &Path,
+        ignores: &Ignores,
+        store: &mut Store,
+        index: &mut crate::snapshot_index::SnapshotIndex,
+        consult: bool,
+    ) -> Result<Self, Error<Store>> {
+        let mut map = BTreeMap::new();
+        for f in read_dir(dir).map_err(Error::IO)? {
+            let dir_entry = f.map_err(Error::IO)?;
+            let path = dir_entry.path();
+
+            if ignores.is_ignored(&path) {
+                continue;
+            }
+
+            let file_type = dir_entry.file_type().map_err(Error::IO)?;
+            if file_type.is_dir() {
+                let sub = Self::build_indexed(root, path.as_path(), ignores, store, index, consult)?;
+                map.insert(
+                    dir_entry.file_name().into_string().unwrap(),
+                    DirectoryEntry::Directory(Box::new(sub)),
+                );
+            } else if file_type.is_file() {
+                let meta = dir_entry.metadata().map_err(Error::IO)?;
+                let rel = relative_key(root, &path);
+
+                // Trust the cache only when explicitly consulting it.
+                let id = match consult
+                    .then(|| index.trusted_id(&rel, &meta, store))
+                    .flatten()
+                {
+                    Some(id) => id,
+                    None => {
+                        let mut v = Vec::new();
+                        File::options()
+                            .read(true)
+                            .open(&path)
+                            .map_err(Error::IO)?
+                            .read_to_end(&mut v)
+                            .map_err(Error::IO)?;
+                        let id = store.insert(&v).map_err(Error::Store)?;
+                        index.record(&rel, &meta, id);
+                        id
+                    }
+                };
+                map.insert(
+                    dir_entry.file_name().into_string().unwrap(),
+                    DirectoryEntry::File(id),
+                );
+            } else {
+                log::warn!(
+                    "Skipping unsupported file type (not a regular file or directory): {:?}",
+                    path
+                );
+            }
+        }
+        Ok(Directory { root: map })
+    }
+}
+
+/// The index key for a file: its path relative to the working-tree root, with
+/// forward slashes so the key is stable across platforms.
+fn relative_key(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 impl fmt::Display for Diff {
