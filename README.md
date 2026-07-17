@@ -139,7 +139,7 @@ source ~/.bashrc
 
 ### Prerequisites
 
-- Rust (1.54 or later recommended)
+- Rust (a recent stable toolchain; 1.87 or later)
 - Cargo
 
 ### Verifying Installation
@@ -241,8 +241,10 @@ unless you opt in:
 revtool checkout other            # refused if you have uncommitted changes
 revtool checkout other --force    # discard local changes and switch
 revtool checkout -b new-branch    # create the branch and switch (like git switch -c)
+revtool merge other               # refused if you have uncommitted changes
+revtool merge other --force       # merge anyway, overwriting local edits
 revtool reset --force             # restore tracked files, discarding local edits
-revtool reset --force --delete-absent  # also remove untracked files
+revtool reset --force --delete-absent  # also remove untracked files (ignored files survive)
 ```
 
 ### Key Commands
@@ -312,7 +314,9 @@ reference is accepted.
 revtool reset --force                 # Restore tracked files to the last snapshot
 revtool reset --force --delete-absent # Also delete untracked files
 ```
-`reset` discards uncommitted work, so it requires `--force`.
+`reset` discards uncommitted work, so it requires `--force`. `--delete-absent`
+never removes ignored files (your `.env` survives), matching `git clean`
+without `-x`.
 
 #### Working with Remotes
 ```bash
@@ -337,6 +341,9 @@ passed on the command line is visible to other users via the process list
 
 Without a token the server is unauthenticated, so bind it to a trusted network
 only (it defaults to `127.0.0.1`).
+
+Objects of any size can be pushed: large files are transferred in verified
+chunks rather than a single request.
 
 ## Common Workflows
 
@@ -408,6 +415,11 @@ revtool merge --continue
 # If you want to abort a merge with conflicts
 revtool merge --abort
 ```
+
+To resolve a conflict by *deleting* the file (keeping one side's deletion),
+delete it from the working tree — like `git rm` — and run
+`revtool merge --continue`. Files deleted on the merged-in branch are removed
+from your working tree when the merge completes.
 
 ## Advanced Features
 
