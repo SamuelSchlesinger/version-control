@@ -133,7 +133,7 @@ fn test_merge_no_conflicts() {
     );
     
     // Perform the merge
-    let merge_result = merge::merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", false).unwrap();
+    let merge_result = merge::merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", None).unwrap();
     
     // Verify no conflicts occurred
     assert!(merge_result.success);
@@ -190,7 +190,7 @@ fn test_merge_with_conflict() {
     );
     
     // Perform the merge
-    let merge_result = merge::merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", false).unwrap();
+    let merge_result = merge::merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", None).unwrap();
     
     // Verify conflicts were detected
     assert!(!merge_result.success);
@@ -246,7 +246,7 @@ fn test_merge_add_delete_conflict() {
     );
     
     // Perform the merge
-    let merge_result = merge::merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", false).unwrap();
+    let merge_result = merge::merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", None).unwrap();
     
     // Verify conflicts were detected
     assert!(!merge_result.success);
@@ -294,7 +294,7 @@ fn test_merge_with_both_added_files() {
     );
     
     // Perform the merge
-    let merge_result = merge::merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", false).unwrap();
+    let merge_result = merge::merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", None).unwrap();
     
     // Verify conflicts were detected for the same-name file with different content
     assert!(!merge_result.success);
@@ -342,7 +342,7 @@ fn test_merge_with_non_conflicting_additions() {
     );
     
     // Perform the merge
-    let merge_result = merge::merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", false).unwrap();
+    let merge_result = merge::merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", None).unwrap();
     
     // Verify no conflicts occurred
     assert!(merge_result.success);

@@ -3,7 +3,7 @@ use std::{
     env::current_dir,
     fmt::Debug,
     io::stdout,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::exit
 };
 
@@ -283,6 +283,14 @@ enum Command {
 
         #[arg(long, help = "Specify editor to use for conflict resolution")]
         editor: Option<String>,
+
+        #[arg(
+            short,
+            long,
+            default_value = "false",
+            help = "Discard uncommitted changes instead of refusing to merge"
+        )]
+        force: bool,
     },
 
     #[clap(
@@ -471,6 +479,7 @@ fn apply_strategy_to_conflicts<S>(
     store: &mut S,
     merge_state: &mut MergeState,
     strategy: merge::MergeStrategy,
+    work_dir: &Path,
 ) -> AppResult<bool>
 where
     S: lib::object_store::ObjectStore + InsertJson + std::fmt::Debug,
@@ -493,7 +502,7 @@ where
             &merge_state.merge_branch,
         )?;
         match resolver.resolve_with_strategy(store, strategy)? {
-            Some(resolved_id) => {
+            merge::StrategyResolution::Content(resolved_id) => {
                 for c in merge_state.merge_result.conflicts.iter_mut() {
                     if c.path == conflict.path {
                         c.resolved = true;
@@ -503,7 +512,31 @@ where
                 }
                 println!("Resolved: {} ({})", conflict.path.display(), conflict.conflict_type);
             }
-            None => {
+            merge::StrategyResolution::Delete => {
+                // The chosen side has no version of the file: the resolution is
+                // its deletion. Remove the conflict-marker file from the
+                // working tree too, so disk and snapshot agree.
+                let full = work_dir.join(&conflict.path);
+                match std::fs::remove_file(&full) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(AppError::Other(format!(
+                            "failed to remove {} while resolving as deletion: {e}",
+                            full.display()
+                        )));
+                    }
+                }
+                for c in merge_state.merge_result.conflicts.iter_mut() {
+                    if c.path == conflict.path {
+                        c.resolved = true;
+                        c.resolution_id = None;
+                        break;
+                    }
+                }
+                println!("Resolved (deleted): {} ({})", conflict.path.display(), conflict.conflict_type);
+            }
+            merge::StrategyResolution::Unresolved => {
                 all_resolved = false;
                 println!("Could not resolve: {} ({})", conflict.path.display(), conflict.conflict_type);
             }
@@ -662,12 +695,14 @@ fn display_path(path: &std::path::Path) -> String {
     }
 }
 
-/// True if any line of `content` is a conflict marker, i.e. begins with a run
-/// of seven or more of `<`, `=`, `>`, or `|`. Anchoring to the start of a line
-/// avoids false positives on prose like a row of `====` in a comment.
+/// True if any line of `content` begins with a run of seven or more `<` or
+/// `>` — the opening/closing lines every conflict block contains. Bare
+/// `=======` or `|||||||` lines are deliberately NOT treated as markers:
+/// they are legitimate content (setext/RST headings, ASCII tables), and
+/// counting them permanently blocked `merge --continue` on such files.
 fn content_has_conflict_markers(content: &[u8]) -> bool {
     content.split(|&b| b == b'\n').any(|line| {
-        b"<=>|".iter().any(|&marker| {
+        b"<>".iter().any(|&marker| {
             line.iter().take_while(|&&b| b == marker).count() >= 7
         })
     })
@@ -705,6 +740,17 @@ fn finalize_merge(
 ) -> AppResult<()> {
     let snapshot_id = merge_result.create_snapshot(store, message)?;
     dot_rev.set_branch_snapshot_id(current_branch, snapshot_id)?;
+
+    // Remove working files the merge deleted (tracked pre-merge, absent from
+    // the merge result). Without this a file deleted on the merged-in branch
+    // survived on disk and the next snap silently resurrected it into history.
+    let ours_snap: SnapShot = store.read_json(merge_result.ours_id)?;
+    let ours_tree: Directory = store.read_json(ours_snap.directory)?;
+    let new_snap: SnapShot = store.read_json(snapshot_id)?;
+    let new_tree: Directory = store.read_json(new_snap.directory)?;
+    let work_dir = dot_rev.work_dir().to_path_buf();
+    remove_tracked_absent(&ours_tree, &new_tree, &work_dir)?;
+
     refresh_worktree_to_snapshot(dot_rev, store, snapshot_id)?;
     dot_rev.clear_merge_state()?;
     println!(
@@ -860,7 +906,7 @@ where
                     if strategy == merge::MergeStrategy::Ours { "ours".cyan() } else { "theirs".cyan() });
 
                 let all_resolved =
-                    apply_strategy_to_conflicts(store, &mut merge_state, strategy)?;
+                    apply_strategy_to_conflicts(store, &mut merge_state, strategy, dot_rev.work_dir())?;
 
                 // On full resolution, hand the result back to the caller to
                 // finalize (create the snapshot, clear the merge state). We do
@@ -914,7 +960,7 @@ where
 
         // Show options for resolution
         println!("\n{}", "How would you like to resolve this conflict?".cyan().bold());
-        let options = vec!["Use our version", "Use their version", "Edit manually", "Skip for now"];
+        let options = vec!["Use our version", "Use their version", "Edit manually", "Delete this file", "Skip for now"];
 
         let resolution = Select::with_theme(&theme)
             .with_prompt("Resolution strategy")
@@ -993,8 +1039,10 @@ where
                 println!("Base content");
                 println!("# Additional instructions are included in the file");
 
-                // Write the marked content to the file
-                let file_path = conflict.path.clone();
+                // Write the marked content to the file, anchored to the
+                // working-tree root (conflict paths are repo-relative; the
+                // process may be running in a subdirectory).
+                let file_path = dot_rev.work_dir().join(&conflict.path);
                 std::fs::write(&file_path, &resolver.marked_content)
                     .map_err(|e| AppError::Other(format!("Failed to write conflict file: {}", e)))?;
 
@@ -1033,10 +1081,12 @@ where
                     let resolved_content = std::fs::read(&file_path)
                         .map_err(|e| AppError::Other(format!("Failed to read edited file: {}", e)))?;
 
-                    // Check if conflict markers are still present
+                    // Check if conflict markers are still present (bare
+                    // ======= / ||||||| lines are legitimate content and are
+                    // deliberately not treated as markers — see
+                    // content_has_conflict_markers).
                     let content_str = String::from_utf8_lossy(&resolved_content);
-                    if content_str.contains("<<<<<<<") || content_str.contains(">>>>>>>") ||
-                       content_str.contains("=======") || content_str.contains("|||||||") ||
+                    if content_has_conflict_markers(&resolved_content) ||
                        content_str.contains("# CONFLICT RESOLUTION INSTRUCTIONS") {
                         println!("{}", "Conflict markers are still present in the file. Please remove all marker lines including:".red());
                         println!("  - <<<<<<< HEAD (or similar)");
@@ -1066,8 +1116,32 @@ where
                 }
             },
             3 => {
-                // Skip for now
-                println!("Skipping conflict for {}", conflict.path.display());
+                // Resolve by deleting the file (keeps a deletion from one side).
+                let file_path = dot_rev.work_dir().join(&conflict.path);
+                match std::fs::remove_file(&file_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        println!("{}", format!("Failed to delete {}: {}", file_path.display(), e).red());
+                        continue;
+                    }
+                }
+                for c in merge_state.merge_result.conflicts.iter_mut() {
+                    if c.path == conflict.path {
+                        c.resolved = true;
+                        c.resolution_id = None;
+                        break;
+                    }
+                }
+                pending_conflicts.remove(selection);
+                println!("Conflict resolved: Deleted {}", conflict.path.display());
+            },
+            4 => {
+                // Skip: exit the loop with the remaining conflicts unresolved so
+                // progress is persisted and reported. (Staying in the loop made
+                // skipping a trap — it only exited when nothing was pending.)
+                println!("Leaving {} conflict(s) unresolved for now", pending_conflicts.len());
+                break;
             },
             _ => unreachable!(),
         }
@@ -1215,9 +1289,14 @@ Example workflow:
   revtool checkout dev         # Switch back to the dev branch
   revtool merge feature        # Merge the feature branch into dev
 
+To resolve a conflict by deleting the file, delete it from the working tree
+(like 'git rm') and run 'revtool merge --continue'.
+
 Options:
   --continue                 # Continue a merge after resolving conflicts
   --abort                    # Abort an in-progress merge and restore state
+  --force                    # Merge despite uncommitted changes (overwrites them)
+  --strategy <s>             # Auto-resolve conflicts: 'ours', 'theirs', or 'normal'
 "#.to_string()),
         "diff" => Some(r#"
 Compare snapshots with flexible referencing:
@@ -1298,7 +1377,8 @@ Reset tracked files to match the latest snapshot:
   revtool reset --force --delete-absent   # Also delete untracked files
 
 reset discards uncommitted changes, so it requires --force. --delete-absent
-additionally removes untracked files, and is irreversible."#.to_string()),
+additionally removes untracked files (ignored files are spared), and is
+irreversible."#.to_string()),
         "log" => Some(r#"
 Show history of snapshots:
   revtool log           # Show 10 most recent snapshots
@@ -1400,6 +1480,9 @@ Use 'revtool usage <command>' for detailed help on a specific command.
 
 /// Handler for `revtool merge` (abort / continue / fresh merge, with optional
 /// strategy or editor). Extracted from run_command to keep that dispatcher small.
+// The parameter list mirrors the clap `Merge` variant one-to-one; bundling
+// them into a struct would just duplicate that definition.
+#[allow(clippy::too_many_arguments)]
 fn cmd_merge(
     branch: Option<String>,
     message: Option<String>,
@@ -1407,6 +1490,7 @@ fn cmd_merge(
     r#continue: bool,
     strategy: Option<String>,
     editor: Option<String>,
+    force: bool,
     interactive: bool,
 ) -> AppResult<()> {
     let (dot_rev, current_branch) = get_repository()?;
@@ -1433,14 +1517,18 @@ fn cmd_merge(
         // rather than failing the same way --continue does. An in-progress merge
         // never advances the branch ref, so the branch's current tip is the
         // pre-merge state and a safe fallback restore target.
-        let snapshot_id = match dot_rev.get_merge_state() {
-            Ok(state) => state.backup_snapshot_id,
+        let merge_state = match dot_rev.get_merge_state() {
+            Ok(state) => Some(state),
             Err(e) => {
                 log::warn!(
                     "merge state is unreadable ({e}); aborting to the current branch tip"
                 );
-                dot_rev.branch_snapshot_id(&current_branch)?
+                None
             }
+        };
+        let snapshot_id = match &merge_state {
+            Some(state) => state.backup_snapshot_id,
+            None => dot_rev.branch_snapshot_id(&current_branch)?,
         };
         let snapshot: SnapShot = store.read_json(snapshot_id)?;
         let directory: Directory = store.read_json(snapshot.directory)?;
@@ -1449,6 +1537,25 @@ fn cmd_merge(
         let cwd = dot_rev.work_dir().to_path_buf();
         directory.write(&store, &cwd, false)
             .map_err(|e| AppError::FailedToResetFiles(format!("{}", e)))?;
+
+        // Conflicts where our branch had no version of the path (e.g. add/add
+        // from theirs) left a marker file that the backup tree can't overwrite
+        // — it doesn't contain that path. Remove those stragglers.
+        if let Some(state) = &merge_state {
+            for conflict in &state.merge_result.conflicts {
+                if conflict.ours_id.is_none() {
+                    let path = cwd.join(&conflict.path);
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => log::warn!(
+                            "could not remove leftover conflict file {}: {e}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+        }
 
         // Restore the branch pointer too, so the tip and the working
         // tree agree again even if a snapshot was taken mid-merge.
@@ -1520,7 +1627,7 @@ fn cmd_merge(
 
                 // Apply the strategy to every unresolved conflict.
                 let all_resolved =
-                    apply_strategy_to_conflicts(&mut store, &mut merge_state, strategy)?;
+                    apply_strategy_to_conflicts(&mut store, &mut merge_state, strategy, dot_rev.work_dir())?;
 
                 // Check if all conflicts are now resolved
                 if all_resolved || merge_state.merge_result.conflicts.iter().all(|c| c.resolved) {
@@ -1560,6 +1667,18 @@ fn cmd_merge(
                     let full = work_dir.join(&path);
                     let content = match std::fs::read(&full) {
                         Ok(c) => c,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // The user deleted the conflicted file: that IS the
+                            // resolution (git's `rm` on a conflicted path).
+                            for c in merge_state.merge_result.conflicts.iter_mut() {
+                                if c.path == path {
+                                    c.resolved = true;
+                                    c.resolution_id = None;
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         Err(_) => {
                             still_conflicted.push(path);
                             continue;
@@ -1673,8 +1792,15 @@ fn cmd_merge(
         return Ok(());
     }
 
-    // Perform the merge
-    let merge_result = merge::merge(&mut store, base_id, ours_id, theirs_id, &current_branch, &merge_branch, true)?;
+    // Merging rewrites tracked files (and writes conflict markers), so protect
+    // uncommitted work first. This runs after the up-to-date short-circuit,
+    // which touches nothing, and before any merge state is written.
+    ensure_clean_or_forced(&dot_rev, &mut store, force, "merging")?;
+
+    // Perform the merge, writing conflict markers under the working-tree root
+    // (conflict paths are repo-relative; the CWD may be a subdirectory).
+    let work_root = dot_rev.work_dir().to_path_buf();
+    let merge_result = merge::merge(&mut store, base_id, ours_id, theirs_id, &current_branch, &merge_branch, Some(work_root.as_path()))?;
 
     // If there are conflicts, handle them
     if !merge_result.success {
@@ -1739,7 +1865,7 @@ fn cmd_merge(
             // Apply the strategy to every conflict.
             let mut merge_state = dot_rev.get_merge_state()?;
             let all_resolved =
-                apply_strategy_to_conflicts(&mut store, &mut merge_state, strategy)?;
+                apply_strategy_to_conflicts(&mut store, &mut merge_state, strategy, dot_rev.work_dir())?;
 
             // If all conflicts were resolved, create the merge snapshot
             if all_resolved {
@@ -1789,8 +1915,12 @@ fn cmd_merge(
         // Update the branch pointer
         dot_rev.set_branch_snapshot_id(&current_branch, snapshot_id)?;
 
-        // Write the new directory to the working directory
+        // Remove working files the merge deleted (tracked on our branch but
+        // absent from the merge result), then lay down the merged tree.
         let cwd = dot_rev.work_dir().to_path_buf();
+        let ours_snap: SnapShot = store.read_json(ours_id)?;
+        let ours_tree: Directory = store.read_json(ours_snap.directory)?;
+        remove_tracked_absent(&ours_tree, &merged_dir, &cwd)?;
         merged_dir.write(&store, &cwd, false)
             .map_err(|e| AppError::FailedToRestoreFiles(format!("{}", e)))?;
 
@@ -2141,9 +2271,12 @@ fn cmd_reset(delete_absent: bool, force: bool) -> AppResult<()> {
     let snapshot: SnapShot = store.read_json(snapshot_id)?;
     let directory: Directory = store.read_json(snapshot.directory)?;
 
-    // Restore files from snapshot
+    // Restore files from snapshot. The repository's ignores are passed so
+    // --delete-absent spares ignored files (which the pre-flight warning
+    // above can never list).
+    let ignores = dot_rev.ignores()?;
     let cwd = dot_rev.work_dir().to_path_buf();
-    directory.write(&store, &cwd, delete_absent)
+    directory.write_with_ignores(&store, &cwd, delete_absent, Some(&ignores))
         .map_err(|e| AppError::FailedToResetFiles(format!("{}", e)))?;
 
     println!("Reset to the last snapshot on branch '{}' ({})",
@@ -2667,8 +2800,8 @@ fn run_command(cmd: Command, interactive: bool) -> AppResult<()> {
     match cmd {
         Usage { command } => cmd_usage(command),
 
-        Merge { branch, message, abort, r#continue, strategy, editor } => {
-            cmd_merge(branch, message, abort, r#continue, strategy, editor, interactive)
+        Merge { branch, message, abort, r#continue, strategy, editor, force } => {
+            cmd_merge(branch, message, abort, r#continue, strategy, editor, force, interactive)
         },
 
         Ignore { pattern, remove } => cmd_ignore(pattern, remove, interactive),
@@ -2727,5 +2860,25 @@ fn main() {
                 exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::content_has_conflict_markers;
+
+    #[test]
+    fn conflict_marker_detection_ignores_setext_headings() {
+        // A line of exactly ======= (an RST/setext heading) or ||||||| must not
+        // count as a conflict marker — real conflict blocks always contain
+        // <<<<<<< / >>>>>>> lines, and flagging bare separator runs permanently
+        // blocked `merge --continue` on files with such headings.
+        assert!(!content_has_conflict_markers(b"Title\n=======\nbody\n"));
+        assert!(!content_has_conflict_markers(b"|||||||\n"));
+        assert!(content_has_conflict_markers(
+            b"<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n"
+        ));
+        assert!(content_has_conflict_markers(b">>>>>>> feature (theirs)\n"));
+        assert!(!content_has_conflict_markers(b"a >>> b <<< c ==== d\n"));
     }
 }

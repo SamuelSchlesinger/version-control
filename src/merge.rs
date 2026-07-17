@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -147,6 +147,11 @@ impl MergeResult {
             return Err(Error::UnresolvedConflicts(self.conflicts.clone()));
         }
 
+        // A resolved conflict carries either content (`resolution_id: Some`) or
+        // a deletion (`resolution_id: None`): the user resolved a modify/delete
+        // or add/add conflict by removing the file. Both shapes are applied to
+        // the merged tree below.
+
         // Create a final merged directory by recreating it with resolved conflicts
         let mut final_directory = if let Some(merged_dir) = &self.merged_directory {
             merged_dir.clone()
@@ -164,7 +169,7 @@ impl MergeResult {
 
         // Apply the resolved conflicts to the directory
         for conflict in &self.conflicts {
-            if !conflict.resolved || conflict.resolution_id.is_none() {
+            if !conflict.resolved {
                 continue;
             }
 
@@ -173,37 +178,43 @@ impl MergeResult {
                 .split('/')
                 .collect();
 
-            // Navigate to the right location in the directory tree
-            let mut current_dir = &mut final_directory;
-            let mut current_path = vec![];
+            match conflict.resolution_id {
+                Some(resolution_id) => {
+                    // Navigate to the parent directory, creating missing levels.
+                    let mut current_dir = &mut final_directory;
+                    let parent_parts = &path_parts[..path_parts.len() - 1];
+                    for &part in parent_parts {
+                        // Two steps (probe, then insert) so there's only ever one
+                        // mutable borrow of the map at a time.
+                        let dir_exists = matches!(
+                            current_dir.root.get(part),
+                            Some(DirectoryEntry::Directory(_))
+                        );
+                        if !dir_exists {
+                            let new_dir = Box::new(Directory { root: BTreeMap::new() });
+                            current_dir
+                                .root
+                                .insert(part.to_string(), DirectoryEntry::Directory(new_dir));
+                        }
+                        if let Some(DirectoryEntry::Directory(dir)) = current_dir.root.get_mut(part) {
+                            current_dir = dir;
+                        } else {
+                            return Err(Error::Other(format!("Failed to access directory: {}", part)));
+                        }
+                    }
 
-            // Navigate to the parent directory
-            let parent_parts = &path_parts[..path_parts.len() - 1];
-            for &part in parent_parts {
-                current_path.push(part);
-
-                // We need to handle getting the directory in a way that doesn't
-                // result in multiple mutable borrows
-                let dir_exists =
-                    matches!(current_dir.root.get(part), Some(DirectoryEntry::Directory(_)));
-
-                if !dir_exists {
-                    // Create missing directory
-                    let new_dir = Box::new(Directory { root: BTreeMap::new() });
-                    current_dir.root.insert(part.to_string(), DirectoryEntry::Directory(new_dir));
+                    let file_name = path_parts.last().unwrap().to_string();
+                    current_dir
+                        .root
+                        .insert(file_name, DirectoryEntry::File(resolution_id));
                 }
-
-                // At this point we know there's a directory entry
-                if let Some(DirectoryEntry::Directory(dir)) = current_dir.root.get_mut(part) {
-                    current_dir = dir;
-                } else {
-                    return Err(Error::Other(format!("Failed to access directory: {}", part)));
+                None => {
+                    // Resolved as a deletion: remove the path if it is present
+                    // (the merged tree holds the base version for conflicted
+                    // paths). A missing parent means there is nothing to delete.
+                    remove_path(&mut final_directory, &path_parts);
                 }
             }
-
-            // Add the resolved file
-            let file_name = path_parts.last().unwrap().to_string();
-            current_dir.root.insert(file_name, DirectoryEntry::File(conflict.resolution_id.unwrap()));
         }
 
         // Save the merged directory
@@ -230,6 +241,23 @@ impl MergeResult {
     }
 }
 
+/// Removes the entry at `parts` from a directory tree, walking existing
+/// parents only (a missing level means the path isn't present — nothing to do).
+fn remove_path(directory: &mut Directory, parts: &[&str]) {
+    let (last, parents) = match parts.split_last() {
+        Some(split) => split,
+        None => return,
+    };
+    let mut current_dir = directory;
+    for &part in parents {
+        match current_dir.root.get_mut(part) {
+            Some(DirectoryEntry::Directory(dir)) => current_dir = dir,
+            _ => return,
+        }
+    }
+    current_dir.root.remove(*last);
+}
+
 /// Merge strategy for resolving conflicts automatically
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeStrategy {
@@ -252,6 +280,18 @@ impl MergeStrategy {
             _ => Err(format!("Invalid merge strategy: {}. Valid options are 'normal', 'ours', or 'theirs'", s)),
         }
     }
+}
+
+/// Outcome of applying a [`MergeStrategy`] to a single conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyResolution {
+    /// The strategy does not auto-resolve (`Normal`): manual resolution needed.
+    Unresolved,
+    /// Resolve the conflict to this content.
+    Content(ObjectId),
+    /// Resolve the conflict by deleting the path — the chosen side has no
+    /// version of the file (it deleted the file, or never added it).
+    Delete,
 }
 
 /// Utility to help resolve a conflict
@@ -379,51 +419,44 @@ impl ConflictResolver {
         Ok(id)
     }
 
-    /// Resolves the conflict using the specified merge strategy
+    /// Resolves the conflict using the specified merge strategy.
+    ///
+    /// A strategy whose chosen side has no content (that side deleted the file,
+    /// or never added it — modify/delete and one-sided add/add conflicts)
+    /// resolves to [`StrategyResolution::Delete`]: taking "ours" when we
+    /// deleted the file means the file stays deleted, exactly as git behaves.
     pub fn resolve_with_strategy<Store>(
         &self,
         store: &mut Store,
         strategy: MergeStrategy,
-    ) -> Result<Option<ObjectId>, Error<Store>>
+    ) -> Result<StrategyResolution, Error<Store>>
     where
         Store: ObjectStore
     {
-        match strategy {
-            MergeStrategy::Normal => {
-                // Normal strategy requires manual resolution
-                Ok(None)
-            },
-            MergeStrategy::Ours => {
-                // Use our version if available
-                if let Some(content) = &self.ours_content {
-                    let id = store.insert(content).map_err(Error::Store)?;
-                    Ok(Some(id))
-                } else {
-                    // Our version not available
-                    Err(Error::Other(format!(
-                        "Cannot resolve conflict using 'ours' strategy: our version not available for {}",
-                        self.conflict.path.display()
-                    )))
-                }
-            },
-            MergeStrategy::Theirs => {
-                // Use their version if available
-                if let Some(content) = &self.theirs_content {
-                    let id = store.insert(content).map_err(Error::Store)?;
-                    Ok(Some(id))
-                } else {
-                    // Their version not available
-                    Err(Error::Other(format!(
-                        "Cannot resolve conflict using 'theirs' strategy: their version not available for {}",
-                        self.conflict.path.display()
-                    )))
-                }
+        let side = match strategy {
+            // Normal strategy requires manual resolution
+            MergeStrategy::Normal => return Ok(StrategyResolution::Unresolved),
+            MergeStrategy::Ours => &self.ours_content,
+            MergeStrategy::Theirs => &self.theirs_content,
+        };
+        match side {
+            Some(content) => {
+                let id = store.insert(content).map_err(Error::Store)?;
+                Ok(StrategyResolution::Content(id))
             }
+            None => Ok(StrategyResolution::Delete),
         }
     }
 }
 
-/// Performs a three-way merge between two snapshots
+/// Performs a three-way merge between two snapshots.
+///
+/// When `conflict_marker_root` is `Some(root)`, files with conflict markers are
+/// written for every conflict at `root.join(conflict.path)`. Conflict paths are
+/// repo-relative, so the caller must pass the working-tree root — resolving
+/// them against the process CWD wrote markers into whatever subdirectory the
+/// command happened to run from, leaving the real file untouched and letting a
+/// later `merge --continue` silently commit one side of the conflict.
 pub fn merge<Store: ObjectStore>(
     store: &mut Store,
     base_id: ObjectId,    // Common ancestor
@@ -431,7 +464,7 @@ pub fn merge<Store: ObjectStore>(
     theirs_id: ObjectId,  // Branch being merged
     our_branch: &str,     // Current branch name
     their_branch: &str,   // Branch being merged name
-    write_conflict_markers: bool, // Whether to write conflict markers to files
+    conflict_marker_root: Option<&Path>, // Working-tree root to write conflict-marker files under
 ) -> Result<MergeResult, Error<Store>> {
     // Get the snapshots from the store
     let base_bytes = store.read(base_id).map_err(Error::Store)?
@@ -463,19 +496,22 @@ pub fn merge<Store: ObjectStore>(
     let (merged_dir, conflicts) = three_way_merge(store, base_dir, ours_dir, theirs_dir)?;
     let has_conflicts = !conflicts.is_empty();
 
-    // If there are conflicts and we should write markers, create files with conflict markers
-    if has_conflicts && write_conflict_markers {
-        for conflict in &conflicts {
-            let file_path = &conflict.path;
+    // If there are conflicts and a working-tree root was given, create files
+    // with conflict markers under that root.
+    if has_conflicts {
+        if let Some(root) = conflict_marker_root {
+            for conflict in &conflicts {
+                let file_path = root.join(&conflict.path);
 
-            // Create a resolver for this conflict
-            let resolver = ConflictResolver::new(store, conflict.clone(), our_branch, their_branch)?;
+                // Create a resolver for this conflict
+                let resolver = ConflictResolver::new(store, conflict.clone(), our_branch, their_branch)?;
 
-            // Write the conflict markers to the file
-            if let Err(e) = std::fs::write(file_path, &resolver.marked_content) {
-                // This is a library function; log rather than printing to stdout
-                // so an embedding application controls where the message goes.
-                log::warn!("Failed to write conflict markers to {}: {}", file_path.display(), e);
+                // Write the conflict markers to the file
+                if let Err(e) = std::fs::write(&file_path, &resolver.marked_content) {
+                    // This is a library function; log rather than printing to stdout
+                    // so an embedding application controls where the message goes.
+                    log::warn!("Failed to write conflict markers to {}: {}", file_path.display(), e);
+                }
             }
         }
     }
@@ -501,35 +537,33 @@ pub fn find_common_ancestor<Store: ObjectStore>(
     snapshot1_id: ObjectId,
     snapshot2_id: ObjectId,
 ) -> Result<Option<ObjectId>, Error<Store>> {
+    use std::collections::HashMap;
+
     // If the snapshots are identical, they are their own common ancestor
     if snapshot1_id == snapshot2_id {
         return Ok(Some(snapshot1_id));
     }
-    
-    // Load the snapshots
-    let snapshot1_bytes = store.read(snapshot1_id).map_err(Error::Store)?
-        .ok_or(Error::ObjectMissing(snapshot1_id))?;
-    let snapshot2_bytes = store.read(snapshot2_id).map_err(Error::Store)?
-        .ok_or(Error::ObjectMissing(snapshot2_id))?;
-    
-    let snapshot1: SnapShot = serde_json::from_slice(&snapshot1_bytes)?;
-    let snapshot2: SnapShot = serde_json::from_slice(&snapshot2_bytes)?;
-    
-    // If one snapshot is a direct parent of the other, that's the common ancestor
-    if snapshot1.previous.contains(&snapshot2_id) {
-        return Ok(Some(snapshot2_id));
+
+    // A missing tip is corruption and must fail loudly; missing ANCESTORS are
+    // tolerated below (treated as roots), matching the old behaviour.
+    for id in [snapshot1_id, snapshot2_id] {
+        if !store.has(id).map_err(Error::Store)? {
+            return Err(Error::ObjectMissing(id));
+        }
     }
-    if snapshot2.previous.contains(&snapshot1_id) {
-        return Ok(Some(snapshot1_id));
-    }
-    
+
+    // Parse memo: every ancestor is loaded and parsed at most once. The
+    // previous code re-walked (and re-parsed) the full ancestry once per
+    // common ancestor — quadratic in history length, which made merging in an
+    // old repository take minutes.
+    let mut parents: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+
     // The merge base is a *lowest* common ancestor: a snapshot that is an
     // ancestor of both tips and is not itself an ancestor of any other common
-    // ancestor. The previous code ranked common ancestors by summed hop
-    // distance, which can pick a strict ancestor of the true base and
-    // manufacture spurious conflicts.
-    let ancestors1 = ancestors_including_self(store, snapshot1_id)?;
-    let ancestors2 = ancestors_including_self(store, snapshot2_id)?;
+    // ancestor. (Ranking by summed hop distance — an older approach — can pick
+    // a strict ancestor of the true base and manufacture spurious conflicts.)
+    let ancestors1 = ancestors_including_self(store, snapshot1_id, &mut parents)?;
+    let ancestors2 = ancestors_including_self(store, snapshot2_id, &mut parents)?;
 
     let common: BTreeSet<ObjectId> =
         ancestors1.intersection(&ancestors2).copied().collect();
@@ -538,14 +572,16 @@ pub fn find_common_ancestor<Store: ObjectStore>(
         return Ok(None);
     }
 
-    // Any common ancestor that is a *proper* ancestor of another common
-    // ancestor is not a lowest common ancestor. Whatever remains are the merge
-    // base candidates.
+    // The common set is closed under ancestry (an ancestor of a common
+    // ancestor is itself a common ancestor), so any non-lowest common ancestor
+    // is reachable from some common node through parent links that stay inside
+    // the set — i.e. it is the direct parent of a common node. One pass over
+    // the memoized parent lists therefore finds every superseded node.
     let mut superseded: BTreeSet<ObjectId> = BTreeSet::new();
     for &c in &common {
-        for parent in proper_ancestors(store, c)? {
-            if common.contains(&parent) {
-                superseded.insert(parent);
+        for parent in parents.get(&c).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if common.contains(parent) {
+                superseded.insert(*parent);
             }
         }
     }
@@ -556,22 +592,28 @@ pub fn find_common_ancestor<Store: ObjectStore>(
     // can leave several equally-valid bases; a true recursive merge would merge
     // them, but for now we pick one deterministically — the one with the most
     // ancestors (closest to the tips), breaking ties by id so the result never
-    // depends on hashing order.
-    bases.sort_by(|a, b| {
-        let da = ancestor_count(store, *a).unwrap_or(0);
-        let db = ancestor_count(store, *b).unwrap_or(0);
-        db.cmp(&da).then_with(|| a.cmp(b))
-    });
+    // depends on hashing order. Counting walks the memo only; nothing is
+    // re-read from the store.
+    if bases.len() > 1 {
+        let counts: HashMap<ObjectId, usize> = bases
+            .iter()
+            .map(|&b| (b, count_proper_ancestors(b, &parents)))
+            .collect();
+        bases.sort_by(|a, b| counts[b].cmp(&counts[a]).then_with(|| a.cmp(b)));
+    }
 
     Ok(bases.into_iter().next())
 }
 
 /// All ancestors of `snapshot_id`, including the snapshot itself. A node is
 /// considered its own ancestor so that "one tip is an ancestor of the other"
-/// falls out of the common-ancestor computation naturally.
+/// falls out of the common-ancestor computation naturally. Parent lists are
+/// recorded in (and reused from) `parents`, so repeated walks never re-read or
+/// re-parse a snapshot.
 fn ancestors_including_self<Store: ObjectStore>(
     store: &Store,
     snapshot_id: ObjectId,
+    parents: &mut std::collections::HashMap<ObjectId, Vec<ObjectId>>,
 ) -> Result<BTreeSet<ObjectId>, Error<Store>> {
     let mut seen = BTreeSet::new();
     let mut stack = vec![snapshot_id];
@@ -579,40 +621,49 @@ fn ancestors_including_self<Store: ObjectStore>(
         if !seen.insert(current_id) {
             continue;
         }
-        let bytes = match store.read(current_id).map_err(Error::Store)? {
-            Some(bytes) => bytes,
-            None => continue,
-        };
-        let snapshot: SnapShot = match serde_json::from_slice(&bytes) {
-            Ok(snap) => snap,
-            Err(_) => continue,
-        };
-        for parent_id in snapshot.previous {
-            if !seen.contains(&parent_id) {
-                stack.push(parent_id);
+        if let std::collections::hash_map::Entry::Vacant(entry) = parents.entry(current_id) {
+            // A missing or unparseable ancestor is treated as a root: the walk
+            // must not fail outright over damage deep in history.
+            let parent_ids = match store.read(current_id).map_err(Error::Store)? {
+                Some(bytes) => match serde_json::from_slice::<SnapShot>(&bytes) {
+                    Ok(snapshot) => snapshot.previous,
+                    Err(_) => Vec::new(),
+                },
+                None => Vec::new(),
+            };
+            entry.insert(parent_ids);
+        }
+        for parent_id in &parents[&current_id] {
+            if !seen.contains(parent_id) {
+                stack.push(*parent_id);
             }
         }
     }
     Ok(seen)
 }
 
-/// Ancestors of `snapshot_id` excluding the snapshot itself.
-fn proper_ancestors<Store: ObjectStore>(
-    store: &Store,
-    snapshot_id: ObjectId,
-) -> Result<BTreeSet<ObjectId>, Error<Store>> {
-    let mut set = ancestors_including_self(store, snapshot_id)?;
-    set.remove(&snapshot_id);
-    Ok(set)
-}
-
-/// Number of proper ancestors of `snapshot_id`, used only as a deterministic
-/// tie-breaker between equally-valid merge bases.
-fn ancestor_count<Store: ObjectStore>(
-    store: &Store,
-    snapshot_id: ObjectId,
-) -> Result<usize, Error<Store>> {
-    Ok(proper_ancestors(store, snapshot_id)?.len())
+/// Number of proper ancestors of `root`, computed purely from the memoized
+/// parent lists. Used only as a deterministic tie-breaker between
+/// equally-valid merge bases (whose ancestries the memo already covers).
+fn count_proper_ancestors(
+    root: ObjectId,
+    parents: &std::collections::HashMap<ObjectId, Vec<ObjectId>>,
+) -> usize {
+    let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut stack: Vec<ObjectId> = parents.get(&root).cloned().unwrap_or_default();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(parent_ids) = parents.get(&id) {
+            for parent_id in parent_ids {
+                if !seen.contains(parent_id) {
+                    stack.push(*parent_id);
+                }
+            }
+        }
+    }
+    seen.len()
 }
 
 /// Perform a three-way merge between directories
@@ -1247,22 +1298,24 @@ mod tests {
         let resolver = ConflictResolver::new(&store, conflict, "ours-branch", "theirs-branch").unwrap();
 
         // Test 'ours' strategy
-        let ours_result = resolver.resolve_with_strategy(&mut store, MergeStrategy::Ours).unwrap();
-        assert!(ours_result.is_some());
-        let ours_resolved_id = ours_result.unwrap();
+        let ours_resolved_id = match resolver.resolve_with_strategy(&mut store, MergeStrategy::Ours).unwrap() {
+            StrategyResolution::Content(id) => id,
+            other => panic!("expected content resolution, got {other:?}"),
+        };
         let ours_resolved_content = store.read(ours_resolved_id).unwrap().unwrap();
         assert_eq!(ours_resolved_content, ours_content);
 
         // Test 'theirs' strategy
-        let theirs_result = resolver.resolve_with_strategy(&mut store, MergeStrategy::Theirs).unwrap();
-        assert!(theirs_result.is_some());
-        let theirs_resolved_id = theirs_result.unwrap();
+        let theirs_resolved_id = match resolver.resolve_with_strategy(&mut store, MergeStrategy::Theirs).unwrap() {
+            StrategyResolution::Content(id) => id,
+            other => panic!("expected content resolution, got {other:?}"),
+        };
         let theirs_resolved_content = store.read(theirs_resolved_id).unwrap().unwrap();
         assert_eq!(theirs_resolved_content, theirs_content);
 
-        // Test 'normal' strategy
+        // Test 'normal' strategy: requires manual resolution
         let normal_result = resolver.resolve_with_strategy(&mut store, MergeStrategy::Normal).unwrap();
-        assert!(normal_result.is_none()); // Normal strategy requires manual resolution
+        assert_eq!(normal_result, StrategyResolution::Unresolved);
     }
 
     #[test]
@@ -1347,13 +1400,14 @@ mod tests {
         // Create resolver
         let resolver = ConflictResolver::new(&store, conflict, "ours-branch", "theirs-branch").unwrap();
 
-        // Test 'ours' strategy - should work
+        // Test 'ours' strategy - resolves to our content
         let ours_result = resolver.resolve_with_strategy(&mut store, MergeStrategy::Ours).unwrap();
-        assert!(ours_result.is_some());
+        assert!(matches!(ours_result, StrategyResolution::Content(_)));
 
-        // Test 'theirs' strategy - should fail
-        let theirs_result = resolver.resolve_with_strategy(&mut store, MergeStrategy::Theirs);
-        assert!(theirs_result.is_err());
+        // Test 'theirs' strategy - they deleted the file, so taking their side
+        // means the file is deleted, not an error.
+        let theirs_result = resolver.resolve_with_strategy(&mut store, MergeStrategy::Theirs).unwrap();
+        assert_eq!(theirs_result, StrategyResolution::Delete);
     }
     
     #[test]
@@ -1513,6 +1567,23 @@ mod tests {
 
         let base = find_common_ancestor(&store, o, t).unwrap();
         assert_eq!(base, Some(p), "merge base of O and T must be P, not Q");
+    }
+
+    #[test]
+    fn test_find_common_ancestor_long_history_is_fast() {
+        // 500 linear snapshots then a fork. The old implementation re-walked
+        // the full ancestry once per common ancestor — O(history²) JSON
+        // parsing — so this test doubles as a perf smoke test: the suite
+        // grinds to a halt if the quadratic behaviour comes back.
+        let mut store = InMemoryObjectStore::new();
+        let mut tip = create_test_snapshot(&mut store, vec![], vec![("f", b"root")]);
+        for i in 0..500u32 {
+            let content = i.to_le_bytes();
+            tip = create_test_snapshot(&mut store, vec![tip], vec![("f", &content[..])]);
+        }
+        let left = create_test_snapshot(&mut store, vec![tip], vec![("f", b"left")]);
+        let right = create_test_snapshot(&mut store, vec![tip], vec![("f", b"right")]);
+        assert_eq!(find_common_ancestor(&store, left, right).unwrap(), Some(tip));
     }
 
     #[test]
@@ -1690,7 +1761,7 @@ mod tests {
         );
         
         // Perform the merge
-        let result = merge(&mut store, base_id, ours_id, theirs_id, "ours", "theirs", false).unwrap();
+        let result = merge(&mut store, base_id, ours_id, theirs_id, "ours", "theirs", None).unwrap();
         
         // Merge should succeed without conflicts
         assert!(result.success);
@@ -1820,7 +1891,7 @@ mod tests {
         );
         
         // Perform the merge
-        let result = merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", false).unwrap();
+        let result = merge(&mut store, base_id, branch1_id, branch2_id, "branch1", "branch2", None).unwrap();
         
         // Merge should succeed without conflicts
         assert!(result.success, "Merge failed with conflicts: {:?}", result.conflicts);
@@ -1874,7 +1945,7 @@ mod tests {
         );
 
         // Perform the merge
-        let merge_result = merge(&mut store, base_id, ours_id, theirs_id, "main", "feature", false).unwrap();
+        let merge_result = merge(&mut store, base_id, ours_id, theirs_id, "main", "feature", None).unwrap();
 
         // Verify that it has a conflict
         assert!(!merge_result.success);
@@ -1883,7 +1954,10 @@ mod tests {
 
         // Manually resolve the conflict with 'ours' strategy
         let resolver = ConflictResolver::new(&store, merge_result.conflicts[0].clone(), "main", "feature").unwrap();
-        let ours_resolved_id = resolver.resolve_with_strategy(&mut store, MergeStrategy::Ours).unwrap().unwrap();
+        let ours_resolved_id = match resolver.resolve_with_strategy(&mut store, MergeStrategy::Ours).unwrap() {
+            StrategyResolution::Content(id) => id,
+            other => panic!("expected content resolution, got {other:?}"),
+        };
 
         // Create a copy of the merge result with the resolved conflict
         let mut resolved_conflicts = merge_result.conflicts.clone();
@@ -1916,11 +1990,14 @@ mod tests {
         }
 
         // Test with 'theirs' strategy on a new merge
-        let merge_result2 = merge(&mut store, base_id, ours_id, theirs_id, "main", "feature", false).unwrap();
+        let merge_result2 = merge(&mut store, base_id, ours_id, theirs_id, "main", "feature", None).unwrap();
 
         // Manually resolve the conflict with 'theirs' strategy
         let resolver2 = ConflictResolver::new(&store, merge_result2.conflicts[0].clone(), "main", "feature").unwrap();
-        let theirs_resolved_id = resolver2.resolve_with_strategy(&mut store, MergeStrategy::Theirs).unwrap().unwrap();
+        let theirs_resolved_id = match resolver2.resolve_with_strategy(&mut store, MergeStrategy::Theirs).unwrap() {
+            StrategyResolution::Content(id) => id,
+            other => panic!("expected content resolution, got {other:?}"),
+        };
 
         // Create a copy of the merge result with the resolved conflict
         let mut resolved_conflicts2 = merge_result2.conflicts.clone();
@@ -1944,6 +2021,62 @@ mod tests {
         } else {
             panic!("file1.txt missing or not a file in merged result");
         }
+    }
+
+    #[test]
+    fn test_conflict_markers_written_under_root() {
+        // Regression: markers used to be written CWD-relative, so a merge run
+        // from a subdirectory scattered marker files in the wrong place and the
+        // real conflicted file never got its markers.
+        let mut store = InMemoryObjectStore::new();
+        let base_id = create_test_snapshot(&mut store, vec![], vec![("f.txt", b"line1\nline2\nline3\n")]);
+        let ours_id = create_test_snapshot(&mut store, vec![base_id], vec![("f.txt", b"line1\nOURS\nline3\n")]);
+        let theirs_id = create_test_snapshot(&mut store, vec![base_id], vec![("f.txt", b"line1\nTHEIRS\nline3\n")]);
+
+        let root = tempfile::tempdir().unwrap();
+        let result = merge(&mut store, base_id, ours_id, theirs_id, "a", "b", Some(root.path())).unwrap();
+        assert!(!result.success);
+
+        let marked = std::fs::read(root.path().join("f.txt")).expect("marker file under the given root");
+        let marked = String::from_utf8_lossy(&marked);
+        assert!(marked.contains("<<<<<<<"), "{marked}");
+        assert!(marked.contains("OURS") && marked.contains("THEIRS"), "{marked}");
+    }
+
+    #[test]
+    fn test_create_snapshot_applies_deletion_resolution() {
+        // A conflict resolved with resolution_id: None means "delete the path";
+        // the merge snapshot must not contain it (nested paths included).
+        let mut store = InMemoryObjectStore::new();
+        let base_id = create_test_snapshot(
+            &mut store,
+            vec![],
+            vec![("keep.txt", b"keep"), ("sub/gone.txt", b"base version")],
+        );
+        let ours_id = create_test_snapshot(&mut store, vec![base_id], vec![("keep.txt", b"keep")]);
+        let theirs_id = create_test_snapshot(
+            &mut store,
+            vec![base_id],
+            vec![("keep.txt", b"keep"), ("sub/gone.txt", b"their edit")],
+        );
+
+        // ours deleted sub/gone.txt, theirs modified it -> modify/delete conflict.
+        let mut result = merge(&mut store, base_id, ours_id, theirs_id, "a", "b", None).unwrap();
+        assert_eq!(result.conflicts.len(), 1, "{:?}", result.conflicts);
+        result.conflicts[0].resolved = true;
+        result.conflicts[0].resolution_id = None; // resolved as deletion
+
+        let snap_id = result.create_snapshot(&mut store, "merge".to_string()).unwrap();
+        let snap: SnapShot = serde_json::from_slice(&store.read(snap_id).unwrap().unwrap()).unwrap();
+        let dir: Directory = serde_json::from_slice(&store.read(snap.directory).unwrap().unwrap()).unwrap();
+
+        assert!(dir.root.contains_key("keep.txt"));
+        let sub = match dir.root.get("sub") {
+            None => return, // parent pruned entirely is also a correct shape
+            Some(DirectoryEntry::Directory(d)) => d,
+            other => panic!("unexpected entry for sub: {other:?}"),
+        };
+        assert!(!sub.root.contains_key("gone.txt"), "deleted path resurfaced in the merge snapshot");
     }
 
     #[test]
@@ -1982,7 +2115,7 @@ mod tests {
         );
 
         // Perform the merge
-        let result = merge(&mut store, base_id, ours_id, theirs_id, "ours", "theirs", false).unwrap();
+        let result = merge(&mut store, base_id, ours_id, theirs_id, "ours", "theirs", None).unwrap();
 
         // Merge should fail due to type conflict
         assert!(!result.success);
