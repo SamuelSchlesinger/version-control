@@ -342,6 +342,22 @@ impl Directory {
         path: &Path,
         delete_absent: bool,
     ) -> Result<(), Error<Store>> {
+        self.write_with_ignores(store, path, delete_absent, None)
+    }
+
+    /// Like [`Directory::write`], but when deleting absent files it skips any
+    /// path matching `ignores` — like `git clean` without `-x`. `reset
+    /// --delete-absent` passes the repository's ignores so untracked-but-
+    /// ignored files (a `.env`, editor state) survive: they are invisible to
+    /// the preview that warns what a reset will destroy, so deleting them
+    /// meant destroying files no warning ever listed.
+    pub fn write_with_ignores<Store: ObjectStore>(
+        &self,
+        store: &Store,
+        path: &Path,
+        delete_absent: bool,
+        ignores: Option<&Ignores>,
+    ) -> Result<(), Error<Store>> {
         // Previously this was `if read_dir(path).is_ok()`, which turned an
         // unreadable or missing target directory into a silent success.
         read_dir(path)?;
@@ -349,6 +365,21 @@ impl Directory {
         // Reject the whole write before touching the disk if any entry name is
         // unsafe, so a malicious snapshot cannot half-apply.
         self.check_entry_names_recursively()?;
+
+        self.write_inner(store, path, delete_absent, ignores, Path::new(""))
+    }
+
+    /// The recursive body of [`Directory::write_with_ignores`]. `rel_prefix`
+    /// is the repo-relative path of `path`, so ignore patterns (which match
+    /// repo-relative paths) work at any depth.
+    fn write_inner<Store: ObjectStore>(
+        &self,
+        store: &Store,
+        path: &Path,
+        delete_absent: bool,
+        ignores: Option<&Ignores>,
+        rel_prefix: &Path,
+    ) -> Result<(), Error<Store>> {
 
         // First, write/update all files and directories in the snapshot
         for (file_name, entry) in self.root.iter() {
@@ -383,7 +414,13 @@ impl Directory {
                     // write would follow the symlink and escape the repository.
                     ensure_real_directory(&dir_path)?;
 
-                    dir.write(store, dir_path.as_path(), delete_absent)?;
+                    dir.write_inner(
+                        store,
+                        dir_path.as_path(),
+                        delete_absent,
+                        ignores,
+                        &rel_prefix.join(file_name),
+                    )?;
                 }
             }
         }
@@ -410,10 +447,27 @@ impl Directory {
                     continue;
                 }
 
+                // An ignored path is invisible to snapshots and previews alike;
+                // deleting it would destroy a file no warning ever mentioned.
+                if let Some(ignores) = ignores {
+                    if ignores.is_ignored(&rel_prefix.join(&file_name)) {
+                        continue;
+                    }
+                }
+
                 if !self.root.contains_key(&file_name) {
                     let entry_path = entry.path();
                     if entry.file_type()?.is_dir() {
-                        std::fs::remove_dir_all(&entry_path)?;
+                        match ignores {
+                            // An untracked directory can still shelter ignored
+                            // files; deleting it wholesale would destroy them.
+                            Some(ignores) => remove_dir_sparing_ignored(
+                                &entry_path,
+                                ignores,
+                                &rel_prefix.join(&file_name),
+                            )?,
+                            None => std::fs::remove_dir_all(&entry_path)?,
+                        }
                     } else {
                         std::fs::remove_file(&entry_path)?;
                     }
@@ -438,14 +492,19 @@ impl Directory {
 }
 
 /// Represents patterns to ignore when creating a directory structure.
-/// Supports gitignore-style glob patterns.
+/// Supports gitignore-style glob patterns, matched against repository-relative
+/// paths (plus bare file names, so `*.log` fires at any depth).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ignores {
     /// The patterns to ignore
     pub patterns: Vec<String>,
-    /// This field is populated at runtime and not serialized
+    /// Compiled form of `patterns`, built lazily exactly once. Not serialized;
+    /// a deserialized `Ignores` compiles on first use. (This used to be an
+    /// `Option` that `is_ignored` rebuilt — by cloning the whole struct — on
+    /// every call for deserialized values, costing O(files × patterns) glob
+    /// compilations per tree walk.)
     #[serde(skip)]
-    glob_set: Option<GlobSet>,
+    glob_set: std::sync::OnceLock<GlobSet>,
 }
 
 impl PartialEq for Ignores {
@@ -458,7 +517,7 @@ impl Eq for Ignores {}
 
 impl Default for Ignores {
     fn default() -> Self {
-        let patterns = vec![
+        Self::new(vec![
             String::from(".rev"),
             String::from("target"),
             String::from(".git"),
@@ -467,38 +526,29 @@ impl Default for Ignores {
             String::from("**/*.so"),
             String::from("**/*.dylib"),
             String::from("**/*.exe"),
-        ];
-
-        let mut ignores = Ignores {
-            patterns,
-            glob_set: None,
-        };
-
-        // Pre-build the glob set
-        ignores.build_glob_set();
-
-        ignores
+        ])
     }
 }
 
 impl Ignores {
     /// Create a new Ignores from a list of patterns
     pub fn new(patterns: Vec<String>) -> Self {
-        let mut ignores = Ignores {
+        Ignores {
             patterns,
-            glob_set: None,
-        };
-
-        ignores.build_glob_set();
-
-        ignores
+            glob_set: std::sync::OnceLock::new(),
+        }
     }
 
-    /// Build the glob set from the patterns
-    fn build_glob_set(&mut self) {
+    /// The compiled glob set, built on first use.
+    fn glob_set(&self) -> &GlobSet {
+        self.glob_set.get_or_init(|| Self::compile(&self.patterns))
+    }
+
+    /// Compiles the patterns, skipping (with a warning) any that fail to parse.
+    fn compile(patterns: &[String]) -> GlobSet {
         let mut builder = GlobSetBuilder::new();
 
-        for pattern in &self.patterns {
+        for pattern in patterns {
             // A trailing slash is gitignore's "directory only" marker (`build/`).
             // The glob crate would match it literally and never fire against the
             // directory entry `build` or the paths under it, so the pattern
@@ -513,35 +563,32 @@ impl Ignores {
             }
         }
 
-        match builder.build() {
-            Ok(glob_set) => { self.glob_set = Some(glob_set); },
-            Err(e) => { log::error!("Failed to build glob set: {e}"); }
-        }
+        builder.build().unwrap_or_else(|e| {
+            log::error!("Failed to build glob set: {e}");
+            GlobSet::empty()
+        })
     }
 
-    /// Check if a path is ignored
+    /// Check if a repository-relative path is ignored.
+    ///
+    /// Callers must pass paths relative to the working-tree root: patterns
+    /// like `docs/*.md` anchor at the start of the matched string, so handing
+    /// this absolute paths made every path-scoped pattern silently never fire.
     pub fn is_ignored(&self, path: &Path) -> bool {
-        // Make sure the glob set is built
-        if self.glob_set.is_none() {
-            let mut this = self.clone();
-            this.build_glob_set();
-            return this.is_ignored(path);
+        let glob_set = self.glob_set();
+
+        // Check both the full path and just the file name
+        let path_str = path.to_string_lossy();
+        if glob_set.is_match(path_str.as_ref()) {
+            return true;
         }
 
-        // Match against the glob set
-        if let Some(glob_set) = &self.glob_set {
-            // Check both the full path and just the file name
-            let path_str = path.to_string_lossy();
-            if glob_set.is_match(path_str.to_string()) {
+        // A pattern without a separator fires on the file name at any depth
+        // (gitignore's rule for bare names).
+        if let Some(file_name) = path.file_name() {
+            let file_name_str = file_name.to_string_lossy();
+            if glob_set.is_match(file_name_str.as_ref()) {
                 return true;
-            }
-
-            // Check just the file name
-            if let Some(file_name) = path.file_name() {
-                let file_name_str = file_name.to_string_lossy().to_string();
-                if glob_set.is_match(&file_name_str) {
-                    return true;
-                }
             }
         }
 
@@ -551,7 +598,8 @@ impl Ignores {
     /// Add a pattern to the ignore list
     pub fn add_pattern(&mut self, pattern: String) {
         self.patterns.push(pattern);
-        self.build_glob_set();
+        // Invalidate the compiled set; it rebuilds on next use.
+        self.glob_set = std::sync::OnceLock::new();
     }
 }
 
@@ -567,13 +615,28 @@ impl Directory {
         ignores: &Ignores,
         store: &mut Store,
     ) -> Result<Self, Error<Store>> {
-        let mut root = BTreeMap::new();
+        let directory = Self::new_at(dir, dir, ignores, store)?;
+        directory.reject_if_too_deep()?;
+        Ok(directory)
+    }
+
+    /// The recursive walker behind [`Directory::new`]. `root` stays fixed at
+    /// the tree's top so entries can be relativized for ignore matching —
+    /// patterns are matched against repo-relative paths, never absolute ones.
+    fn new_at<Store: ObjectStore>(
+        root: &Path,
+        dir: &Path,
+        ignores: &Ignores,
+        store: &mut Store,
+    ) -> Result<Self, Error<Store>> {
+        let mut map = BTreeMap::new();
         for f in std::fs::read_dir(dir).map_err(Error::IO)? {
             let dir_entry = f.map_err(Error::IO)?;
             let path = dir_entry.path();
 
             // Check if the file or directory should be ignored
-            if ignores.is_ignored(&path) {
+            let rel_path = path.strip_prefix(root).unwrap_or(&path);
+            if ignores.is_ignored(rel_path) {
                 continue;
             }
 
@@ -586,8 +649,8 @@ impl Directory {
 
             let file_type = dir_entry.file_type().map_err(Error::IO)?;
             if file_type.is_dir() {
-                let directory = Directory::new(path.as_path(), ignores, store)?;
-                root.insert(file_name, DirectoryEntry::Directory(Box::new(directory)));
+                let directory = Directory::new_at(root, path.as_path(), ignores, store)?;
+                map.insert(file_name, DirectoryEntry::Directory(Box::new(directory)));
             } else if file_type.is_file() {
                 // Read and hash the file exactly once: insert() hashes the bytes
                 // and returns the id, so a separate ObjectId::try_from (which
@@ -600,7 +663,7 @@ impl Directory {
                     .read_to_end(&mut v)
                     .map_err(Error::IO)?;
                 let id = store.insert(&v).map_err(Error::Store)?;
-                root.insert(file_name, DirectoryEntry::File(id));
+                map.insert(file_name, DirectoryEntry::File(id));
             } else {
                 log::warn!(
                     "Skipping unsupported file type (not a regular file or directory): {:?}",
@@ -608,9 +671,7 @@ impl Directory {
                 );
             }
         }
-        let directory = Directory { root };
-        directory.reject_if_too_deep()?;
-        Ok(directory)
+        Ok(Directory { root: map })
     }
 
     /// Builds the tree from the working directory using a [`SnapshotIndex`] so
@@ -644,7 +705,9 @@ impl Directory {
             let dir_entry = f.map_err(Error::IO)?;
             let path = dir_entry.path();
 
-            if ignores.is_ignored(&path) {
+            // Ignore patterns are matched against repo-relative paths.
+            let rel_path = path.strip_prefix(root).unwrap_or(&path);
+            if ignores.is_ignored(rel_path) {
                 continue;
             }
 
@@ -704,6 +767,33 @@ fn utf8_entry_name(entry: &std::fs::DirEntry) -> Option<String> {
             None
         }
     }
+}
+
+/// Deletes an untracked directory while sparing ignored paths inside it:
+/// contents are removed recursively, ignored entries survive, and each
+/// directory is removed only if it ends up empty (like `git clean -fd`
+/// without `-x`).
+fn remove_dir_sparing_ignored(
+    dir_path: &Path,
+    ignores: &Ignores,
+    rel_prefix: &Path,
+) -> std::io::Result<()> {
+    for entry in read_dir(dir_path)? {
+        let entry = entry?;
+        let rel = rel_prefix.join(entry.file_name());
+        if ignores.is_ignored(&rel) {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            remove_dir_sparing_ignored(&entry.path(), ignores, &rel)?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    if read_dir(dir_path)?.next().is_none() {
+        std::fs::remove_dir(dir_path)?;
+    }
+    Ok(())
 }
 
 /// Removes whatever is at `target` unless it is already a regular file.
@@ -1106,6 +1196,57 @@ fn test_write_never_follows_symlinks() {
 }
 
 #[test]
+fn test_path_scoped_patterns_match_in_real_walk() {
+    use crate::object_store::in_memory::InMemoryObjectStore;
+
+    // Regression: the walkers used to hand ABSOLUTE paths to is_ignored, so a
+    // path-scoped pattern like `docs/*.md` never matched anything in a real
+    // repository (the old unit tests only ever passed relative paths).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("docs/readme.md"), b"x").unwrap();
+    std::fs::write(root.join("docs/keep.txt"), b"x").unwrap();
+    std::fs::write(root.join("src/readme.md"), b"x").unwrap();
+
+    let ignores = Ignores::new(vec!["docs/*.md".to_string()]);
+    let mut store = InMemoryObjectStore::new();
+
+    let tree = Directory::new(&root, &ignores, &mut store).unwrap();
+    let docs = match tree.root.get("docs") {
+        Some(DirectoryEntry::Directory(d)) => d,
+        other => panic!("expected docs dir, got {other:?}"),
+    };
+    assert!(!docs.root.contains_key("readme.md"), "docs/*.md must be ignored");
+    assert!(docs.root.contains_key("keep.txt"));
+    let src = match tree.root.get("src") {
+        Some(DirectoryEntry::Directory(d)) => d,
+        other => panic!("expected src dir, got {other:?}"),
+    };
+    assert!(src.root.contains_key("readme.md"), "pattern must not fire outside docs/");
+
+    // The indexed walker must agree with the plain one.
+    let mut index = crate::snapshot_index::SnapshotIndex::default();
+    let tree2 =
+        Directory::from_working_tree(&root, &ignores, &mut store, &mut index, true).unwrap();
+    assert_eq!(tree, tree2);
+}
+
+#[test]
+fn test_deserialized_ignores_match() {
+    // An Ignores read back from `.rev/ignores` arrives without a compiled glob
+    // set; matching must still work (it compiles lazily, once).
+    let ignores = Ignores::new(vec!["*.log".to_string(), "docs/*.md".to_string()]);
+    let json = serde_json::to_string(&ignores).unwrap();
+    let de: Ignores = serde_json::from_str(&json).unwrap();
+    assert!(de.is_ignored(Path::new("a.log")));
+    assert!(de.is_ignored(Path::new("nested/deep/a.log")));
+    assert!(de.is_ignored(Path::new("docs/readme.md")));
+    assert!(!de.is_ignored(Path::new("a.txt")));
+}
+
+#[test]
 fn test_trailing_slash_ignore_matches_directory() {
     // gitignore's `build/` directory syntax must actually exclude the directory
     // (and its contents), not silently do nothing.
@@ -1115,6 +1256,40 @@ fn test_trailing_slash_ignore_matches_directory() {
     // A pattern that is only a slash normalizes away and matches nothing.
     let only_slash = Ignores::new(vec!["/".to_string()]);
     assert!(!only_slash.is_ignored(Path::new("anything")));
+}
+
+#[test]
+fn test_delete_absent_spares_ignored_files() {
+    use crate::object_store::in_memory::InMemoryObjectStore;
+
+    // Regression: `reset --force --delete-absent` deleted ignored files (a
+    // .env, editor state) that the pre-flight warning never listed, because
+    // the preview respects ignores but the delete pass did not.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("secrets")).unwrap();
+    std::fs::write(repo.join("tracked.txt"), b"tracked").unwrap();
+    std::fs::write(repo.join("junk.txt"), b"junk").unwrap();
+    std::fs::write(repo.join(".env"), b"SECRET=1").unwrap();
+    std::fs::write(repo.join("secrets/api.key"), b"key").unwrap();
+    std::fs::write(repo.join("secrets/notes.txt"), b"notes").unwrap();
+
+    let mut store = InMemoryObjectStore::new();
+    let id = store.insert(b"tracked").unwrap();
+    let mut root = BTreeMap::new();
+    root.insert("tracked.txt".to_string(), DirectoryEntry::File(id));
+    let snapshot_tree = Directory { root };
+
+    let ignores = Ignores::new(vec![".env".to_string(), "secrets/*.key".to_string()]);
+    snapshot_tree
+        .write_with_ignores(&store, &repo, true, Some(&ignores))
+        .unwrap();
+
+    assert!(repo.join("tracked.txt").exists());
+    assert!(!repo.join("junk.txt").exists(), "unignored untracked file must be deleted");
+    assert!(repo.join(".env").exists(), "ignored file was deleted");
+    assert!(repo.join("secrets/api.key").exists(), "path-scoped ignored file was deleted");
+    assert!(!repo.join("secrets/notes.txt").exists(), "unignored nested file must be deleted");
 }
 
 #[test]
