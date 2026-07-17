@@ -295,13 +295,10 @@ impl DotRev {
     /// Sets the currently checked-out branch (does not touch the working tree).
     pub fn set_branch(&self, new_branch: &str) -> Result<(), Error> {
         validate_branch_name(new_branch)?;
-        let mut file = File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(self.root.join("branch"))?;
-        file.write_all(new_branch.as_bytes())?;
-        Ok(())
+        // Atomic like every other metadata write: a truncate-then-write here
+        // could leave an empty current-branch file after a crash, bricking
+        // every subsequent command.
+        write_bytes_atomic(new_branch.as_bytes(), &self.root.join("branch"))
     }
 
     /// The snapshot a branch points at. Errors with `BranchNotFound` if it
@@ -549,14 +546,18 @@ fn read_json<A: for<'de> Deserialize<'de>>(path: &Path) -> Result<A, Error> {
 
 fn write_json<A: Serialize>(thing: &A, path: &Path) -> Result<(), Error> {
     // Serialize into memory then write once (to_writer against a raw File makes
-    // a syscall per token), and write atomically via a temp file + rename so a
-    // crash can never leave a half-written branch pointer / index / merge state
-    // that would break the repository. Falls back to a direct write if the path
-    // has no parent (shouldn't happen for repo metadata).
+    // a syscall per token).
     let bytes = serde_json::to_vec_pretty(thing)?;
+    write_bytes_atomic(&bytes, path)
+}
+
+/// Writes `bytes` atomically via a same-directory temp file + rename, so a
+/// crash can never leave a half-written branch pointer / index / merge state
+/// that would break the repository.
+fn write_bytes_atomic(bytes: &[u8], path: &Path) -> Result<(), Error> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(&bytes)?;
+    tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())

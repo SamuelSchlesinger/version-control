@@ -193,24 +193,26 @@ impl SnapshotRef {
             }
 
             SnapshotRef::ObjectId(obj_ref) => {
-                // A short hex string parses as an id prefix, but names like
-                // `dead`/`beef` can also be real branches or tags. If nothing
-                // matches the prefix, fall back to resolving it as a ref name.
-                match obj_ref.resolve(dot_rev) {
-                    Err(Error::NoMatchingPrefix(name)) => {
-                        if dot_rev.branch_exists(&name)? {
-                            dot_rev.branch_snapshot_id(&name).map_err(Error::from)
-                        } else if dot_rev.tag_exists(&name)? {
-                            dot_rev.tag_snapshot_id(&name).map_err(Error::from)
-                        } else {
-                            Err(Error::NoMatchingPrefix(name))
-                        }
+                // An all-hex name like `cafe` can be BOTH a branch/tag name and
+                // an id prefix. The exact ref name wins — otherwise a snapshot
+                // whose id happens to start with an existing branch's name
+                // would shadow that branch (or make it "ambiguous").
+                if let ObjectIdRef::Prefix(name) = obj_ref {
+                    if let Some(id) = resolve_exact_ref_name(dot_rev, name)? {
+                        return Ok(id);
                     }
-                    other => other,
                 }
+                obj_ref.resolve(dot_rev)
             }
 
             SnapshotRef::RelativeToSnapshot { snapshot_id, depth } => {
+                // `cafe~2` where `cafe` is a branch or tag: the ref name wins
+                // here too, exactly as in the bare-name case above.
+                if let ObjectIdRef::Prefix(name) = snapshot_id {
+                    if let Some(id) = resolve_exact_ref_name(dot_rev, name)? {
+                        return Self::go_back_n(dot_rev, id, *depth);
+                    }
+                }
                 let resolved_id = snapshot_id.resolve(dot_rev)?;
                 Self::go_back_n(dot_rev, resolved_id, *depth)
             }
@@ -240,6 +242,17 @@ impl SnapshotRef {
 
         Ok(current_id)
     }
+}
+
+/// Resolves `name` as an exactly-matching branch or tag, if one exists.
+fn resolve_exact_ref_name(dot_rev: &DotRev, name: &str) -> Result<Option<ObjectId>, Error> {
+    if dot_rev.branch_exists(name)? {
+        return Ok(Some(dot_rev.branch_snapshot_id(name)?));
+    }
+    if dot_rev.tag_exists(name)? {
+        return Ok(Some(dot_rev.tag_snapshot_id(name)?));
+    }
+    Ok(None)
 }
 
 impl FromStr for SnapshotRef {
@@ -499,6 +512,32 @@ mod tests {
         // However, the implementation is properly covered by the logic in resolve()
     }
     
+    #[test]
+    fn test_exact_ref_name_beats_id_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let (dot_rev, snapshots) = setup_test_history(&temp_dir);
+
+        // Name a branch after an actual prefix of an existing snapshot's id,
+        // pointing it at a DIFFERENT snapshot. The branch must win over the
+        // prefix interpretation — a hex-looking branch name must not be
+        // shadowed by whatever snapshot happens to share those characters.
+        let shadowed = snapshots[1];
+        let prefix_name: String = shadowed.to_string().chars().take(6).collect();
+        let target = *snapshots.last().unwrap();
+        dot_rev.create_branch(&prefix_name).unwrap();
+        dot_rev.set_branch_snapshot_id(&prefix_name, target).unwrap();
+
+        let resolved = SnapshotRef::from_str(&prefix_name).unwrap().resolve(&dot_rev).unwrap();
+        assert_eq!(resolved, target, "branch name shadowed by an id prefix");
+
+        // And name~N follows the branch too (previously it never fell back).
+        let relative = SnapshotRef::from_str(&format!("{prefix_name}~1"))
+            .unwrap()
+            .resolve(&dot_rev)
+            .unwrap();
+        assert_eq!(relative, snapshots[snapshots.len() - 2]);
+    }
+
     #[test]
     fn test_resolve_relative_to_snapshot() {
         let temp_dir = TempDir::new().unwrap();

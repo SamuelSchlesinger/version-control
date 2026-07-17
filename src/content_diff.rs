@@ -96,7 +96,22 @@ impl ContentDiff {
         let old_lines: Vec<&str> = old_str.lines().collect();
         let new_lines: Vec<&str> = new_str.lines().collect();
 
-        let changes = diff_lines(&old_lines, &new_lines);
+        let mut changes = diff_lines(&old_lines, &new_lines);
+
+        // .lines() erases trailing-newline and CRLF-vs-LF differences, so a
+        // change touching only those rendered as a modification with no
+        // visible diff. Surface it explicitly. These notes are Added rows (not
+        // Context) so the context-window filter can never hide them.
+        if old_lines == new_lines {
+            changes.push(Change::Added(
+                "\\ (files differ only in line endings or the trailing newline)".to_string(),
+            ));
+        } else if old_content.ends_with(b"\n") != new_content.ends_with(b"\n") {
+            changes.push(Change::Added(format!(
+                "\\ No newline at end of {} file",
+                if new_content.ends_with(b"\n") { "old" } else { "new" }
+            )));
+        }
 
         Ok(Some(ContentDiff {
             changes,
@@ -338,6 +353,50 @@ mod tests {
         assert_eq!(diff.modified_lines(), 1);
         assert_eq!(diff.added_lines(), 0);
         assert_eq!(diff.removed_lines(), 0);
+    }
+
+    #[test]
+    fn test_line_ending_only_changes_are_visible() {
+        // .lines() sees these as identical; the diff must say why the file
+        // still counts as modified instead of rendering an empty diff.
+        let mut store = InMemoryObjectStore::new();
+
+        // Trailing newline removed.
+        let old_id = store.insert(b"a\nb\n").unwrap();
+        let new_id = store.insert(b"a\nb").unwrap();
+        let diff = ContentDiff::generate(&store, old_id, new_id).unwrap().unwrap();
+        assert!(
+            diff.changes.iter().any(
+                |c| matches!(c, Change::Added(s) if s.contains("line endings or the trailing newline"))
+            ),
+            "{:?}",
+            diff.changes
+        );
+
+        // CRLF converted to LF.
+        let old_id = store.insert(b"a\r\nb\r\n").unwrap();
+        let new_id = store.insert(b"a\nb\n").unwrap();
+        let diff = ContentDiff::generate(&store, old_id, new_id).unwrap().unwrap();
+        assert!(
+            diff.changes.iter().any(
+                |c| matches!(c, Change::Added(s) if s.contains("line endings or the trailing newline"))
+            ),
+            "{:?}",
+            diff.changes
+        );
+
+        // Content changed AND the trailing newline flipped: the newline note
+        // rides along with the ordinary line changes.
+        let old_id = store.insert(b"a\n").unwrap();
+        let new_id = store.insert(b"b").unwrap();
+        let diff = ContentDiff::generate(&store, old_id, new_id).unwrap().unwrap();
+        assert!(
+            diff.changes.iter().any(
+                |c| matches!(c, Change::Added(s) if s.contains("No newline at end of new file"))
+            ),
+            "{:?}",
+            diff.changes
+        );
     }
 
     #[test]
