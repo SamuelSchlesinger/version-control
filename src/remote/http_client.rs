@@ -41,8 +41,14 @@ impl HttpRemoteClient {
 
     /// Create a new HTTP client that authenticates with a bearer token.
     pub fn with_token(base_url: String, token: Option<String>) -> Result<Self, HttpClientError> {
+        // No blanket total timeout: object transfers scale with repository
+        // size and link speed, and a fixed 30s deadline made any repository
+        // that couldn't move a batch in 30 seconds permanently unpullable.
+        // Small metadata requests get explicit per-request deadlines instead
+        // (see request_timeout), and the connect timeout still bounds a dead
+        // peer.
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(HttpClientError::Network)?;
 
@@ -54,6 +60,9 @@ impl HttpRemoteClient {
         let url = format!("{}/api", self.base_url);
 
         let mut builder = self.client.post(&url).json(request);
+        if let Some(timeout) = request_timeout(request) {
+            builder = builder.timeout(timeout);
+        }
         if let Some(token) = &self.token {
             builder = builder.bearer_auth(token);
         }
@@ -74,6 +83,22 @@ impl HttpRemoteClient {
         
         serde_json::from_slice(&response_body)
             .map_err(HttpClientError::Serialization)
+    }
+}
+
+/// The total-request deadline for one request, or `None` for object transfers
+/// (whose duration is bounded by data size and link speed, not by us).
+fn request_timeout(request: &RemoteRequest) -> Option<Duration> {
+    match request {
+        RemoteRequest::GetObject { .. }
+        | RemoteRequest::GetObjects { .. }
+        | RemoteRequest::UploadObject { .. }
+        | RemoteRequest::UploadObjects { .. }
+        | RemoteRequest::UploadObjectChunk { .. } => None,
+        // A push makes the server walk the whole object graph before
+        // answering; give it slack proportional to a large repository.
+        RemoteRequest::PushSnapshot { .. } => Some(Duration::from_secs(300)),
+        _ => Some(Duration::from_secs(30)),
     }
 }
 
@@ -185,7 +210,7 @@ impl RemoteRepository for HttpRemoteClient {
         let request = RemoteRequest::UploadObjects {
             objects: objects.iter().map(|(id, d)| (*id, super::Blob(d.clone()))).collect(),
         };
-        
+
         match self.send_request(&request)? {
             RemoteResponse::UploadResult { success, message } => {
                 if success {
@@ -194,6 +219,33 @@ impl RemoteRepository for HttpRemoteClient {
                     Err(HttpClientError::ServerError(message))
                 }
             },
+            RemoteResponse::Error { message } => Err(HttpClientError::ServerError(message)),
+            _ => Err(HttpClientError::InvalidResponse("Expected UploadResult response".to_string())),
+        }
+    }
+
+    fn upload_object_chunk(
+        &self,
+        id: ObjectId,
+        offset: u64,
+        total_size: u64,
+        data: &[u8],
+    ) -> Result<(), Self::Error> {
+        let request = RemoteRequest::UploadObjectChunk {
+            id,
+            offset,
+            total_size,
+            data: super::Blob(data.to_vec()),
+        };
+
+        match self.send_request(&request)? {
+            RemoteResponse::UploadResult { success, message } => {
+                if success {
+                    Ok(())
+                } else {
+                    Err(HttpClientError::ServerError(message))
+                }
+            }
             RemoteResponse::Error { message } => Err(HttpClientError::ServerError(message)),
             _ => Err(HttpClientError::InvalidResponse("Expected UploadResult response".to_string())),
         }

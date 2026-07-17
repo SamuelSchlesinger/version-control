@@ -57,11 +57,31 @@ const MAX_OBJECTS_PER_REQUEST: usize = 10_000;
 /// client re-requests whatever ids a response omits.
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Most chunked uploads a server will stage at once; further ones are
+/// rejected until an in-flight object completes. Bounds disk held by
+/// abandoned transfers.
+const MAX_STAGED_UPLOADS: usize = 8;
+
+/// Sanity cap on one chunked object's declared size, so a client cannot
+/// reserve unbounded staging space with a single lying `total_size`.
+const MAX_STAGED_OBJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// An in-flight chunked upload: bytes staged to an anonymous temp file (freed
+/// by the OS even if the process dies) until the object completes and is
+/// hash-verified.
+struct StagedUpload {
+    file: std::fs::File,
+    received: u64,
+    total: u64,
+}
+
 /// HTTP server for hosting a remote repository
 pub struct HttpRemoteServer {
     dot_rev: Arc<RwLock<DotRev>>,
     /// If set, every request must present `Authorization: Bearer <token>`.
     token: Option<String>,
+    /// In-flight chunked uploads, keyed by the object id being assembled.
+    staging: std::sync::Mutex<std::collections::HashMap<ObjectId, StagedUpload>>,
 }
 
 impl HttpRemoteServer {
@@ -79,6 +99,7 @@ impl HttpRemoteServer {
         Ok(HttpRemoteServer {
             dot_rev: Arc::new(RwLock::new(dot_rev)),
             token,
+            staging: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
     
@@ -313,6 +334,12 @@ async fn process_request(
             })
         },
         
+        RemoteRequest::UploadObjectChunk { id, offset, total_size, data } => {
+            let dot_rev = server.dot_rev.read().await;
+            let mut store = dot_rev.store()?;
+            handle_upload_chunk(server, &mut store, id, offset, total_size, data.0)
+        },
+
         RemoteRequest::UploadObjects { objects } => {
             if objects.len() > MAX_OBJECTS_PER_REQUEST {
                 return Ok(RemoteResponse::Error {
@@ -337,6 +364,97 @@ async fn process_request(
             })
         },
     }
+}
+
+/// Accepts one chunk of a chunked upload, staging it to a temp file and — on
+/// the final chunk — verifying the assembled bytes hash to the claimed id
+/// before anything reaches the store. Protocol violations (out-of-order
+/// offset, disagreeing total, overrun) evict the staging entry so the client
+/// must restart that object from offset 0.
+fn handle_upload_chunk(
+    server: &HttpRemoteServer,
+    store: &mut crate::object_store::directory::DirectoryObjectStore,
+    id: ObjectId,
+    offset: u64,
+    total_size: u64,
+    data: Vec<u8>,
+) -> Result<RemoteResponse, Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut staging = server.staging.lock().expect("staging mutex poisoned");
+
+    if total_size > MAX_STAGED_OBJECT_BYTES {
+        staging.remove(&id);
+        return Ok(RemoteResponse::Error {
+            message: format!(
+                "object too large for chunked upload ({total_size} bytes; the limit is {MAX_STAGED_OBJECT_BYTES})"
+            ),
+        });
+    }
+
+    if offset == 0 {
+        // (Re)start: replace any stale entry for this id.
+        staging.remove(&id);
+        if staging.len() >= MAX_STAGED_UPLOADS {
+            return Ok(RemoteResponse::Error {
+                message: format!(
+                    "too many chunked uploads in flight (limit {MAX_STAGED_UPLOADS}); retry later"
+                ),
+            });
+        }
+        staging.insert(
+            id,
+            StagedUpload { file: tempfile::tempfile()?, received: 0, total: total_size },
+        );
+    }
+
+    let entry = match staging.get_mut(&id) {
+        Some(entry) => entry,
+        None => {
+            return Ok(RemoteResponse::Error {
+                message: format!(
+                    "no chunked upload in progress for {id}; chunks must start at offset 0"
+                ),
+            });
+        }
+    };
+
+    // Chunks must arrive contiguously, agree on the total, and never overrun it.
+    if offset != entry.received
+        || total_size != entry.total
+        || entry.received + data.len() as u64 > entry.total
+    {
+        let expected = entry.received;
+        staging.remove(&id);
+        return Ok(RemoteResponse::Error {
+            message: format!(
+                "chunk out of sequence for {id}: got offset {offset} (expected {expected}); upload restarted"
+            ),
+        });
+    }
+
+    entry.file.write_all(&data)?;
+    entry.received += data.len() as u64;
+
+    if entry.received < entry.total {
+        return Ok(RemoteResponse::UploadResult {
+            success: true,
+            message: format!("chunk accepted ({}/{} bytes)", entry.received, entry.total),
+        });
+    }
+
+    // Complete: assemble and hash-verify before the store sees anything.
+    let mut done = staging.remove(&id).expect("entry just inserted");
+    drop(staging);
+    done.file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::with_capacity(done.total as usize);
+    done.file.read_to_end(&mut bytes)?;
+    store.insert_with_id(id, &bytes)?;
+
+    Ok(RemoteResponse::UploadResult {
+        success: true,
+        message: format!("Object {id} uploaded successfully in {total_size} chunked bytes"),
+    })
 }
 
 /// Walks the entire object graph reachable from `root_snapshot` (ancestor
@@ -426,4 +544,103 @@ where
     }
     
     Ok(false)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::Blob;
+
+    fn test_server() -> (tempfile::TempDir, HttpRemoteServer) {
+        let tmp = tempfile::tempdir().unwrap();
+        let rev = tmp.path().join(".rev");
+        DotRev::init(rev.clone()).unwrap();
+        let server = HttpRemoteServer::new(rev).unwrap();
+        (tmp, server)
+    }
+
+    fn chunk_req(id: ObjectId, offset: u64, total: u64, data: &[u8]) -> RemoteRequest {
+        RemoteRequest::UploadObjectChunk { id, offset, total_size: total, data: Blob(data.to_vec()) }
+    }
+
+    fn assert_upload_ok(resp: &RemoteResponse) {
+        match resp {
+            RemoteResponse::UploadResult { success: true, .. } => {}
+            other => panic!("expected successful UploadResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chunked_upload_reassembles_and_serves_the_object() {
+        let (_tmp, server) = test_server();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let data: Vec<u8> = (0..100_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let id = ObjectId::from(data.as_slice());
+        let total = data.len() as u64;
+
+        for (offset, chunk) in [(0usize, &data[..150_000]), (150_000, &data[150_000..300_000]), (300_000, &data[300_000..])] {
+            let resp = rt
+                .block_on(process_request(&server, chunk_req(id, offset as u64, total, chunk)))
+                .unwrap();
+            assert_upload_ok(&resp);
+        }
+
+        // The assembled object is stored and served back byte-identical.
+        let resp = rt.block_on(process_request(&server, RemoteRequest::GetObject { id })).unwrap();
+        match resp {
+            RemoteResponse::Object { data: Some(blob), .. } => assert_eq!(blob.0, data),
+            other => panic!("expected the object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chunked_upload_out_of_order_is_rejected_then_restartable() {
+        let (_tmp, server) = test_server();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let data = vec![7u8; 30];
+        let id = ObjectId::from(data.as_slice());
+
+        let resp = rt.block_on(process_request(&server, chunk_req(id, 0, 30, &data[..10]))).unwrap();
+        assert_upload_ok(&resp);
+
+        // A gap (offset 20, expected 10) must be rejected and the staging entry evicted.
+        let resp = rt.block_on(process_request(&server, chunk_req(id, 20, 30, &data[20..]))).unwrap();
+        assert!(matches!(resp, RemoteResponse::Error { .. }), "gap accepted: {resp:?}");
+
+        // Continuing where the client left off no longer works — restart required.
+        let resp = rt.block_on(process_request(&server, chunk_req(id, 10, 30, &data[10..20]))).unwrap();
+        assert!(matches!(resp, RemoteResponse::Error { .. }));
+
+        // A clean restart succeeds.
+        let resp = rt.block_on(process_request(&server, chunk_req(id, 0, 30, &data))).unwrap();
+        assert_upload_ok(&resp);
+        let resp = rt.block_on(process_request(&server, RemoteRequest::HasObject { id })).unwrap();
+        assert!(matches!(resp, RemoteResponse::ObjectExists { exists: true, .. }));
+    }
+
+    #[test]
+    fn chunked_upload_with_lying_hash_is_rejected() {
+        let (_tmp, server) = test_server();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let claimed = ObjectId::from(&b"the real content"[..]);
+        let forged = b"something else entirely";
+
+        // The final chunk triggers hash verification, which must fail before
+        // anything reaches the store.
+        let result = rt.block_on(process_request(
+            &server,
+            chunk_req(claimed, 0, forged.len() as u64, forged),
+        ));
+        assert!(result.is_err(), "forged content accepted: {result:?}");
+
+        let resp = rt
+            .block_on(process_request(&server, RemoteRequest::HasObject { id: claimed }))
+            .unwrap();
+        assert!(
+            matches!(resp, RemoteResponse::ObjectExists { exists: false, .. }),
+            "forged object reached the store"
+        );
+    }
 }
